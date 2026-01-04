@@ -1,0 +1,54 @@
+# Confidential files
+**/CONFIDENTIAL*
+**/DO_NOT_COMMIT*
+**/*CONFIDENTIAL*
+**/*DO_NOT_COMMIT*
+
+# Sample/test data that might contain sensitive info
+tests/samples/CONFIDENTIAL_DO_NOT_COMMIT_Oustanding Customer PO (eSoft) 21.10.2025.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+
+# Ruff
+.ruff_cache/

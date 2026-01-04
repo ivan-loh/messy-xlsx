@@ -1,0 +1,485 @@
+Testing 33 Excel files...
+
+====================================================================================================
+
+[1/33] Testing: CONFIDENTIAL_DO_NOT_COMMIT_Oustanding Customer PO (eSoft) 21.10.2025.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 2548.2 KB
+  Sheets: 5 - ['Chart', 'Ptable', 'Data 21.10pm']
+  ✓ Parsed: 0 rows × 0 columns
+  Structure:
+    - Header row: None (confidence: 0.00)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[2/33] Testing: accounts_receivable.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 23.1 KB
+  Sheets: 1 - ['AR Aging']
+  ✓ Parsed: 300 rows × 9 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[3/33] Testing: budget_vs_actuals.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 8.4 KB
+  Sheets: 1 - ['Analysis']
+  ✓ Parsed: 72 rows × 6 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[4/33] Testing: cash_flow_forecast.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 5.8 KB
+  Sheets: 1 - ['Monthly Forecast']
+  ✓ Parsed: 9 rows × 13 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[5/33] Testing: cost_analysis.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 81.0 KB
+  Sheets: 1 - ['Job_Costing']
+  ✓ Parsed: 660 rows × 19 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[6/33] Testing: customer_orders.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 8.2 KB
+  Sheets: 1 - ['Customers']
+  ✓ Parsed: 54 rows × 12 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[7/33] Testing: customers.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 2459.8 KB
+  Sheets: 1 - ['Sheet1']
+  ✓ Parsed: 50,000 rows × 9 columns
+  Structure:
+    - Header row: 1 (confidence: 0.70)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[8/33] Testing: daily_sales_summary.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 29.5 KB
+  Sheets: 1 - ['Sheet1']
+  ✓ Parsed: 730 rows × 6 columns
+  Structure:
+    - Header row: 1 (confidence: 0.70)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[9/33] Testing: expense_reports.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 15.9 KB
+  Sheets: 1 - ['Reports']
+  ✓ Parsed: 200 rows × 9 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[10/33] Testing: financial_ratios.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 5.4 KB
+  Sheets: 1 - ['Quarterly Metrics']
+  ✓ Parsed: 13 rows × 5 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[11/33] Testing: financial_statements.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 7.6 KB
+  Sheets: 3 - ['Income Statement', 'Balance Sheet', 'Cash Flow']
+  ✓ Parsed: 15 rows × 6 columns
+  Structure:
+    - Header row: 6 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[12/33] Testing: general_ledger.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 56.4 KB
+  Sheets: 1 - ['Entries']
+  ✓ Parsed: 1,000 rows × 9 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[13/33] Testing: invoice_register.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 37.0 KB
+  Sheets: 1 - ['Invoices']
+  ✓ Parsed: 500 rows × 10 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[14/33] Testing: job_execution.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 83.0 KB
+  Sheets: 1 - ['Execution']
+  ✓ Parsed: 975 rows × 16 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[15/33] Testing: job_operations.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 274.6 KB
+  Sheets: 1 - ['Operations']
+  ✓ Parsed: 4,524 rows × 13 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[16/33] Testing: job_orders.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 74.8 KB
+  Sheets: 1 - ['Orders']
+  ✓ Parsed: 660 rows × 20 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[17/33] Testing: labor_tracking.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 7.2 KB
+  Sheets: 1 - ['Employees']
+  ✓ Parsed: 52 rows × 7 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[18/33] Testing: machine_downtime.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 20.3 KB
+  Sheets: 1 - ['Downtime']
+  ✓ Parsed: 324 rows × 9 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[19/33] Testing: machines.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 6.0 KB
+  Sheets: 1 - ['Equipment']
+  ✓ Parsed: 18 rows × 8 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[20/33] Testing: material_inventory.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 41.1 KB
+  Sheets: 1 - ['Inventory']
+  ✓ Parsed: 624 rows × 10 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[21/33] Testing: product_inventory.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 97.5 KB
+  Sheets: 1 - ['Sheet1']
+  ✓ Parsed: 2,000 rows × 8 columns
+  Structure:
+    - Header row: 1 (confidence: 0.70)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[22/33] Testing: production_schedule.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 51.1 KB
+  Sheets: 1 - ['Schedule']
+  ✓ Parsed: 936 rows × 10 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[23/33] Testing: program_validation.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 53.2 KB
+  Sheets: 1 - ['Programs']
+  ✓ Parsed: 660 rows × 14 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[24/33] Testing: quality_inspections.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 215.6 KB
+  Sheets: 1 - ['Inspections']
+  ✓ Parsed: 3,514 rows × 12 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[25/33] Testing: revenue_by_segment.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 60.6 KB
+  Sheets: 1 - ['Revenue']
+  ✓ Parsed: 1,020 rows × 9 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[26/33] Testing: rework_tracking.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 30.6 KB
+  Sheets: 1 - ['Rework']
+  ✓ Parsed: 396 rows × 13 columns
+  Structure:
+    - Header row: 2 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[27/33] Testing: sales_transactions.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 5159.0 KB
+  Sheets: 1 - ['Sheet1']
+  ✓ Parsed: 100,000 rows × 9 columns
+  Structure:
+    - Header row: 1 (confidence: 0.70)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[28/33] Testing: scrap_rework.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 10.0 KB
+  Sheets: 1 - ['Scrap']
+  ✓ Parsed: 84 rows × 10 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[29/33] Testing: setup_changeovers.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 61.4 KB
+  Sheets: 1 - ['Changeovers']
+  ✓ Parsed: 616 rows × 18 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[30/33] Testing: tool_life_tracking.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 25.5 KB
+  Sheets: 1 - ['Tool_Instances']
+  ✓ Parsed: 270 rows × 15 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[31/33] Testing: tooling_management.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 6.1 KB
+  Sheets: 1 - ['Tools']
+  ✓ Parsed: 19 rows × 11 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[32/33] Testing: trial_balance.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 5.6 KB
+  Sheets: 1 - ['Trial Balance']
+  ✓ Parsed: 25 rows × 4 columns
+  Structure:
+    - Header row: 1 (confidence: 0.70)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+[33/33] Testing: work_in_progress.xlsx
+----------------------------------------------------------------------------------------------------
+  Status: success
+  Format: xlsx
+  Size: 84.3 KB
+  Sheets: 1 - ['WIP_Tracking']
+  ✓ Parsed: 1,750 rows × 9 columns
+  Structure:
+    - Header row: 1 (confidence: 0.90)
+    - Tables: 1
+    - Has formulas: False
+    - Merged cells: 0
+    - Locale: en_US
+
+====================================================================================================
+
+FINAL SUMMARY
+====================================================================================================
+Total files tested: 33
+✓ Successful: 33 (100.0%)
+✗ Failed: 0 (0.0%)
+
+Status breakdown:
+  success: 33
+
+Largest successfully parsed files:
+  - sales_transactions.xlsx: 5159.0 KB, 100,000 rows
+  - CONFIDENTIAL_DO_NOT_COMMIT_Oustanding Customer PO (eSoft) 21.10.2025.xlsx: 2548.2 KB, 0 rows
+  - customers.xlsx: 2459.8 KB, 50,000 rows
+  - job_operations.xlsx: 274.6 KB, 4,524 rows
+  - quality_inspections.xlsx: 215.6 KB, 3,514 rows
+
+====================================================================================================
