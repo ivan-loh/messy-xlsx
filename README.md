@@ -1,5 +1,9 @@
 # messy-xlsx
 
+[![Tests](https://github.com/ivan-loh/messy-xlsx/actions/workflows/test.yml/badge.svg)](https://github.com/ivan-loh/messy-xlsx/actions/workflows/test.yml)
+[![PyPI version](https://badge.fury.io/py/messy-xlsx.svg)](https://badge.fury.io/py/messy-xlsx)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
 Python library for parsing Excel files with structure detection and normalization.
 
 ## Installation
