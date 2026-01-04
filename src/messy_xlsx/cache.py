@@ -7,7 +7,7 @@
 from collections import OrderedDict
 from pathlib import Path
 from threading import RLock
-from typing import TypeVar
+from typing import Generic, TypeVar
 
 from messy_xlsx.models import StructureInfo
 
@@ -23,7 +23,7 @@ T = TypeVar("T")
 # Generic LRU Cache
 # ============================================================================
 
-class LRUCache[T]:
+class LRUCache(Generic[T]):
     """Thread-safe LRU (Least Recently Used) cache."""
 
     def __init__(self, maxsize: int = 128):
