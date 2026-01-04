@@ -115,6 +115,13 @@ class SheetConfig:
     drop_regex: str | None = None
     drop_conditions: list[dict[str, Any]] = field(default_factory=list)
 
+    # Header detection configuration
+    header_detection_mode: str = "smart"
+    header_confidence_threshold: float = 0.7
+    header_fallback: str = "first_row"
+    multi_row_headers: bool = False
+    header_patterns: list[str] | None = None
+
 
 # ============================================================================
 # Cell Models

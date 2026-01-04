@@ -192,7 +192,7 @@ class MessyWorkbook:
         config = config or self._sheet_config
 
         if config.auto_detect:
-            structure        = self._analyze_structure(sheet)
+            structure        = self._analyze_structure(sheet, config)
             effective_config = self._apply_structure_detection(config, structure)
         else:
             effective_config = config
@@ -227,9 +227,10 @@ class MessyWorkbook:
 
         return df
 
-    def _analyze_structure(self, sheet: str) -> StructureInfo:
+    def _analyze_structure(self, sheet: str, config: SheetConfig | None = None) -> StructureInfo:
         """Analyze sheet structure."""
-        return self._analyzer.analyze(self._file_path, sheet)
+        header_patterns = config.header_patterns if config else None
+        return self._analyzer.analyze(self._file_path, sheet, header_patterns=header_patterns)
 
     def _apply_structure_detection(
         self,
@@ -237,20 +238,68 @@ class MessyWorkbook:
         structure: StructureInfo,
     ) -> SheetConfig:
         """Merge user config with detected structure."""
+        from .exceptions import StructureError
+
+        # Determine skip_rows and header_rows based on detection mode
+        skip_rows   = config.skip_rows
+        header_rows = config.header_rows
+
+        if config.header_detection_mode == "auto":
+            # Trust detection if confidence >= threshold
+            if (
+                structure.header_row is not None
+                and structure.header_confidence >= config.header_confidence_threshold
+            ):
+                skip_rows   = max(0, structure.header_row - 1)
+                header_rows = structure.header_rows_count
+            else:
+                # Fallback logic
+                if config.header_fallback == "first_row":
+                    skip_rows   = 0
+                    header_rows = 1
+                elif config.header_fallback == "none":
+                    header_rows = 0
+                elif config.header_fallback == "error":
+                    raise StructureError(
+                        f"No header detected with sufficient confidence "
+                        f"(found: {structure.header_confidence:.2f}, "
+                        f"required: {config.header_confidence_threshold:.2f})"
+                    )
+
+        elif config.header_detection_mode == "smart":
+            # Use detection unless user explicitly overrode
+            if (
+                config.skip_rows == 0
+                and structure.header_row is not None
+                and structure.header_confidence >= config.header_confidence_threshold
+            ):
+                skip_rows   = max(0, structure.header_row - 1)
+                header_rows = structure.header_rows_count
+            else:
+                skip_rows   = config.skip_rows
+                header_rows = config.header_rows
+
+        # "manual" mode: just use config values (no changes)
+
         return SheetConfig(
-            skip_rows        = config.skip_rows if config.skip_rows > 0 else structure.suggested_skip_rows,
-            header_rows      = config.header_rows,
-            skip_footer      = config.skip_footer if config.skip_footer > 0 else structure.suggested_skip_footer,
-            cell_range       = config.cell_range,
-            column_renames   = config.column_renames,
-            type_hints       = config.type_hints,
-            auto_detect      = False,
-            include_hidden   = config.include_hidden,
-            merge_strategy   = config.merge_strategy,
-            locale           = config.locale or structure.detected_locale,
-            evaluate_formulas = config.evaluate_formulas,
-            drop_regex       = config.drop_regex,
-            drop_conditions  = config.drop_conditions,
+            skip_rows             = skip_rows,
+            header_rows           = header_rows,
+            skip_footer           = config.skip_footer if config.skip_footer > 0 else structure.suggested_skip_footer,
+            cell_range            = config.cell_range,
+            column_renames        = config.column_renames,
+            type_hints            = config.type_hints,
+            auto_detect           = False,
+            include_hidden        = config.include_hidden,
+            merge_strategy        = config.merge_strategy,
+            locale                = config.locale or structure.detected_locale,
+            evaluate_formulas     = config.evaluate_formulas,
+            drop_regex            = config.drop_regex,
+            drop_conditions       = config.drop_conditions,
+            header_detection_mode = config.header_detection_mode,
+            header_confidence_threshold = config.header_confidence_threshold,
+            header_fallback       = config.header_fallback,
+            multi_row_headers     = config.multi_row_headers,
+            header_patterns       = config.header_patterns,
         )
 
     def _ensure_workbook(self) -> None:

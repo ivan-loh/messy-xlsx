@@ -39,6 +39,7 @@ class StructureAnalyzer:
         file_path: Path | str,
         sheet: str,
         force: bool = False,
+        header_patterns: list[str] | None = None,
     ) -> StructureInfo:
         """Analyze sheet structure."""
         file_path = Path(file_path)
@@ -74,7 +75,7 @@ class StructureAnalyzer:
             data_region  = self._detect_data_region(ws)
             merged       = self._detect_merged_cells(ws)
             hidden_rows, hidden_cols = self._detect_hidden_content(ws)
-            header_info  = self._detect_headers(ws, data_region, merged)
+            header_info  = self._detect_headers(ws, data_region, merged, header_patterns)
             metadata     = self._detect_metadata_rows(ws, data_region, header_info)
             tables       = self._detect_multiple_tables(ws, data_region, header_info)
             locale_info  = self.locale_detector.detect(ws, data_region)
@@ -197,8 +198,11 @@ class StructureAnalyzer:
         ws,
         data_region: dict,
         merged_ranges: list,
+        header_patterns: list[str] | None = None,
     ) -> dict:
         """Detect header row(s) with confidence scoring."""
+        import re
+
         start_row = data_region["start_row"]
         end_row   = min(start_row + 10, data_region["end_row"])
         start_col = data_region["start_col"]
@@ -251,6 +255,16 @@ class StructureAnalyzer:
             )
             if has_merged:
                 confidence += 0.1
+
+            # Pattern matching boost
+            if header_patterns:
+                row_text = " ".join(str(v) for v in row_values if v is not None).lower()
+                pattern_matches = sum(
+                    1 for pattern in header_patterns
+                    if re.search(pattern, row_text, re.IGNORECASE)
+                )
+                if pattern_matches > 0:
+                    confidence += min(0.2, 0.05 * pattern_matches)
 
             if confidence > best_confidence:
                 best_confidence = confidence

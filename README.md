@@ -71,10 +71,39 @@ config = SheetConfig(
     merge_strategy   = "fill",
     locale           = "auto",
     evaluate_formulas = True,
+
+    # Header detection (auto-enabled by default)
+    header_detection_mode = "smart",  # "auto" | "manual" | "smart"
+    header_confidence_threshold = 0.7,
+    header_patterns  = [r".*name.*", r".*date.*"],  # Boost confidence
 )
 
 wb = MessyWorkbook("data.xlsx", sheet_config=config)
 df = wb.to_dataframe()
+```
+
+### Header Detection Modes
+
+**smart (default)** - Uses detection unless user explicitly overrides
+```python
+config = SheetConfig(auto_detect=True)  # Headers detected automatically
+```
+
+**auto** - Always trust detection if confidence >= threshold
+```python
+config = SheetConfig(
+    header_detection_mode="auto",
+    header_confidence_threshold=0.8  # Only use if 80%+ confident
+)
+```
+
+**manual** - Ignore detection, use explicit values
+```python
+config = SheetConfig(
+    skip_rows=5,
+    header_rows=2,
+    header_detection_mode="manual"
+)
 ```
 
 ## API Reference
@@ -105,6 +134,12 @@ SheetConfig(
     merge_strategy   = "fill",         # "fill", "skip", "first_only"
     locale           = "auto",         # "en_US", "de_DE", "auto"
     evaluate_formulas = True,
+
+    # Header detection
+    header_detection_mode = "smart",   # "auto", "manual", "smart"
+    header_confidence_threshold = 0.7, # 0.0-1.0
+    header_fallback  = "first_row",    # "first_row", "none", "error"
+    header_patterns  = None,           # List of regex patterns
 )
 ```
 
