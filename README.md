@@ -215,7 +215,3 @@ Tested on 33 real-world Excel files including:
 ## License
 
 MIT
-
-## Credits
-
-Inspired by [mcp-excel](https://github.com/anthropics/mcp-excel).
