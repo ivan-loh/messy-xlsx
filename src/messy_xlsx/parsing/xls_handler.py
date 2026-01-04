@@ -5,11 +5,12 @@
 # ============================================================================
 
 from pathlib import Path
+from typing import BinaryIO
 
 import pandas as pd
 
 from messy_xlsx.exceptions import FileError, FormatError
-from messy_xlsx.parsing.base_handler import FormatHandler, ParseOptions
+from messy_xlsx.parsing.base_handler import FileSource, FormatHandler, ParseOptions
 
 
 # ============================================================================
@@ -25,16 +26,21 @@ class XLSHandler(FormatHandler):
 
     def parse(
         self,
-        file_path: Path,
+        file_source: FileSource,
         sheet: str | None,
         options: ParseOptions,
     ) -> pd.DataFrame:
         """Parse XLS file to DataFrame."""
+        is_fileobj = hasattr(file_source, "read")
+        if is_fileobj and hasattr(file_source, "seek"):
+            file_source.seek(0)
+
+        file_desc = "<stream>" if is_fileobj else str(file_source)
         header = 0 if options.header_rows == 1 else None
 
         try:
             df = pd.read_excel(
-                file_path,
+                file_source,
                 sheet_name   = sheet if sheet else 0,
                 skiprows     = options.skip_rows if options.header_rows <= 1 else 0,
                 skipfooter   = options.skip_footer,
@@ -44,8 +50,10 @@ class XLSHandler(FormatHandler):
             )
         except ImportError:
             try:
+                if is_fileobj and hasattr(file_source, "seek"):
+                    file_source.seek(0)
                 df = pd.read_excel(
-                    file_path,
+                    file_source,
                     sheet_name  = sheet if sheet else 0,
                     skiprows    = options.skip_rows if options.header_rows <= 1 else 0,
                     skipfooter  = options.skip_footer,
@@ -55,19 +63,19 @@ class XLSHandler(FormatHandler):
             except Exception as e:
                 raise FormatError(
                     f"Cannot parse XLS file (xlrd may be required): {e}",
-                    file_path        = str(file_path),
+                    file_path        = file_desc,
                     detected_format  = "xls",
                 ) from e
         except PermissionError as e:
             raise FileError(
-                f"Permission denied: {file_path}",
-                file_path  = str(file_path),
+                f"Permission denied: {file_desc}",
+                file_path  = file_desc,
                 operation  = "open",
             ) from e
         except Exception as e:
             raise FormatError(
                 f"Cannot parse XLS file: {e}",
-                file_path        = str(file_path),
+                file_path        = file_desc,
                 detected_format  = "xls",
             ) from e
 
@@ -86,16 +94,24 @@ class XLSHandler(FormatHandler):
 
         return df
 
-    def get_sheet_names(self, file_path: Path) -> list[str]:
+    def get_sheet_names(self, file_source: FileSource) -> list[str]:
         """Get list of sheet names."""
+        is_fileobj = hasattr(file_source, "read")
+        if is_fileobj and hasattr(file_source, "seek"):
+            file_source.seek(0)
+
+        file_desc = "<stream>" if is_fileobj else str(file_source)
+
         try:
-            xl_file = pd.ExcelFile(file_path, engine="xlrd")
+            xl_file = pd.ExcelFile(file_source, engine="xlrd")
             sheets  = xl_file.sheet_names
             xl_file.close()
             return sheets
         except ImportError:
             try:
-                xl_file = pd.ExcelFile(file_path)
+                if is_fileobj and hasattr(file_source, "seek"):
+                    file_source.seek(0)
+                xl_file = pd.ExcelFile(file_source)
                 sheets  = xl_file.sheet_names
                 xl_file.close()
                 return sheets
@@ -103,22 +119,28 @@ class XLSHandler(FormatHandler):
                 return ["Sheet1"]
         except PermissionError as e:
             raise FileError(
-                f"Permission denied: {file_path}",
-                file_path  = str(file_path),
+                f"Permission denied: {file_desc}",
+                file_path  = file_desc,
                 operation  = "get_sheets",
             ) from e
-        except Exception as e:
+        except Exception:
             return ["Sheet1"]
 
-    def validate(self, file_path: Path) -> tuple[bool, str | None]:
+    def validate(self, file_source: FileSource) -> tuple[bool, str | None]:
         """Validate that file can be parsed."""
+        is_fileobj = hasattr(file_source, "read")
+        if is_fileobj and hasattr(file_source, "seek"):
+            file_source.seek(0)
+
         try:
-            xl_file = pd.ExcelFile(file_path, engine="xlrd")
+            xl_file = pd.ExcelFile(file_source, engine="xlrd")
             xl_file.close()
             return True, None
         except ImportError:
             try:
-                xl_file = pd.ExcelFile(file_path)
+                if is_fileobj and hasattr(file_source, "seek"):
+                    file_source.seek(0)
+                xl_file = pd.ExcelFile(file_source)
                 xl_file.close()
                 return True, None
             except Exception as e:

@@ -7,8 +7,16 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import BinaryIO
 
 import pandas as pd
+
+
+# ============================================================================
+# Type Aliases
+# ============================================================================
+
+FileSource = Path | BinaryIO
 
 
 # ============================================================================
@@ -59,7 +67,7 @@ class FormatHandler(ABC):
     @abstractmethod
     def parse(
         self,
-        file_path: Path,
+        file_source: FileSource,
         sheet: str | None,
         options: ParseOptions,
     ) -> pd.DataFrame:
@@ -67,12 +75,12 @@ class FormatHandler(ABC):
         ...
 
     @abstractmethod
-    def get_sheet_names(self, file_path: Path) -> list[str]:
+    def get_sheet_names(self, file_source: FileSource) -> list[str]:
         """Get list of sheet names in file."""
         ...
 
     @abstractmethod
-    def validate(self, file_path: Path) -> tuple[bool, str | None]:
+    def validate(self, file_source: FileSource) -> tuple[bool, str | None]:
         """Validate that file can be parsed."""
         ...
 

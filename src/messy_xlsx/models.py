@@ -122,6 +122,12 @@ class SheetConfig:
     multi_row_headers: bool = False
     header_patterns: list[str] | None = None
 
+    # Normalization configuration
+    normalize: bool = True  # Master switch for all normalization
+    normalize_dates: bool = True  # Convert date-like columns to datetime
+    normalize_numbers: bool = True  # Convert number-like strings to numeric
+    normalize_whitespace: bool = True  # Clean whitespace in text columns
+
 
 # ============================================================================
 # Cell Models

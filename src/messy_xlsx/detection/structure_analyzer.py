@@ -5,6 +5,7 @@
 # ============================================================================
 
 from pathlib import Path
+from typing import BinaryIO
 
 import openpyxl
 
@@ -12,6 +13,13 @@ from messy_xlsx.cache import StructureCache, get_structure_cache
 from messy_xlsx.detection.locale_detector import LocaleDetector
 from messy_xlsx.exceptions import StructureError
 from messy_xlsx.models import StructureInfo, TableInfo
+
+
+# ============================================================================
+# Type Aliases
+# ============================================================================
+
+FileSource = Path | BinaryIO
 
 
 # ============================================================================
@@ -36,22 +44,30 @@ class StructureAnalyzer:
 
     def analyze(
         self,
-        file_path: Path | str,
+        file_source: FileSource,
         sheet: str,
         force: bool = False,
         header_patterns: list[str] | None = None,
     ) -> StructureInfo:
         """Analyze sheet structure."""
-        file_path = Path(file_path)
+        is_fileobj = hasattr(file_source, "read")
 
-        if not force:
-            cached = self.cache.get(file_path, sheet)
-            if cached:
-                return cached
+        # Only use cache for file paths (not file-like objects)
+        if not is_fileobj:
+            file_path = Path(file_source)
+            if not force:
+                cached = self.cache.get(file_path, sheet)
+                if cached:
+                    return cached
+        else:
+            file_path = None
+            # Reset buffer position
+            if hasattr(file_source, "seek"):
+                file_source.seek(0)
 
         try:
             wb = openpyxl.load_workbook(
-                file_path,
+                file_source,
                 read_only = True,
                 data_only = True,
             )
@@ -107,7 +123,9 @@ class StructureAnalyzer:
                 suggested_skip_footer = self._suggest_skip_footer(ws, data_region),
             )
 
-            self.cache.put(file_path, sheet, result)
+            # Only cache for file paths
+            if file_path:
+                self.cache.put(file_path, sheet, result)
 
             return result
 

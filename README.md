@@ -22,14 +22,23 @@ pip install messy-xlsx[xls]
 
 ```python
 import messy_xlsx
+from messy_xlsx import MessyWorkbook, SheetConfig
+import io
 
 # Basic usage
 df = messy_xlsx.read_excel("data.xlsx")
 
 # Multi-sheet workbook
-wb = messy_xlsx.MessyWorkbook("data.xlsx")
+wb = MessyWorkbook("data.xlsx")
 df = wb.to_dataframe(sheet="Sheet1")
 dfs = wb.to_dataframes()  # All sheets
+
+# Read from BytesIO (cloud storage, S3, etc.)
+with open("data.xlsx", "rb") as f:
+    content = f.read()
+buffer = io.BytesIO(content)
+wb = MessyWorkbook(buffer, filename="data.xlsx")
+df = wb.to_dataframe()
 
 # Structure analysis
 structure = wb.get_structure()
@@ -115,9 +124,16 @@ config = SheetConfig(
 ### MessyWorkbook
 
 ```python
-wb = MessyWorkbook(file_path, sheet_config=None, formula_config=None)
+# From file path
+wb = MessyWorkbook("data.xlsx", sheet_config=None, formula_config=None)
 
+# From file-like object (BytesIO, S3 stream, etc.)
+wb = MessyWorkbook(buffer, sheet_config=None, filename="data.xlsx")
+
+# Properties and methods
 wb.sheet_names                    # List of sheet names
+wb.file_path                      # Path or None if from buffer
+wb.source                         # The file path or buffer
 wb.get_sheet(name)                # Get MessySheet object
 wb.to_dataframe(sheet=None)       # Convert sheet to DataFrame
 wb.to_dataframes()                # Convert all sheets
@@ -144,6 +160,31 @@ SheetConfig(
     header_confidence_threshold = 0.7, # 0.0-1.0
     header_fallback  = "first_row",    # "first_row", "none", "error"
     header_patterns  = None,           # List of regex patterns
+
+    # Normalization controls
+    normalize        = True,           # Master switch for all normalization
+    normalize_dates  = True,           # Convert date columns to datetime
+    normalize_numbers = True,          # Parse number strings to numeric
+    normalize_whitespace = True,       # Clean whitespace in text columns
+)
+```
+
+### Disable Normalization
+
+To get raw data without type conversion (useful for ETL pipelines where the destination handles schema):
+
+```python
+config = SheetConfig(normalize=False)
+wb = MessyWorkbook("data.xlsx", sheet_config=config)
+df = wb.to_dataframe()  # All columns as object dtype
+```
+
+Or disable specific normalizations:
+
+```python
+config = SheetConfig(
+    normalize_dates=False,   # Keep dates as strings
+    normalize_numbers=False, # Keep numbers as strings
 )
 ```
 

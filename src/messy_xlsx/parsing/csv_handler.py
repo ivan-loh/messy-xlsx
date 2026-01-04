@@ -5,12 +5,14 @@
 # ============================================================================
 
 import csv
+import io
 from pathlib import Path
+from typing import BinaryIO
 
 import pandas as pd
 
 from messy_xlsx.exceptions import FileError, FormatError
-from messy_xlsx.parsing.base_handler import FormatHandler, ParseOptions
+from messy_xlsx.parsing.base_handler import FileSource, FormatHandler, ParseOptions
 
 
 # ============================================================================
@@ -35,13 +37,32 @@ class CSVHandler(FormatHandler):
 
     def parse(
         self,
-        file_path: Path,
+        file_source: FileSource,
         sheet: str | None,
         options: ParseOptions,
     ) -> pd.DataFrame:
         """Parse CSV/TSV file to DataFrame."""
-        encoding  = self._detect_encoding(file_path, options.encoding)
-        delimiter = self._detect_delimiter(file_path, encoding)
+        is_fileobj = hasattr(file_source, "read")
+        file_desc = "<stream>" if is_fileobj else str(file_source)
+
+        if is_fileobj:
+            # For file-like objects, read content and detect from bytes
+            if hasattr(file_source, "seek"):
+                file_source.seek(0)
+            raw_data = file_source.read()
+            if hasattr(file_source, "seek"):
+                file_source.seek(0)
+
+            encoding = self._detect_encoding_from_bytes(raw_data, options.encoding)
+            delimiter = self._detect_delimiter_from_bytes(raw_data, encoding)
+
+            # Create a new StringIO for pandas
+            text_data = raw_data.decode(encoding, errors="ignore")
+            source_for_pandas = io.StringIO(text_data)
+        else:
+            encoding = self._detect_encoding(file_source, options.encoding)
+            delimiter = self._detect_delimiter(file_source, encoding)
+            source_for_pandas = file_source
 
         na_values = options.na_values or DEFAULT_NA_VALUES
 
@@ -51,8 +72,8 @@ class CSVHandler(FormatHandler):
 
         try:
             df = pd.read_csv(
-                file_path,
-                encoding    = encoding,
+                source_for_pandas,
+                encoding    = None if is_fileobj else encoding,  # Already decoded for StringIO
                 delimiter   = delimiter,
                 skiprows    = options.skip_rows if options.header_rows <= 1 else 0,
                 skipfooter  = options.skip_footer,
@@ -62,8 +83,14 @@ class CSVHandler(FormatHandler):
                 engine      = engine,
             )
         except UnicodeDecodeError:
+            if is_fileobj:
+                raise FormatError(
+                    f"Cannot decode CSV data",
+                    file_path        = file_desc,
+                    detected_format  = "csv",
+                )
             df = self._read_with_encoding_fallback(
-                file_path,
+                file_source,
                 delimiter,
                 options,
                 na_values,
@@ -71,7 +98,7 @@ class CSVHandler(FormatHandler):
         except Exception as e:
             raise FormatError(
                 f"Cannot parse CSV file: {e}",
-                file_path        = str(file_path),
+                file_path        = file_desc,
                 detected_format  = "csv",
             ) from e
 
@@ -95,6 +122,13 @@ class CSVHandler(FormatHandler):
         except Exception:
             return default
 
+        return self._detect_encoding_from_bytes(raw_data, default)
+
+    def _detect_encoding_from_bytes(self, raw_data: bytes, default: str) -> str:
+        """Detect encoding from raw bytes."""
+        if not raw_data:
+            return default
+
         if raw_data.startswith(b"\xef\xbb\xbf"):
             return "utf-8-sig"
         if raw_data.startswith(b"\xff\xfe"):
@@ -103,7 +137,7 @@ class CSVHandler(FormatHandler):
             return "utf-16-be"
 
         try:
-            raw_data.decode("utf-8")
+            raw_data[:10000].decode("utf-8")
             return "utf-8"
         except UnicodeDecodeError:
             pass
@@ -118,6 +152,19 @@ class CSVHandler(FormatHandler):
         except Exception:
             return ","
 
+        return self._detect_delimiter_from_text(sample)
+
+    def _detect_delimiter_from_bytes(self, raw_data: bytes, encoding: str) -> str:
+        """Detect delimiter from raw bytes."""
+        try:
+            sample = raw_data[:8192].decode(encoding, errors="ignore")
+        except Exception:
+            return ","
+
+        return self._detect_delimiter_from_text(sample)
+
+    def _detect_delimiter_from_text(self, sample: str) -> str:
+        """Detect delimiter from text sample."""
         try:
             sniffer = csv.Sniffer()
             dialect = sniffer.sniff(sample)
@@ -195,16 +242,29 @@ class CSVHandler(FormatHandler):
             attempted_formats  = [f"csv[{enc}]" for enc in ENCODING_FALLBACKS],
         )
 
-    def get_sheet_names(self, file_path: Path) -> list[str]:
+    def get_sheet_names(self, file_source: FileSource) -> list[str]:
         """Get sheet names (always returns single element for CSV)."""
         return ["Sheet1"]
 
-    def validate(self, file_path: Path) -> tuple[bool, str | None]:
+    def validate(self, file_source: FileSource) -> tuple[bool, str | None]:
         """Validate that file can be parsed."""
-        try:
-            encoding = self._detect_encoding(file_path, "utf-8")
-            with open(file_path, "r", encoding=encoding, errors="ignore") as f:
-                f.read(1024)
-            return True, None
-        except Exception as e:
-            return False, str(e)
+        is_fileobj = hasattr(file_source, "read")
+
+        if is_fileobj:
+            try:
+                if hasattr(file_source, "seek"):
+                    file_source.seek(0)
+                data = file_source.read(1024)
+                if hasattr(file_source, "seek"):
+                    file_source.seek(0)
+                return True, None
+            except Exception as e:
+                return False, str(e)
+        else:
+            try:
+                encoding = self._detect_encoding(file_source, "utf-8")
+                with open(file_source, "r", encoding=encoding, errors="ignore") as f:
+                    f.read(1024)
+                return True, None
+            except Exception as e:
+                return False, str(e)

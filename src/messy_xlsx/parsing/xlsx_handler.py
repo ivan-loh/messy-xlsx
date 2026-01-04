@@ -5,13 +5,14 @@
 # ============================================================================
 
 from pathlib import Path
+from typing import BinaryIO
 
 import numpy as np
 import openpyxl
 import pandas as pd
 
 from messy_xlsx.exceptions import FileError, FormatError
-from messy_xlsx.parsing.base_handler import FormatHandler, ParseOptions
+from messy_xlsx.parsing.base_handler import FileSource, FormatHandler, ParseOptions
 
 
 # ============================================================================
@@ -43,30 +44,37 @@ class XLSXHandler(FormatHandler):
 
     def parse(
         self,
-        file_path: Path,
+        file_source: FileSource,
         sheet: str | None,
         options: ParseOptions,
     ) -> pd.DataFrame:
         """Parse XLSX/XLSM file to DataFrame."""
         read_only = options.merge_strategy == "skip"
 
+        # Reset buffer position if file-like object
+        is_fileobj = hasattr(file_source, "read")
+        if is_fileobj and hasattr(file_source, "seek"):
+            file_source.seek(0)
+
+        file_desc = "<stream>" if is_fileobj else str(file_source)
+
         try:
             wb = openpyxl.load_workbook(
-                file_path,
+                file_source,
                 read_only  = read_only,
                 data_only  = options.data_only,
                 keep_links = False,
             )
         except PermissionError as e:
             raise FileError(
-                f"Permission denied: {file_path}",
-                file_path  = str(file_path),
+                f"Permission denied: {file_desc}",
+                file_path  = file_desc,
                 operation  = "open",
             ) from e
         except Exception as e:
             raise FormatError(
                 f"Cannot open Excel file: {e}",
-                file_path  = str(file_path),
+                file_path  = file_desc,
             ) from e
 
         try:
@@ -74,7 +82,7 @@ class XLSXHandler(FormatHandler):
                 if sheet not in wb.sheetnames:
                     raise FormatError(
                         f"Sheet '{sheet}' not found",
-                        file_path        = str(file_path),
+                        file_path        = file_desc,
                         detected_format  = "xlsx",
                     )
                 ws = wb[sheet]
@@ -189,42 +197,61 @@ class XLSXHandler(FormatHandler):
         options: ParseOptions,
     ) -> pd.DataFrame:
         """Clean Excel-specific data issues."""
-        df = df.replace(EXCEL_ERRORS, np.nan)
+        # Replace Excel errors with NaN using map to avoid FutureWarning
+        error_set = set(EXCEL_ERRORS)
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].map(lambda x: np.nan if x in error_set else x)
 
         if options.na_values:
-            df = df.replace(options.na_values, np.nan)
+            na_set = set(options.na_values)
+            for col in df.columns:
+                if df[col].dtype == object:
+                    df[col] = df[col].map(lambda x: np.nan if x in na_set else x)
 
         return df
 
-    def get_sheet_names(self, file_path: Path) -> list[str]:
+    def get_sheet_names(self, file_source: FileSource) -> list[str]:
         """Get list of sheet names."""
+        is_fileobj = hasattr(file_source, "read")
+        if is_fileobj and hasattr(file_source, "seek"):
+            file_source.seek(0)
+
+        file_desc = "<stream>" if is_fileobj else str(file_source)
+
         try:
-            wb     = openpyxl.load_workbook(file_path, read_only=True)
+            wb     = openpyxl.load_workbook(file_source, read_only=True)
             sheets = wb.sheetnames
             wb.close()
             return sheets
         except PermissionError as e:
             raise FileError(
-                f"Permission denied: {file_path}",
-                file_path  = str(file_path),
+                f"Permission denied: {file_desc}",
+                file_path  = file_desc,
                 operation  = "get_sheets",
             ) from e
         except Exception as e:
             try:
-                xl_file = pd.ExcelFile(file_path, engine="openpyxl")
+                if is_fileobj and hasattr(file_source, "seek"):
+                    file_source.seek(0)
+                xl_file = pd.ExcelFile(file_source, engine="openpyxl")
                 sheets  = xl_file.sheet_names
                 xl_file.close()
                 return sheets
             except Exception:
                 raise FormatError(
                     f"Cannot read sheet names: {e}",
-                    file_path  = str(file_path),
+                    file_path  = file_desc,
                 ) from e
 
-    def validate(self, file_path: Path) -> tuple[bool, str | None]:
+    def validate(self, file_source: FileSource) -> tuple[bool, str | None]:
         """Validate that file can be parsed."""
+        is_fileobj = hasattr(file_source, "read")
+        if is_fileobj and hasattr(file_source, "seek"):
+            file_source.seek(0)
+
         try:
-            wb = openpyxl.load_workbook(file_path, read_only=True)
+            wb = openpyxl.load_workbook(file_source, read_only=True)
             wb.close()
             return True, None
         except Exception as e:

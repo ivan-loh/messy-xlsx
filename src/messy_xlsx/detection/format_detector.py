@@ -4,8 +4,10 @@
 # Imports
 # ============================================================================
 
+import io
 import zipfile
 from pathlib import Path
+from typing import BinaryIO
 
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.models import FormatInfo
@@ -34,9 +36,19 @@ HEADER_SIZE = 8192
 class FormatDetector:
     """Detect file format using binary signatures and content analysis."""
 
-    def detect(self, file_path: Path | str) -> FormatInfo:
-        """Detect file format."""
-        file_path = Path(file_path)
+    def detect(self, file_or_path: Path | str | BinaryIO, filename: str | None = None) -> FormatInfo:
+        """Detect file format from path or file-like object.
+
+        Args:
+            file_or_path: Path to file or file-like object (BytesIO, etc.)
+            filename: Optional filename hint for extension-based detection when using file-like objects
+        """
+        # Handle file-like objects
+        if hasattr(file_or_path, "read"):
+            return self._detect_from_fileobj(file_or_path, filename)
+
+        # Handle path
+        file_path = Path(file_or_path)
 
         if not file_path.exists():
             raise FormatError(f"File not found: {file_path}", file_path=str(file_path))
@@ -60,6 +72,116 @@ class FormatDetector:
             return self._analyze_text_format(file_path, header)
 
         return self._detect_from_extension(file_path)
+
+    def _detect_from_fileobj(self, fileobj: BinaryIO, filename: str | None = None) -> FormatInfo:
+        """Detect format from file-like object."""
+        # Save position
+        start_pos = fileobj.tell() if hasattr(fileobj, "tell") else 0
+
+        try:
+            header = fileobj.read(HEADER_SIZE)
+        except Exception as e:
+            raise FormatError(f"Cannot read from file object: {e}", file_path="<stream>") from e
+        finally:
+            # Reset position
+            if hasattr(fileobj, "seek"):
+                fileobj.seek(start_pos)
+
+        if not header:
+            raise FormatError("File object is empty", file_path="<stream>")
+
+        for signature, format_family in SIGNATURES.items():
+            if header.startswith(signature):
+                return self._analyze_format_family_from_bytes(header, format_family, fileobj)
+
+        if self._is_text_based(header):
+            return self._analyze_text_format_from_bytes(header, filename)
+
+        # Fall back to extension if filename provided
+        if filename:
+            return self._detect_from_extension(Path(filename))
+
+        return FormatInfo(format_type="unknown", confidence=0.0)
+
+    def _analyze_format_family_from_bytes(
+        self, header: bytes, format_family: str, fileobj: BinaryIO
+    ) -> FormatInfo:
+        """Analyze format family from file-like object."""
+        if format_family == "zip_based":
+            return self._analyze_zip_format_from_fileobj(fileobj)
+        elif format_family == "ole2":
+            return FormatInfo(format_type="xls", confidence=0.95, version="OLE2 Compound Document")
+        elif format_family.startswith("xls_biff"):
+            return FormatInfo(format_type="xls", confidence=0.95, version=format_family.upper())
+        else:
+            return FormatInfo(format_type="unknown", confidence=0.0)
+
+    def _analyze_zip_format_from_fileobj(self, fileobj: BinaryIO) -> FormatInfo:
+        """Analyze ZIP-based format from file-like object."""
+        start_pos = fileobj.tell() if hasattr(fileobj, "tell") else 0
+
+        try:
+            # Reset to beginning for zipfile
+            if hasattr(fileobj, "seek"):
+                fileobj.seek(0)
+
+            with zipfile.ZipFile(fileobj, "r") as zf:
+                filelist = set(zf.namelist())
+
+                if "xl/workbook.xml" in filelist:
+                    has_macros = "xl/vbaProject.bin" in filelist
+                    is_encrypted = "EncryptionInfo" in filelist
+
+                    return FormatInfo(
+                        format_type="xlsm" if has_macros else "xlsx",
+                        confidence=0.95,
+                        version="Office Open XML",
+                        has_macros=has_macros,
+                        is_encrypted=is_encrypted,
+                        is_compressed=True,
+                    )
+
+                if "xl/workbook.bin" in filelist:
+                    has_macros = "xl/vbaProject.bin" in filelist
+
+                    return FormatInfo(
+                        format_type="xlsb",
+                        confidence=0.95,
+                        version="Excel Binary",
+                        has_macros=has_macros,
+                        is_compressed=True,
+                    )
+
+                return FormatInfo(
+                    format_type="unknown",
+                    confidence=0.3,
+                    version="ZIP archive (not Excel)",
+                    is_compressed=True,
+                )
+
+        except zipfile.BadZipFile:
+            return FormatInfo(format_type="unknown", confidence=0.0)
+        finally:
+            if hasattr(fileobj, "seek"):
+                fileobj.seek(start_pos)
+
+    def _analyze_text_format_from_bytes(self, header: bytes, filename: str | None) -> FormatInfo:
+        """Analyze text-based format from bytes."""
+        try:
+            text_sample = header.decode("utf-8", errors="ignore")
+        except Exception:
+            text_sample = header.decode("latin-1", errors="ignore")
+
+        lines = [line for line in text_sample.split("\n")[:10] if line.strip()]
+
+        if len(lines) < 2:
+            return FormatInfo(format_type="csv", confidence=0.5, encoding="utf-8")
+
+        delimiter, confidence = self._detect_delimiter(lines)
+        format_type = "tsv" if delimiter == "\t" else "csv"
+        encoding = self._detect_encoding(header)
+
+        return FormatInfo(format_type=format_type, confidence=confidence, encoding=encoding)
 
     def _analyze_format_family(self, file_path: Path, format_family: str, header: bytes) -> FormatInfo:
         """Analyze format within a detected family."""

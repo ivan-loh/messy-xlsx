@@ -5,13 +5,14 @@
 # ============================================================================
 
 from pathlib import Path
+from typing import BinaryIO
 
 import pandas as pd
 
 from messy_xlsx.detection.format_detector import FormatDetector
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.models import FormatInfo
-from messy_xlsx.parsing.base_handler import FormatHandler, ParseOptions
+from messy_xlsx.parsing.base_handler import FileSource, FormatHandler, ParseOptions
 from messy_xlsx.parsing.csv_handler import CSVHandler
 from messy_xlsx.parsing.xls_handler import XLSHandler
 from messy_xlsx.parsing.xlsx_handler import XLSXHandler
@@ -47,23 +48,24 @@ class HandlerRegistry:
                 return handler
         return None
 
-    def detect_format(self, file_path: Path | str) -> FormatInfo:
+    def detect_format(self, file_source: FileSource, filename: str | None = None) -> FormatInfo:
         """Detect file format."""
-        return self.detector.detect(Path(file_path))
+        return self.detector.detect(file_source, filename=filename)
 
     def parse(
         self,
-        file_path: Path | str,
+        file_source: FileSource,
         sheet: str | None = None,
         options: ParseOptions | None = None,
         format_type: str | None = None,
     ) -> pd.DataFrame:
         """Parse file with automatic format detection and fallback."""
-        file_path = Path(file_path)
-        options   = options or ParseOptions()
+        is_fileobj = hasattr(file_source, "read")
+        file_desc = "<stream>" if is_fileobj else str(file_source)
+        options = options or ParseOptions()
 
         if format_type is None:
-            format_info = self.detector.detect(file_path)
+            format_info = self.detector.detect(file_source)
             format_type = format_info.format_type
 
         handler = self.get_handler(format_type)
@@ -71,13 +73,13 @@ class HandlerRegistry:
         if handler is None:
             raise FormatError(
                 f"No handler available for format: {format_type}",
-                file_path        = str(file_path),
+                file_path        = file_desc,
                 detected_format  = format_type,
             )
 
         errors = []
         try:
-            return handler.parse(file_path, sheet, options)
+            return handler.parse(file_source, sheet, options)
         except (PermissionError, FileNotFoundError, MemoryError):
             raise
         except Exception as e:
@@ -88,7 +90,7 @@ class HandlerRegistry:
                 continue
 
             try:
-                df = fallback_handler.parse(file_path, sheet, options)
+                df = fallback_handler.parse(file_source, sheet, options)
                 return df
             except (PermissionError, FileNotFoundError, MemoryError):
                 raise
@@ -96,23 +98,24 @@ class HandlerRegistry:
                 errors.append(f"{fallback_handler.__class__.__name__}: {e}")
                 continue
 
+        name = file_desc if is_fileobj else Path(file_source).name
         raise FormatError(
-            f"All handlers failed for {file_path.name}",
-            file_path          = str(file_path),
+            f"All handlers failed for {name}",
+            file_path          = file_desc,
             detected_format    = format_type,
             attempted_formats  = [h.__class__.__name__ for h in self.handlers],
         )
 
     def get_sheet_names(
         self,
-        file_path: Path | str,
+        file_source: FileSource,
         format_type: str | None = None,
     ) -> list[str]:
         """Get sheet names from file."""
-        file_path = Path(file_path)
+        is_fileobj = hasattr(file_source, "read")
 
         if format_type is None:
-            format_info = self.detector.detect(file_path)
+            format_info = self.detector.detect(file_source)
             format_type = format_info.format_type
 
         handler = self.get_handler(format_type)
@@ -123,7 +126,7 @@ class HandlerRegistry:
         errors = []
 
         try:
-            return handler.get_sheet_names(file_path)
+            return handler.get_sheet_names(file_source)
         except (PermissionError, FileNotFoundError, MemoryError):
             raise
         except Exception as e:
@@ -134,7 +137,7 @@ class HandlerRegistry:
                 continue
 
             try:
-                return fallback_handler.get_sheet_names(file_path)
+                return fallback_handler.get_sheet_names(file_source)
             except (PermissionError, FileNotFoundError, MemoryError):
                 raise
             except Exception:
@@ -144,15 +147,13 @@ class HandlerRegistry:
 
     def validate(
         self,
-        file_path: Path | str,
+        file_source: FileSource,
         format_type: str | None = None,
     ) -> tuple[bool, str | None]:
         """Validate that file can be parsed."""
-        file_path = Path(file_path)
-
         if format_type is None:
             try:
-                format_info = self.detector.detect(file_path)
+                format_info = self.detector.detect(file_source)
                 format_type = format_info.format_type
             except FormatError as e:
                 return False, str(e)
@@ -165,7 +166,7 @@ class HandlerRegistry:
         if handler is None:
             return False, f"No handler for format: {format_type}"
 
-        return handler.validate(file_path)
+        return handler.validate(file_source)
 
 
 # ============================================================================

@@ -4,8 +4,9 @@
 # Imports
 # ============================================================================
 
+import io
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import openpyxl
 import pandas as pd
@@ -32,12 +33,19 @@ class MessyWorkbook:
 
     def __init__(
         self,
-        file_path: str | Path,
+        file_path_or_buffer: str | Path | BinaryIO,
         sheet_config: SheetConfig | None = None,
         formula_config: FormulaConfig | None = None,
+        filename: str | None = None,
     ):
-        """Open an Excel file for parsing."""
-        self._file_path      = Path(file_path)
+        """Open an Excel file for parsing.
+
+        Args:
+            file_path_or_buffer: Path to file, or file-like object (BytesIO, etc.)
+            sheet_config: Configuration for parsing sheets
+            formula_config: Configuration for formula evaluation
+            filename: Optional filename hint when using file-like objects (for format detection)
+        """
         self._sheet_config   = sheet_config or SheetConfig()
         self._formula_config = formula_config or FormulaConfig()
 
@@ -46,36 +54,65 @@ class MessyWorkbook:
         self._analyzer      = StructureAnalyzer(get_structure_cache())
         self._formula_engine = FormulaEngine(self._formula_config)
 
-        if not self._file_path.exists():
-            raise FileError(
-                f"File not found: {self._file_path}",
-                file_path = str(self._file_path),
-            )
+        # Determine if input is file path or file-like object
+        self._is_fileobj = hasattr(file_path_or_buffer, "read")
 
-        self._format_info = self._detector.detect(self._file_path)
+        if self._is_fileobj:
+            self._file_path = None
+            self._file_buffer = file_path_or_buffer
+            self._filename_hint = filename
+
+            # Detect format from file object
+            self._format_info = self._detector.detect(file_path_or_buffer, filename=filename)
+
+            # Reset buffer position after detection
+            if hasattr(file_path_or_buffer, "seek"):
+                file_path_or_buffer.seek(0)
+        else:
+            self._file_path = Path(file_path_or_buffer)
+            self._file_buffer = None
+            self._filename_hint = None
+
+            if not self._file_path.exists():
+                raise FileError(
+                    f"File not found: {self._file_path}",
+                    file_path = str(self._file_path),
+                )
+
+            self._format_info = self._detector.detect(self._file_path)
+
         if self._format_info.format_type == "unknown":
+            file_desc = self._filename_hint or self._file_path or "<stream>"
             raise FormatError(
-                f"Unknown file format: {self._file_path}",
-                file_path = str(self._file_path),
+                f"Unknown file format: {file_desc}",
+                file_path = str(file_desc),
             )
 
-        self._sheet_names = self._registry.get_sheet_names(self._file_path)
+        self._sheet_names = self._registry.get_sheet_names(
+            self._file_buffer if self._is_fileobj else self._file_path
+        )
 
         self._sheets: dict[str, MessySheet] = {}
 
         if self._formula_config.mode != FormulaEvaluationMode.DISABLED:
             if self._formula_engine.is_available:
                 try:
-                    self._formula_engine.load_workbook(self._file_path)
-                except Exception as e:
+                    source = self._file_buffer if self._is_fileobj else self._file_path
+                    self._formula_engine.load_workbook(source)
+                except Exception:
                     pass
 
         self._wb: openpyxl.Workbook | None = None
 
     @property
-    def file_path(self) -> Path:
-        """Path to the Excel file."""
+    def file_path(self) -> Path | None:
+        """Path to the Excel file, or None if reading from buffer."""
         return self._file_path
+
+    @property
+    def source(self) -> Path | BinaryIO:
+        """The source file path or buffer."""
+        return self._file_buffer if self._is_fileobj else self._file_path
 
     @property
     def sheet_names(self) -> list[str]:
@@ -93,9 +130,10 @@ class MessyWorkbook:
             name = self._sheet_names[0]
 
         if name not in self._sheet_names:
+            file_desc = self._file_path or self._filename_hint or "<stream>"
             raise FormatError(
                 f"Sheet '{name}' not found",
-                file_path = str(self._file_path),
+                file_path = str(file_desc),
             )
 
         if name not in self._sheets:
@@ -207,11 +245,21 @@ class MessyWorkbook:
             data_only      = True,
         )
 
+        # Reset buffer position before parsing
+        if self._is_fileobj and hasattr(self._file_buffer, "seek"):
+            self._file_buffer.seek(0)
+
         df = self._registry.parse(
-            self._file_path,
+            self.source,
             sheet   = sheet,
             options = parse_options,
         )
+
+        # Skip normalization if disabled
+        if not effective_config.normalize:
+            if effective_config.column_renames:
+                df = df.rename(columns=effective_config.column_renames)
+            return df
 
         pipeline = NormalizationPipeline(
             decimal_separator   = None,
@@ -220,7 +268,16 @@ class MessyWorkbook:
 
         type_hints = effective_config.type_hints.copy()
 
-        df = pipeline.normalize(df, semantic_hints=type_hints)
+        # Build skip_steps based on config
+        skip_steps = []
+        if not effective_config.normalize_whitespace:
+            skip_steps.append("whitespace")
+        if not effective_config.normalize_numbers:
+            skip_steps.append("numbers")
+        if not effective_config.normalize_dates:
+            skip_steps.append("dates")
+
+        df = pipeline.normalize(df, semantic_hints=type_hints, skip_steps=skip_steps)
 
         if effective_config.column_renames:
             df = df.rename(columns=effective_config.column_renames)
@@ -230,7 +287,10 @@ class MessyWorkbook:
     def _analyze_structure(self, sheet: str, config: SheetConfig | None = None) -> StructureInfo:
         """Analyze sheet structure."""
         header_patterns = config.header_patterns if config else None
-        return self._analyzer.analyze(self._file_path, sheet, header_patterns=header_patterns)
+        # Reset buffer position before analysis
+        if self._is_fileobj and hasattr(self._file_buffer, "seek"):
+            self._file_buffer.seek(0)
+        return self._analyzer.analyze(self.source, sheet, header_patterns=header_patterns)
 
     def _apply_structure_detection(
         self,
@@ -300,13 +360,22 @@ class MessyWorkbook:
             header_fallback       = config.header_fallback,
             multi_row_headers     = config.multi_row_headers,
             header_patterns       = config.header_patterns,
+            # Normalization options
+            normalize             = config.normalize,
+            normalize_dates       = config.normalize_dates,
+            normalize_numbers     = config.normalize_numbers,
+            normalize_whitespace  = config.normalize_whitespace,
         )
 
     def _ensure_workbook(self) -> None:
         """Ensure openpyxl workbook is loaded."""
         if self._wb is None:
+            # Reset buffer position before loading
+            if self._is_fileobj and hasattr(self._file_buffer, "seek"):
+                self._file_buffer.seek(0)
+
             self._wb = openpyxl.load_workbook(
-                self._file_path,
+                self.source,
                 read_only = True,
                 data_only = True,
             )
@@ -366,4 +435,10 @@ class MessyWorkbook:
         self.close()
 
     def __repr__(self) -> str:
-        return f"MessyWorkbook({self._file_path.name!r}, sheets={self._sheet_names})"
+        if self._file_path:
+            name = self._file_path.name
+        elif self._filename_hint:
+            name = self._filename_hint
+        else:
+            name = "<stream>"
+        return f"MessyWorkbook({name!r}, sheets={self._sheet_names})"
