@@ -66,9 +66,10 @@ class StructureAnalyzer:
                 file_source.seek(0)
 
         try:
+            # Note: Cannot use read_only=True as ReadOnlyWorksheet doesn't have merged_cells
             wb = openpyxl.load_workbook(
                 file_source,
-                read_only = True,
+                read_only = False,
                 data_only = True,
             )
         except Exception as e:
@@ -189,6 +190,7 @@ class StructureAnalyzer:
                     merged_range.max_col,
                 ))
         except Exception:
+            # Silently fail if worksheet doesn't support merged cells
             pass
         return merged
 

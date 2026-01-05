@@ -4,8 +4,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from messy_xlsx.parsing import CSVHandler
-from messy_xlsx.models import SheetConfig
+from messy_xlsx.parsing import CSVHandler, ParseOptions
 
 
 class TestCSVHandler:
@@ -25,9 +24,9 @@ class TestCSVHandler:
         csv_file.write_text("Name,Age,City\nAlice,30,NYC\nBob,25,LA\n")
 
         handler = CSVHandler()
-        config = SheetConfig()
+        options = ParseOptions()
 
-        df = handler.parse(csv_file, "Sheet1", config)
+        df = handler.parse(csv_file, "Sheet1", options)
 
         assert df is not None
         assert len(df) == 2
@@ -40,9 +39,9 @@ class TestCSVHandler:
         tsv_file.write_text("Name\tAge\tCity\nAlice\t30\tNYC\n")
 
         handler = CSVHandler()
-        config = SheetConfig()
+        options = ParseOptions()
 
-        df = handler.parse(tsv_file, "Sheet1", config)
+        df = handler.parse(tsv_file, "Sheet1", options)
 
         assert df is not None
         assert len(df.columns) == 3
@@ -53,9 +52,9 @@ class TestCSVHandler:
         csv_file.write_text("Name,Value\nTest,123\n", encoding="utf-8")
 
         handler = CSVHandler()
-        config = SheetConfig()
+        options = ParseOptions()
 
-        df = handler.parse(csv_file, "Sheet1", config)
+        df = handler.parse(csv_file, "Sheet1", options)
 
         assert df is not None
 

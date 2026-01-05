@@ -73,14 +73,15 @@ class CSVHandler(FormatHandler):
         try:
             df = pd.read_csv(
                 source_for_pandas,
-                encoding    = None if is_fileobj else encoding,  # Already decoded for StringIO
-                delimiter   = delimiter,
-                skiprows    = options.skip_rows if options.header_rows <= 1 else 0,
-                skipfooter  = options.skip_footer,
-                nrows       = options.max_rows,
-                na_values   = na_values,
-                header      = header,
-                engine      = engine,
+                encoding      = None if is_fileobj else encoding,  # Already decoded for StringIO
+                delimiter     = delimiter,
+                skiprows      = options.skip_rows if options.header_rows <= 1 else 0,
+                skipfooter    = options.skip_footer,
+                nrows         = options.max_rows,
+                na_values     = na_values,
+                header        = header,
+                engine        = engine,
+                on_bad_lines  = "warn",  # Handle malformed rows gracefully
             )
         except UnicodeDecodeError:
             if is_fileobj:

@@ -105,7 +105,7 @@ class XLSXHandler(FormatHandler):
             if options.skip_footer > 0:
                 df = df.iloc[:-options.skip_footer]
 
-            if options.header_rows > 0 and len(df) > options.header_rows:
+            if options.header_rows > 0 and len(df) >= options.header_rows:
                 df, columns = self._generate_column_names(df, options.header_rows)
                 df.columns  = columns
                 df          = df.reset_index(drop=True)
@@ -199,15 +199,19 @@ class XLSXHandler(FormatHandler):
         """Clean Excel-specific data issues."""
         # Replace Excel errors with NaN using map to avoid FutureWarning
         error_set = set(EXCEL_ERRORS)
-        for col in df.columns:
-            if df[col].dtype == object:
-                df[col] = df[col].map(lambda x: np.nan if x in error_set else x)
+
+        # Handle duplicate column names by using integer positions
+        for idx in range(len(df.columns)):
+            series = df.iloc[:, idx]
+            if series.dtype == object:
+                df.iloc[:, idx] = series.map(lambda x: np.nan if x in error_set else x)
 
         if options.na_values:
             na_set = set(options.na_values)
-            for col in df.columns:
-                if df[col].dtype == object:
-                    df[col] = df[col].map(lambda x: np.nan if x in na_set else x)
+            for idx in range(len(df.columns)):
+                series = df.iloc[:, idx]
+                if series.dtype == object:
+                    df.iloc[:, idx] = series.map(lambda x: np.nan if x in na_set else x)
 
         return df
 

@@ -11,7 +11,7 @@ class TestNumberNormalizer:
 
     def test_normalize_us_format(self):
         """Test normalizing US number format."""
-        normalizer = NumberNormalizer(locale="en_US")
+        normalizer = NumberNormalizer(decimal_separator=".", thousands_separator=",")
 
         df = pd.DataFrame({
             "amount": ["1,234.56", "2,345.67", "3,456.78"]
@@ -24,7 +24,7 @@ class TestNumberNormalizer:
 
     def test_normalize_european_format(self):
         """Test normalizing European number format."""
-        normalizer = NumberNormalizer(locale="de_DE")
+        normalizer = NumberNormalizer(decimal_separator=",", thousands_separator=".")
 
         df = pd.DataFrame({
             "amount": ["1.234,56", "2.345,67", "3.456,78"]
@@ -37,7 +37,7 @@ class TestNumberNormalizer:
 
     def test_remove_currency_symbols(self):
         """Test removing currency symbols."""
-        normalizer = NumberNormalizer(locale="en_US")
+        normalizer = NumberNormalizer(decimal_separator=".", thousands_separator=",")
 
         df = pd.DataFrame({
             "amount": ["$1,234.56", "€2,345.67", "£3,456.78"]
@@ -50,7 +50,7 @@ class TestNumberNormalizer:
 
     def test_accounting_format(self):
         """Test handling accounting format (negative in parentheses)."""
-        normalizer = NumberNormalizer(locale="en_US")
+        normalizer = NumberNormalizer(decimal_separator=".", thousands_separator=",")
 
         df = pd.DataFrame({
             "amount": ["1,234.56", "(234.56)", "567.89"]
@@ -62,7 +62,7 @@ class TestNumberNormalizer:
 
     def test_auto_locale_detection(self):
         """Test automatic locale detection."""
-        normalizer = NumberNormalizer(locale="auto")
+        normalizer = NumberNormalizer()  # Auto-detect when None
 
         df = pd.DataFrame({
             "us_format": ["1,234.56", "2,345.67"],
@@ -76,7 +76,7 @@ class TestNumberNormalizer:
 
     def test_preserve_integers(self):
         """Test that integer values are preserved."""
-        normalizer = NumberNormalizer(locale="en_US")
+        normalizer = NumberNormalizer(decimal_separator=".", thousands_separator=",")
 
         df = pd.DataFrame({
             "count": [100, 200, 300]

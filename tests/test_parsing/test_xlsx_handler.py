@@ -2,7 +2,6 @@
 
 import pytest
 from messy_xlsx.parsing import XLSXHandler, ParseOptions
-from messy_xlsx.models import SheetConfig
 
 
 class TestXLSXHandler:
@@ -20,9 +19,9 @@ class TestXLSXHandler:
     def test_parse_simple_xlsx(self, sample_xlsx):
         """Test parsing simple XLSX file."""
         handler = XLSXHandler()
-        config = SheetConfig()
+        options = ParseOptions()
 
-        df = handler.parse(sample_xlsx, "Data", config)
+        df = handler.parse(sample_xlsx, "Data", options)
 
         assert df is not None
         assert len(df) == 3
@@ -49,9 +48,9 @@ class TestXLSXHandler:
     def test_handle_merged_cells(self, merged_cells_xlsx):
         """Test handling merged cells."""
         handler = XLSXHandler()
-        config = SheetConfig(merge_strategy="fill")
+        options = ParseOptions(merge_strategy="fill")
 
-        df = handler.parse(merged_cells_xlsx, "Data", config)
+        df = handler.parse(merged_cells_xlsx, "Data", options)
 
         assert df is not None
         assert len(df) > 0
@@ -59,18 +58,18 @@ class TestXLSXHandler:
     def test_skip_rows_config(self, messy_xlsx):
         """Test skip_rows configuration."""
         handler = XLSXHandler()
-        config = SheetConfig(skip_rows=3)  # Skip metadata rows
+        options = ParseOptions(skip_rows=3)  # Skip metadata rows
 
-        df = handler.parse(messy_xlsx, "Report", config)
+        df = handler.parse(messy_xlsx, "Report", options)
 
         assert df is not None
 
     def test_parse_formulas(self, messy_xlsx):
         """Test parsing files with formulas."""
         handler = XLSXHandler()
-        config = SheetConfig(evaluate_formulas=False)
+        options = ParseOptions(data_only=False)
 
-        df = handler.parse(messy_xlsx, "Report", config)
+        df = handler.parse(messy_xlsx, "Report", options)
 
         # Should return data (cached values or formulas)
         assert df is not None

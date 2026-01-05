@@ -69,11 +69,11 @@ class MissingValueHandler:
         """Handle missing values in DataFrame."""
         df = df.copy()
 
-        df = df.replace(self.missing_values, np.nan)
+        df = df.replace(self.missing_values, np.nan).infer_objects(copy=False)
 
         if self.empty_string_as_na:
-            df = df.replace("", np.nan)
-            df = df.replace(r"^\s*$", np.nan, regex=True)
+            df = df.replace("", np.nan).infer_objects(copy=False)
+            df = df.replace(r"^\s*$", np.nan, regex=True).infer_objects(copy=False)
 
         if drop_empty_rows:
             df = df.dropna(how="all")

@@ -50,8 +50,11 @@ class TestHeaderOnlyFiles:
         wb.save(file_path)
         wb.close()
 
+        from messy_xlsx.models import SheetConfig
         with MessyWorkbook(file_path) as mwb:
-            df = mwb.to_dataframe()
+            # Disable normalization since empty columns would be dropped
+            config = SheetConfig(auto_detect=False, header_rows=1, normalize=False)
+            df = mwb.to_dataframe(config=config)
             assert len(df) == 0
             assert list(df.columns) == ["Name", "Age", "City"]
 

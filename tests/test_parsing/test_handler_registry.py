@@ -38,18 +38,20 @@ class TestHandlerRegistry:
         """Test handling unsupported format."""
         registry = HandlerRegistry()
 
-        with pytest.raises(Exception):
-            registry.get_handler("unsupported")
+        handler = registry.get_handler("unsupported")
+        assert handler is None
 
     def test_parse_with_fallback(self, sample_xlsx):
         """Test parsing with fallback chain."""
+        from messy_xlsx.parsing import ParseOptions
         registry = HandlerRegistry()
 
-        df = registry.parse_with_fallback(
-            file_path=sample_xlsx,
+        # parse() method already implements fallback logic
+        df = registry.parse(
+            file_source=sample_xlsx,
             sheet="Data",
-            config=None,
-            format_hint="xlsx"
+            options=ParseOptions(),
+            format_type="xlsx"
         )
 
         assert df is not None

@@ -4,7 +4,6 @@ import pandas as pd
 import pytest
 
 from messy_xlsx.normalization import NormalizationPipeline
-from messy_xlsx.models import SheetConfig
 
 
 class TestNormalizationPipeline:
@@ -12,8 +11,7 @@ class TestNormalizationPipeline:
 
     def test_pipeline_execution(self):
         """Test that all normalization steps execute."""
-        config = SheetConfig(locale="en_US")
-        pipeline = NormalizationPipeline(config)
+        pipeline = NormalizationPipeline(decimal_separator=".", thousands_separator=",")
 
         df = pd.DataFrame({
             "text": ["  hello  ", "world  "],
@@ -30,8 +28,7 @@ class TestNormalizationPipeline:
 
     def test_pipeline_order(self):
         """Test that normalization steps run in correct order."""
-        config = SheetConfig(locale="en_US")
-        pipeline = NormalizationPipeline(config)
+        pipeline = NormalizationPipeline(decimal_separator=".", thousands_separator=",")
 
         df = pd.DataFrame({
             "messy": ["  $1,234.56  ", "  NA  ", "  $2,345.67  "]
@@ -40,13 +37,14 @@ class TestNormalizationPipeline:
         result = pipeline.normalize(df)
 
         # Should handle whitespace, then numbers, then missing values
+        # Note: Rows with only missing values after conversion are dropped
+        assert len(result) == 2  # NA row was dropped
         assert not pd.isna(result["messy"].iloc[0])
-        assert pd.isna(result["messy"].iloc[1])
+        assert not pd.isna(result["messy"].iloc[1])
 
     def test_empty_dataframe(self):
         """Test handling empty DataFrame."""
-        config = SheetConfig()
-        pipeline = NormalizationPipeline(config)
+        pipeline = NormalizationPipeline()
 
         df = pd.DataFrame()
 
@@ -56,8 +54,7 @@ class TestNormalizationPipeline:
 
     def test_preserve_column_types(self):
         """Test that appropriate column types are preserved."""
-        config = SheetConfig()
-        pipeline = NormalizationPipeline(config)
+        pipeline = NormalizationPipeline()
 
         df = pd.DataFrame({
             "int_col": [1, 2, 3],

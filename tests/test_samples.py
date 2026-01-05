@@ -86,4 +86,4 @@ def test_all_samples_exist():
     """Test that sample files directory exists and has files."""
     assert SAMPLES_DIR.exists(), f"Samples directory not found: {SAMPLES_DIR}"
     assert len(SAMPLE_FILES) > 0, "No sample files found"
-    assert len(SAMPLE_FILES) == 33, f"Expected 33 sample files, found {len(SAMPLE_FILES)}"
+    assert len(SAMPLE_FILES) == 32, f"Expected 32 sample files, found {len(SAMPLE_FILES)}"

@@ -88,9 +88,33 @@ class MessyWorkbook:
                 file_path = str(file_desc),
             )
 
-        self._sheet_names = self._registry.get_sheet_names(
-            self._file_buffer if self._is_fileobj else self._file_path
-        )
+        # Validate extension matches detected format for Excel files
+        # This catches files with .xlsx extension but different content
+        if not self._is_fileobj:
+            file_ext = self._file_path.suffix.lower()
+            excel_extensions = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"}
+            if file_ext in excel_extensions and self._format_info.format_type not in ("xlsx", "xlsm", "xls", "xltx", "xltm"):
+                raise FormatError(
+                    f"File extension {file_ext} suggests Excel format, but content is {self._format_info.format_type}",
+                    file_path=str(self._file_path),
+                    detected_format=self._format_info.format_type,
+                )
+
+        # Get sheet names and validate file is readable
+        source = self._file_buffer if self._is_fileobj else self._file_path
+        self._sheet_names = self._registry.get_sheet_names(source)
+
+        # Validate that the file is actually readable (not just format-detected)
+        # This catches corrupted files that pass format detection but can't be opened
+        if self._format_info.format_type in ("xlsx", "xlsm", "xltx", "xltm", "xls"):
+            is_valid, error = self._registry.validate(source, self._format_info.format_type)
+            if not is_valid:
+                file_desc = self._filename_hint or self._file_path or "<stream>"
+                raise FormatError(
+                    f"File appears corrupted or invalid: {error}",
+                    file_path=str(file_desc),
+                    detected_format=self._format_info.format_type,
+                )
 
         self._sheets: dict[str, MessySheet] = {}
 
@@ -229,7 +253,8 @@ class MessyWorkbook:
         """Parse a sheet to DataFrame with normalization."""
         config = config or self._sheet_config
 
-        if config.auto_detect:
+        # Skip structure analysis for CSV/TSV/TXT - these formats don't support openpyxl
+        if config.auto_detect and self.format_type not in ("csv", "tsv", "txt"):
             structure        = self._analyze_structure(sheet, config)
             effective_config = self._apply_structure_detection(config, structure)
         else:
@@ -374,10 +399,12 @@ class MessyWorkbook:
             if self._is_fileobj and hasattr(self._file_buffer, "seek"):
                 self._file_buffer.seek(0)
 
+            # Load with data_only=False to preserve formula information
+            # Note: read_only=True is incompatible with some features (merged_cells)
             self._wb = openpyxl.load_workbook(
                 self.source,
-                read_only = True,
-                data_only = True,
+                read_only = False,
+                data_only = False,
             )
 
     def _get_data_type(self, value: Any) -> str:
