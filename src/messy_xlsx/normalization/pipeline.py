@@ -9,6 +9,7 @@ import pandas as pd
 from messy_xlsx.normalization.dates import DateNormalizer
 from messy_xlsx.normalization.missing_values import MissingValueHandler
 from messy_xlsx.normalization.numbers import NumberNormalizer
+from messy_xlsx.normalization.type_coercion import TypeCoercionNormalizer
 from messy_xlsx.normalization.type_inference import SemanticTypeInference
 from messy_xlsx.normalization.whitespace import WhitespaceNormalizer
 
@@ -28,11 +29,12 @@ class NormalizationPipeline:
         preserve_linebreaks: bool = False,
     ):
         """Initialize pipeline."""
-        self.whitespace       = WhitespaceNormalizer()
-        self.numbers          = NumberNormalizer(decimal_separator, thousands_separator)
-        self.dates            = DateNormalizer()
-        self.missing          = MissingValueHandler(extra_missing_values)
-        self.type_inference   = SemanticTypeInference()
+        self.whitespace        = WhitespaceNormalizer()
+        self.numbers           = NumberNormalizer(decimal_separator, thousands_separator)
+        self.dates             = DateNormalizer()
+        self.missing           = MissingValueHandler(extra_missing_values)
+        self.type_coercion     = TypeCoercionNormalizer()
+        self.type_inference    = SemanticTypeInference()
         self.preserve_linebreaks = preserve_linebreaks
 
     def normalize(
@@ -58,6 +60,10 @@ class NormalizationPipeline:
 
         if "missing" not in skip_steps:
             df = self.missing.normalize(df)
+
+        # Type coercion should be last - ensures BQ/Arrow compatibility
+        if "type_coercion" not in skip_steps:
+            df = self.type_coercion.normalize(df)
 
         return df
 

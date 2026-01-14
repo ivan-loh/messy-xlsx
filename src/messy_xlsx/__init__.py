@@ -26,6 +26,13 @@ from messy_xlsx.models import (
     StructureInfo,
 )
 from messy_xlsx.workbook import MessyWorkbook
+from messy_xlsx.multi_sheet import (
+    MultiSheetParser,
+    MultiSheetOptions,
+    SheetInfo,
+    read_all_sheets,
+    analyze_excel,
+)
 
 
 # ============================================================================
@@ -51,6 +58,12 @@ __all__ = [
     "FormulaConfig",
     "FormulaEvaluationMode",
     "CircularRefStrategy",
+    # Multi-sheet parsing
+    "MultiSheetParser",
+    "MultiSheetOptions",
+    "SheetInfo",
+    "read_all_sheets",
+    "analyze_excel",
 ]
 
 

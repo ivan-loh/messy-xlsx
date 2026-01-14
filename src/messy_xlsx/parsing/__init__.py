@@ -5,7 +5,7 @@
 # ============================================================================
 
 from messy_xlsx.parsing.base_handler import FormatHandler, ParseOptions
-from messy_xlsx.parsing.csv_handler import CSVHandler
+from messy_xlsx.parsing.csv_handler import CSVHandler, MetadataRowDetector
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
 from messy_xlsx.parsing.xls_handler import XLSHandler
 from messy_xlsx.parsing.xlsx_handler import XLSXHandler
@@ -21,5 +21,6 @@ __all__ = [
     "XLSXHandler",
     "XLSHandler",
     "CSVHandler",
+    "MetadataRowDetector",
     "HandlerRegistry",
 ]

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "messy-xlsx"
-version = "0.4.1"
+version = "0.5.0"
 description = "A Python library for parsing messy Excel files with intelligent structure detection and formula evaluation"
 readme = "README.md"
 license = "MIT"
@@ -33,6 +33,7 @@ classifiers = [
 ]
 
 dependencies = [
+    "fastexcel>=0.11.0",
     "openpyxl>=3.1.0",
     "pandas>=2.0.0",
     "numpy>=1.24.0",

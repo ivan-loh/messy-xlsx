@@ -51,6 +51,8 @@ class ParseOptions:
 
     cell_range: str | None = None
 
+    auto_detect_header: bool = False
+
 
 # ============================================================================
 # Core

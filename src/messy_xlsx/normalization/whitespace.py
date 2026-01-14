@@ -4,7 +4,19 @@
 # Imports
 # ============================================================================
 
+import re
+
 import pandas as pd
+
+
+# ============================================================================
+# Compiled patterns (avoid recompiling on each call)
+# ============================================================================
+
+# Matches horizontal whitespace (space, tab, NBSP) - preserves newlines
+_HORIZONTAL_WS_PATTERN = re.compile(r"[ \t\xa0]+")
+# Matches all whitespace including NBSP and newlines
+_ALL_WS_PATTERN = re.compile(r"[\s\xa0]+")
 
 
 # ============================================================================
@@ -42,15 +54,14 @@ class WhitespaceNormalizer:
 
         text = result[mask].astype(str)
 
-        text = text.str.strip()
-
-        text = text.str.replace("\xa0", " ", regex=False)
-        text = text.str.replace("\u00a0", " ", regex=False)
-
-        if not preserve_linebreaks:
-            text = text.str.replace(r"[\r\n]+", " ", regex=True)
-
-        text = text.str.replace(r"\s+", " ", regex=True)
+        # Single-pass replacement using pre-compiled pattern
+        # Replaces NBSP and collapses whitespace sequences to single space
+        if preserve_linebreaks:
+            # Only collapse horizontal whitespace (space, tab, NBSP), preserve newlines
+            text = text.str.replace(_HORIZONTAL_WS_PATTERN, " ", regex=True)
+        else:
+            # Collapse all whitespace including newlines and NBSP
+            text = text.str.replace(_ALL_WS_PATTERN, " ", regex=True)
 
         text = text.str.strip()
 

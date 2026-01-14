@@ -224,9 +224,10 @@ class StructureAnalyzer:
         import re
 
         start_row = data_region["start_row"]
-        end_row   = min(start_row + 10, data_region["end_row"])
+        end_row   = min(start_row + 15, data_region["end_row"])
         start_col = data_region["start_col"]
         end_col   = data_region["end_col"]
+        total_cols = end_col - start_col + 1
 
         best_header_row = None
         best_confidence = 0.0
@@ -250,31 +251,68 @@ class StructureAnalyzer:
             if not all_strings:
                 continue
 
+            # Calculate column coverage (what % of columns are filled)
+            coverage = len(non_empty) / total_cols if total_cols > 0 else 0
+
+            # Sparse rows (1-2 cells) are likely metadata, not headers
+            # Penalize heavily if coverage is very low
+            if coverage < 0.3 and len(non_empty) <= 2:
+                continue  # Skip metadata-like rows entirely
+
+            # Check for numbers in rows below (look ahead up to 3 rows)
             has_numbers_below = False
-            if row_idx < data_region["end_row"]:
-                next_row_values = []
+            for look_ahead in range(1, 4):
+                check_row = row_idx + look_ahead
+                if check_row > data_region["end_row"]:
+                    break
                 for col_idx in range(start_col, end_col + 1):
                     try:
-                        cell = ws.cell(row_idx + 1, col_idx)
-                        next_row_values.append(cell.value)
+                        cell = ws.cell(check_row, col_idx)
+                        if isinstance(cell.value, (int, float)):
+                            has_numbers_below = True
+                            break
                     except Exception:
                         pass
+                if has_numbers_below:
+                    break
 
-                has_numbers_below = any(
-                    isinstance(v, (int, float)) for v in next_row_values if v is not None
-                )
+            # Base confidence
+            confidence = 0.3
 
-            confidence = 0.5
+            # Boost for all strings
             if all_strings:
+                confidence += 0.1
+
+            # Boost for good column coverage
+            if coverage >= 0.5:
                 confidence += 0.2
+            elif coverage >= 0.3:
+                confidence += 0.1
+
+            # Boost for numbers in data rows below
             if has_numbers_below:
                 confidence += 0.2
 
+            # Boost for header-like naming patterns (snake_case, contains common header words)
+            header_like_count = 0
+            for val in non_empty:
+                val_str = str(val).lower()
+                # Check for snake_case or common header patterns
+                if re.match(r'^[a-z][a-z0-9_]*$', val_str):  # snake_case
+                    header_like_count += 1
+                elif re.search(r'\b(id|name|date|time|code|type|status|number|amount|qty|count|total)\b', val_str, re.I):
+                    header_like_count += 1
+
+            if header_like_count > 0:
+                header_ratio = header_like_count / len(non_empty)
+                confidence += min(0.2, header_ratio * 0.3)
+
+            # Boost for merged cells in header
             has_merged = any(
                 mr[0] == row_idx for mr in merged_ranges
             )
             if has_merged:
-                confidence += 0.1
+                confidence += 0.05
 
             # Pattern matching boost
             if header_patterns:
@@ -284,7 +322,7 @@ class StructureAnalyzer:
                     if re.search(pattern, row_text, re.IGNORECASE)
                 )
                 if pattern_matches > 0:
-                    confidence += min(0.2, 0.05 * pattern_matches)
+                    confidence += min(0.15, 0.05 * pattern_matches)
 
             if confidence > best_confidence:
                 best_confidence = confidence
