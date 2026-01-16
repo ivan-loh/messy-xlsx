@@ -8,7 +8,7 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
-from messy_xlsx import MessyWorkbook
+from messy_xlsx import MessyWorkbook, SheetConfig, sanitize_column_name
 
 
 # Find all sample files
@@ -185,8 +185,8 @@ class TestBigQueryCompatibility:
 class TestColumnNameNormalization:
     """Test that column names can be made BigQuery compatible."""
 
-    def test_detect_invalid_column_names(self, tmp_path):
-        """Should detect column names that are invalid for BigQuery."""
+    def test_detect_invalid_column_names_when_sanitization_off(self, tmp_path):
+        """Should detect column names that are invalid for BigQuery when sanitization is disabled."""
         import openpyxl
 
         file_path = tmp_path / "names.xlsx"
@@ -196,7 +196,9 @@ class TestColumnNameNormalization:
         ws.append([1, 2, 3, 4, 5])
         wb.save(file_path)
 
-        with MessyWorkbook(file_path) as mwb:
+        # With sanitization OFF
+        config = SheetConfig(sanitize_column_names=False)
+        with MessyWorkbook(file_path, sheet_config=config) as mwb:
             df = mwb.to_dataframe()
 
         issues = check_bigquery_compatible(df)
@@ -204,6 +206,208 @@ class TestColumnNameNormalization:
 
         # Should detect at least some invalid names
         assert len(name_issues) >= 3, f"Should detect invalid column names, found: {name_issues}"
+
+
+class TestSanitizeColumnNameFunction:
+    """Test the sanitize_column_name utility function."""
+
+    def test_basic_transformation(self):
+        """Test basic column name sanitization."""
+        assert sanitize_column_name("First Name") == "first_name"
+        assert sanitize_column_name("Amount ($)") == "amount"
+        assert sanitize_column_name("Sales (Q1-2024)") == "sales_q1_2024"
+
+    def test_digit_prefix(self):
+        """Names starting with digits get 'col_' prefix."""
+        assert sanitize_column_name("123-ID") == "col_123_id"
+        assert sanitize_column_name("1st Place") == "col_1st_place"
+        assert sanitize_column_name("2024 Revenue") == "col_2024_revenue"
+
+    def test_special_characters(self):
+        """Special characters are replaced with underscores."""
+        assert sanitize_column_name("email@domain") == "email_domain"
+        assert sanitize_column_name("price#1") == "price_1"
+        assert sanitize_column_name("user.name") == "user_name"
+        assert sanitize_column_name("field/value") == "field_value"
+
+    def test_unicode_characters(self):
+        """Unicode characters should be removed (not BigQuery compatible)."""
+        assert sanitize_column_name("café") == "caf"
+        assert sanitize_column_name("naïve") == "na_ve"
+        assert sanitize_column_name("日本語") == "unnamed"
+
+    def test_consecutive_underscores(self):
+        """Consecutive underscores should be collapsed."""
+        assert sanitize_column_name("a__b") == "a_b"
+        assert sanitize_column_name("a___b___c") == "a_b_c"
+        assert sanitize_column_name("first  name") == "first_name"
+
+    def test_leading_trailing_underscores(self):
+        """Leading/trailing underscores should be stripped."""
+        assert sanitize_column_name("_name_") == "name"
+        assert sanitize_column_name("__id__") == "id"
+        assert sanitize_column_name("  name  ") == "name"
+
+    def test_empty_and_none(self):
+        """Empty strings and None should return 'unnamed'."""
+        assert sanitize_column_name(None) == "unnamed"
+        assert sanitize_column_name("") == "unnamed"
+        assert sanitize_column_name("   ") == "unnamed"
+        assert sanitize_column_name("nan") == "unnamed"
+        assert sanitize_column_name("NaN") == "unnamed"
+
+    def test_lowercase_conversion(self):
+        """All names should be converted to lowercase."""
+        assert sanitize_column_name("UPPERCASE") == "uppercase"
+        assert sanitize_column_name("MixedCase") == "mixedcase"
+        assert sanitize_column_name("camelCase") == "camelcase"
+
+    def test_max_length_truncation(self):
+        """Names exceeding max_length should be truncated."""
+        long_name = "a" * 350
+        result = sanitize_column_name(long_name)
+        assert len(result) == 300
+        assert result == "a" * 300
+
+        # With custom max_length
+        result = sanitize_column_name(long_name, max_length=10)
+        assert len(result) == 10
+
+    def test_truncation_strips_trailing_underscore(self):
+        """Truncation should not leave trailing underscores."""
+        name = "a" * 299 + "_b"  # 301 chars, truncates to 300
+        result = sanitize_column_name(name, max_length=300)
+        assert not result.endswith("_")
+
+    def test_bigquery_pattern_compliance(self):
+        """All results should match BigQuery's column name pattern."""
+        test_cases = [
+            "First Name", "Amount ($)", "123-ID", "Sales (Q1-2024)",
+            "email@domain.com", "user.name", "UPPERCASE", "  spaces  ",
+            "_underscore_", "normal_name", "αβγ", "日本語",
+        ]
+        pattern = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+        for name in test_cases:
+            result = sanitize_column_name(name)
+            if result != "unnamed":  # unnamed is also valid
+                assert pattern.match(result), f"'{name}' -> '{result}' doesn't match BigQuery pattern"
+
+
+class TestSanitizeColumnNamesConfig:
+    """Test the sanitize_column_names config option."""
+
+    def test_sanitization_enabled_by_default(self, tmp_path):
+        """Sanitization should be enabled by default."""
+        import openpyxl
+
+        file_path = tmp_path / "test.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["First Name", "Amount ($)", "123-ID"])
+        ws.append(["Alice", 100, "A001"])
+        wb.save(file_path)
+
+        with MessyWorkbook(file_path) as mwb:
+            df = mwb.to_dataframe()
+
+        assert list(df.columns) == ["first_name", "amount", "col_123_id"]
+
+    def test_sanitization_can_be_disabled(self, tmp_path):
+        """Sanitization can be disabled via config."""
+        import openpyxl
+
+        file_path = tmp_path / "test.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["First Name", "Amount ($)", "123-ID"])
+        ws.append(["Alice", 100, "A001"])
+        wb.save(file_path)
+
+        config = SheetConfig(sanitize_column_names=False)
+        with MessyWorkbook(file_path, sheet_config=config) as mwb:
+            df = mwb.to_dataframe()
+
+        # Original names preserved
+        assert list(df.columns) == ["First Name", "Amount ($)", "123-ID"]
+
+    def test_user_renames_take_precedence(self, tmp_path):
+        """User-specified column_renames should override sanitization."""
+        import openpyxl
+
+        file_path = tmp_path / "test.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["First Name", "Amount ($)"])
+        ws.append(["Alice", 100])
+        wb.save(file_path)
+
+        config = SheetConfig(
+            sanitize_column_names=True,
+            column_renames={"first_name": "user_name"}  # Rename after sanitization
+        )
+        with MessyWorkbook(file_path, sheet_config=config) as mwb:
+            df = mwb.to_dataframe()
+
+        assert "user_name" in df.columns
+        assert "amount" in df.columns
+
+    def test_duplicate_column_handling(self, tmp_path):
+        """Duplicate column names after sanitization should get suffixes."""
+        import openpyxl
+
+        file_path = tmp_path / "test.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        # These will all become "name" after sanitization
+        ws.append(["Name", "NAME", "name"])
+        ws.append(["Alice", "Bob", "Charlie"])
+        wb.save(file_path)
+
+        with MessyWorkbook(file_path) as mwb:
+            df = mwb.to_dataframe()
+
+        # Should have unique names
+        assert len(set(df.columns)) == 3
+        assert "name" in df.columns
+        assert "name_1" in df.columns
+        assert "name_2" in df.columns
+
+    def test_all_columns_match_bigquery_pattern(self, tmp_path):
+        """All sanitized columns should match BigQuery's pattern."""
+        import openpyxl
+
+        file_path = tmp_path / "test.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["First Name", "Amount ($)", "123-ID", "日本語", "café", "email@domain"])
+        ws.append(["Alice", 100, "A001", "test", "test", "test"])
+        wb.save(file_path)
+
+        with MessyWorkbook(file_path) as mwb:
+            df = mwb.to_dataframe()
+
+        pattern = re.compile(r"^[a-z_][a-z0-9_]*$")
+        for col in df.columns:
+            assert pattern.match(col), f"Column '{col}' doesn't match BigQuery pattern"
+
+    def test_sanitization_works_with_normalization_disabled(self, tmp_path):
+        """Sanitization should work even when normalization is disabled."""
+        import openpyxl
+
+        file_path = tmp_path / "test.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["First Name", "Amount"])
+        ws.append(["Alice", "100"])
+        wb.save(file_path)
+
+        config = SheetConfig(normalize=False, sanitize_column_names=True)
+        with MessyWorkbook(file_path, sheet_config=config) as mwb:
+            df = mwb.to_dataframe()
+
+        # Columns should still be sanitized
+        assert list(df.columns) == ["first_name", "amount"]
 
 
 def convert_to_arrow(df: pd.DataFrame) -> tuple[pa.Table | None, str | None]:

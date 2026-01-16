@@ -108,7 +108,8 @@ class TestBasicParsing:
         df = workbook.to_dataframe()
 
         assert len(df) == 3
-        assert list(df.columns) == ["Name", "Age", "City"]
+        # Column names are sanitized by default (lowercased)
+        assert list(df.columns) == ["name", "age", "city"]
 
         workbook.close()
 

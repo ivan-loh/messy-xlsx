@@ -296,12 +296,12 @@ class TestParsing:
         sheets = read_all_sheets(multi_sheet_xlsx)
 
         report = sheets["Report"]
-        # Should have correct column names from row 3
-        assert "Name" in report.columns
-        assert "Department" in report.columns
-        assert "Salary" in report.columns
+        # Should have correct column names from row 3 (sanitized to lowercase)
+        assert "name" in report.columns
+        assert "department" in report.columns
+        assert "salary" in report.columns
         # Should not have metadata in data
-        assert not any("Printed" in str(v) for v in report["Name"])
+        assert not any("Printed" in str(v) for v in report["name"])
 
     def test_parse_specific_sheet(self, multi_sheet_xlsx):
         """Test parsing a specific sheet by name."""
@@ -310,7 +310,8 @@ class TestParsing:
 
         assert isinstance(df, pd.DataFrame)
         assert len(df) == 3
-        assert "Product" in df.columns
+        # Column names are sanitized to lowercase by default
+        assert "product" in df.columns
 
 
 class TestColumnCleaning:
@@ -330,8 +331,8 @@ class TestColumnCleaning:
         sheets = read_all_sheets(messy_columns_xlsx)
         df = sheets["Data"]
 
-        # P/O No. should become P_O_No or similar
-        assert any("P" in col and "O" in col for col in df.columns)
+        # P/O No. should become p_o_no (lowercase, no slashes/dots)
+        assert any("p" in col and "o" in col for col in df.columns)
         # No slashes or dots in column names
         for col in df.columns:
             assert "/" not in col
@@ -365,8 +366,8 @@ class TestTypeConsistency:
         sheets = read_all_sheets(mixed_types_xlsx)
         df = sheets["Data"]
 
-        # Code column had mixed int/str, should all be strings now
-        code_types = set(type(v).__name__ for v in df["Code"].dropna())
+        # Code column had mixed int/str, should all be strings now (column name is lowercase)
+        code_types = set(type(v).__name__ for v in df["code"].dropna())
         assert len(code_types) == 1, f"Expected single type, got {code_types}"
 
     def test_pure_numeric_stays_numeric(self, multi_sheet_xlsx):
@@ -374,9 +375,9 @@ class TestTypeConsistency:
         sheets = read_all_sheets(multi_sheet_xlsx)
         df = sheets["Sales"]
 
-        # Price and Quantity should be numeric
-        assert df["Price"].dtype in ["float64", "int64"]
-        assert df["Quantity"].dtype in ["float64", "int64"]
+        # Price and Quantity should be numeric (column names are lowercase)
+        assert df["price"].dtype in ["float64", "int64"]
+        assert df["quantity"].dtype in ["float64", "int64"]
 
     def test_can_disable_type_consistency(self, mixed_types_xlsx):
         """Test that type consistency can be disabled."""
@@ -386,8 +387,8 @@ class TestTypeConsistency:
         )
         df = sheets["Data"]
 
-        # Mixed types may still exist
-        code_types = set(type(v).__name__ for v in df["Code"].dropna())
+        # Mixed types may still exist (column name is lowercase)
+        code_types = set(type(v).__name__ for v in df["code"].dropna())
         # Could be mixed or not depending on pandas inference
         assert len(code_types) >= 1
 
@@ -529,8 +530,8 @@ class TestEdgeCases:
 
         sheets = read_all_sheets(file_path)
         df = sheets["Data"]
-        # Should correctly identify row 0 as headers
-        assert "Name" in df.columns
+        # Should correctly identify row 0 as headers (column names are lowercase)
+        assert "name" in df.columns
         assert len(df) == 2
 
 

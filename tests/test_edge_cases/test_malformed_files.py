@@ -52,8 +52,8 @@ class TestHeaderOnlyFiles:
 
         from messy_xlsx.models import SheetConfig
         with MessyWorkbook(file_path) as mwb:
-            # Disable normalization since empty columns would be dropped
-            config = SheetConfig(auto_detect=False, header_rows=1, normalize=False)
+            # Disable normalization and sanitization to preserve original column names
+            config = SheetConfig(auto_detect=False, header_rows=1, normalize=False, sanitize_column_names=False)
             df = mwb.to_dataframe(config=config)
             assert len(df) == 0
             assert list(df.columns) == ["Name", "Age", "City"]
@@ -180,7 +180,9 @@ class TestSpecialCharacters:
         wb.save(file_path)
         wb.close()
 
-        with MessyWorkbook(file_path) as mwb:
+        # Disable sanitization to preserve Unicode headers
+        config = SheetConfig(sanitize_column_names=False)
+        with MessyWorkbook(file_path, sheet_config=config) as mwb:
             df = mwb.to_dataframe()
             assert len(df) == 1
             assert "名前" in df.columns

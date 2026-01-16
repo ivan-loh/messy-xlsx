@@ -46,10 +46,10 @@ class TestRegressionBugs:
         with MessyWorkbook(file_path, sheet_config=config) as mwb:
             df = mwb.to_dataframe()
 
-            # Should parse as 1234.56
+            # Should parse as 1234.56 (column name is lowercase)
             import pandas as pd
-            if pd.api.types.is_numeric_dtype(df["Amount"]):
-                assert df.iloc[0]["Amount"] == pytest.approx(1234.56)
+            if pd.api.types.is_numeric_dtype(df["amount"]):
+                assert df.iloc[0]["amount"] == pytest.approx(1234.56)
 
     def test_merged_cells_dont_crash(self, temp_dir):
         """Regression: Merged cells should not crash parser."""

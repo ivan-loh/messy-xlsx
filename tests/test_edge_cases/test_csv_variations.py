@@ -58,7 +58,8 @@ class TestCSVQuoting:
         with MessyWorkbook(csv_file) as wb:
             df = wb.to_dataframe()
             assert len(df) == 1
-            assert df.iloc[0]["Name"] == "Smith, John"
+            # Column names are sanitized to lowercase by default
+            assert df.iloc[0]["name"] == "Smith, John"
 
     def test_quoted_fields_with_newlines(self, temp_dir):
         """Test quoted fields containing newlines."""
