@@ -282,6 +282,9 @@ class MessyWorkbook:
 
         # Skip normalization if disabled
         if not effective_config.normalize:
+            # Still apply sanitization if enabled
+            if effective_config.sanitize_column_names:
+                df = self._sanitize_columns(df)
             if effective_config.column_renames:
                 df = df.rename(columns=effective_config.column_renames)
             return df
@@ -304,6 +307,11 @@ class MessyWorkbook:
 
         df = pipeline.normalize(df, semantic_hints=type_hints, skip_steps=skip_steps)
 
+        # Sanitize column names if requested
+        if effective_config.sanitize_column_names:
+            df = self._sanitize_columns(df)
+
+        # Apply user renames (user overrides take precedence)
         if effective_config.column_renames:
             df = df.rename(columns=effective_config.column_renames)
 
@@ -390,7 +398,30 @@ class MessyWorkbook:
             normalize_dates       = config.normalize_dates,
             normalize_numbers     = config.normalize_numbers,
             normalize_whitespace  = config.normalize_whitespace,
+            sanitize_column_names = config.sanitize_column_names,
         )
+
+    def _sanitize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Sanitize column names for BigQuery compatibility."""
+        from .utils import sanitize_column_name
+
+        new_columns = []
+        seen: dict[str, int] = {}
+
+        for col in df.columns:
+            clean = sanitize_column_name(col)
+
+            # Handle duplicates by appending counter
+            if clean in seen:
+                seen[clean] += 1
+                clean = f"{clean}_{seen[clean]}"
+            else:
+                seen[clean] = 0
+
+            new_columns.append(clean)
+
+        df.columns = new_columns
+        return df
 
     def _ensure_workbook(self) -> None:
         """Ensure openpyxl workbook is loaded."""

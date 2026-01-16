@@ -94,8 +94,20 @@ def column_index_to_letter(index: int) -> str:
 # String Processing Functions
 # ============================================================================
 
-def sanitize_column_name(name: Any) -> str:
-    """Sanitize a value for use as a column name."""
+def sanitize_column_name(name: Any, max_length: int = 300) -> str:
+    """
+    Sanitize a value for use as a BigQuery-compatible column name.
+
+    Transforms headers to match: ^[a-zA-Z_][a-zA-Z0-9_]*$
+    Converts to lowercase for consistency.
+
+    Args:
+        name: The column name to sanitize (any type, will be converted to string)
+        max_length: Maximum length for the resulting name (default 300 for BigQuery)
+
+    Returns:
+        A sanitized, lowercase column name safe for BigQuery
+    """
     if name is None:
         return "unnamed"
 
@@ -104,14 +116,31 @@ def sanitize_column_name(name: Any) -> str:
     if not name_str or name_str.lower() == "nan":
         return "unnamed"
 
-    name_str = re.sub(r"[^\w\s-]", "_", name_str)
-    name_str = re.sub(r"[\s-]+", "_", name_str)
-    name_str = name_str.strip("_")
+    # Lowercase for consistency
+    result = name_str.lower()
 
-    if name_str and name_str[0].isdigit():
-        name_str = f"col_{name_str}"
+    # Replace non-ASCII and special chars with underscore
+    result = re.sub(r"[^a-z0-9_]", "_", result)
 
-    return name_str or "unnamed"
+    # Collapse consecutive underscores
+    result = re.sub(r"_+", "_", result)
+
+    # Strip leading/trailing underscores
+    result = result.strip("_")
+
+    # Ensure starts with letter or underscore (not digit)
+    if result and result[0].isdigit():
+        result = f"col_{result}"
+
+    # Handle empty result
+    if not result:
+        return "unnamed"
+
+    # Truncate if too long
+    if len(result) > max_length:
+        result = result[:max_length].rstrip("_")
+
+    return result
 
 
 def flatten(nested: Any) -> list[Any]:

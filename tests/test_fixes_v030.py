@@ -36,13 +36,13 @@ class TestDateParsingFix:
         with MessyWorkbook(file_path) as mwb:
             df = mwb.to_dataframe()
 
-            # Total_Transactions should be integer, not datetime
-            assert df["Total_Transactions"].dtype in (int, "int64", "Int64", float, "float64")
-            assert df["Total_Transactions"].iloc[0] == 211
+            # Total_Transactions should be integer, not datetime (column names are lowercase)
+            assert df["total_transactions"].dtype in (int, "int64", "Int64", float, "float64")
+            assert df["total_transactions"].iloc[0] == 211
 
             # Unique_Customers should be integer, not datetime
-            assert df["Unique_Customers"].dtype in (int, "int64", "Int64", float, "float64")
-            assert df["Unique_Customers"].iloc[0] == 142
+            assert df["unique_customers"].dtype in (int, "int64", "Int64", float, "float64")
+            assert df["unique_customers"].iloc[0] == 142
 
     def test_count_column_not_converted_to_date(self, temp_dir):
         """Columns with 'count' in the name should not be converted."""
@@ -131,8 +131,9 @@ class TestBytesIOSupport:
         with MessyWorkbook(buffer) as mwb:
             df = mwb.to_dataframe()
             assert len(df) == 2
-            assert "Name" in df.columns
-            assert "Value" in df.columns
+            # Column names are sanitized by default (lowercased)
+            assert "name" in df.columns
+            assert "value" in df.columns
 
     def test_read_from_bytesio_with_filename_hint(self, temp_dir):
         """Should accept filename hint for format detection."""
@@ -223,8 +224,9 @@ class TestBytesIOSupport:
 
             assert len(df1) == 1
             assert len(df2) == 1
-            assert "A" in df1.columns
-            assert "C" in df2.columns
+            # Column names are sanitized by default (lowercased)
+            assert "a" in df1.columns
+            assert "c" in df2.columns
 
 
 class TestNormalizationToggle:
@@ -241,7 +243,8 @@ class TestNormalizationToggle:
         wb.save(file_path)
         wb.close()
 
-        config = SheetConfig(normalize=False)
+        # Also disable sanitization to preserve original column names
+        config = SheetConfig(normalize=False, sanitize_column_names=False)
 
         with MessyWorkbook(file_path, sheet_config=config) as mwb:
             df = mwb.to_dataframe()

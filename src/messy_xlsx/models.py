@@ -128,6 +128,9 @@ class SheetConfig:
     normalize_numbers: bool = True  # Convert number-like strings to numeric
     normalize_whitespace: bool = True  # Clean whitespace in text columns
 
+    # Column name sanitization (ON by default for BigQuery compatibility)
+    sanitize_column_names: bool = True
+
 
 # ============================================================================
 # Cell Models

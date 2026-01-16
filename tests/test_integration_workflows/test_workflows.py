@@ -102,11 +102,12 @@ class TestEndToEndWorkflows:
             df = mwb.to_dataframe()
 
             # Whitespace should be cleaned
-            assert df.iloc[0]["Name"] == "Alice"
+            # Column names are sanitized by default (lowercased)
+            assert df.iloc[0]["name"] == "Alice"
 
             # Missing values should be standardized
             import pandas as pd
-            assert pd.isna(df.iloc[1]["Amount"])
+            assert pd.isna(df.iloc[1]["amount"])
 
 
 class TestConfigurationChaining:

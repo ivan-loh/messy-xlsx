@@ -33,6 +33,7 @@ from messy_xlsx.multi_sheet import (
     read_all_sheets,
     analyze_excel,
 )
+from messy_xlsx.utils import sanitize_column_name
 
 
 # ============================================================================
@@ -64,6 +65,8 @@ __all__ = [
     "SheetInfo",
     "read_all_sheets",
     "analyze_excel",
+    # Utilities
+    "sanitize_column_name",
 ]
 
 

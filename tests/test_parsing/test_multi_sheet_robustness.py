@@ -263,8 +263,8 @@ class TestMixedTypeHandling:
         sheets = read_all_sheets(plant_column_xlsx)
         df = sheets["Data"]
 
-        # All Plant values should be same type
-        types = set(type(v).__name__ for v in df["Plant"].dropna())
+        # All Plant values should be same type (column name is lowercase)
+        types = set(type(v).__name__ for v in df["plant"].dropna())
         assert len(types) == 1, f"Mixed types found: {types}"
 
     def test_status_column_text_zero_mix(self, status_column_xlsx):
@@ -272,8 +272,8 @@ class TestMixedTypeHandling:
         sheets = read_all_sheets(status_column_xlsx)
         df = sheets["Data"]
 
-        # Track_Date should have consistent types
-        types = set(type(v).__name__ for v in df["Track_Date"].dropna())
+        # Track_Date should have consistent types (column name is lowercase)
+        types = set(type(v).__name__ for v in df["track_date"].dropna())
         assert len(types) == 1, f"Mixed types found: {types}"
 
     def test_numeric_string_preserved(self, numeric_string_column_xlsx):
@@ -281,8 +281,8 @@ class TestMixedTypeHandling:
         sheets = read_all_sheets(numeric_string_column_xlsx)
         df = sheets["Data"]
 
-        # Mat_Status should all be strings (not partial float conversion)
-        types = set(type(v).__name__ for v in df["Mat_Status"].dropna())
+        # Mat_Status should all be strings (not partial float conversion, column name is lowercase)
+        types = set(type(v).__name__ for v in df["mat_status"].dropna())
         assert len(types) == 1
         assert "str" in types, "Should preserve as strings"
 
@@ -321,9 +321,9 @@ class TestHeaderDetectionEdgeCases:
         sheets = read_all_sheets(date_in_data_xlsx)
         df = sheets["Data"]
 
-        # Should have correct headers
-        assert "Date" in df.columns
-        assert "Event" in df.columns
+        # Should have correct headers (column names are lowercase)
+        assert "date" in df.columns
+        assert "event" in df.columns
         # Should have all data rows
         assert len(df) == 3
 
@@ -349,8 +349,8 @@ class TestColumnNameCleaning:
         sheets = read_all_sheets(trailing_spaces_xlsx)
         df = sheets["Data"]
 
-        # Should have a Balance_Qty column (spaces replaced)
-        balance_cols = [c for c in df.columns if "Balance" in c]
+        # Should have a balance_qty column (spaces replaced, lowercase)
+        balance_cols = [c for c in df.columns if "balance" in c]
         assert len(balance_cols) == 1
 
     def test_concatenated_keys_preserved(self, concatenated_key_xlsx):
@@ -358,9 +358,9 @@ class TestColumnNameCleaning:
         sheets = read_all_sheets(concatenated_key_xlsx)
         df = sheets["Data"]
 
-        # CompositeKey column should exist and have data
-        assert "CompositeKey" in df.columns
-        assert "TP04820011024-404 REV C.05" in df["CompositeKey"].values
+        # CompositeKey column should exist and have data (column name is lowercase)
+        assert "compositekey" in df.columns
+        assert "TP04820011024-404 REV C.05" in df["compositekey"].values
 
 
 # ============================================================================
@@ -384,10 +384,11 @@ class TestSparseDataHandling:
         sheets = read_all_sheets(sparse_columns_xlsx)
         df = sheets["Data"]
 
-        assert "ID" in df.columns
-        assert "Name" in df.columns
-        assert "Value" in df.columns
-        assert "Status" in df.columns
+        # Column names are lowercase
+        assert "id" in df.columns
+        assert "name" in df.columns
+        assert "value" in df.columns
+        assert "status" in df.columns
 
 
 # ============================================================================
@@ -402,16 +403,16 @@ class TestDataIntegrity:
         sheets = read_all_sheets(plant_column_xlsx)
         df = sheets["Data"]
 
-        # ID should still be readable
-        assert "001" in df["ID"].values or 1 in df["ID"].values
+        # ID should still be readable (column name is lowercase)
+        assert "001" in df["id"].values or 1 in df["id"].values
 
     def test_special_characters_in_data_preserved(self, concatenated_key_xlsx):
         """Test that special chars in data (not headers) are preserved."""
         sheets = read_all_sheets(concatenated_key_xlsx)
         df = sheets["Data"]
 
-        # Part numbers with dashes and spaces should be intact
-        assert any("-" in str(v) for v in df["Part_No"].values)
+        # Part numbers with dashes and spaces should be intact (column name is lowercase)
+        assert any("-" in str(v) for v in df["part_no"].values)
 
     def test_row_count_correct_after_header_skip(self, deep_header_xlsx):
         """Test correct row count after skipping metadata."""
