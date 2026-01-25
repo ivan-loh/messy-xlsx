@@ -270,8 +270,8 @@ class TestNormalizationToggle:
         with MessyWorkbook(file_path, sheet_config=config) as mwb:
             df = mwb.to_dataframe()
 
-            # Date strings should remain as strings
-            assert df["date_column"].dtype == object
+            # Date strings should remain as strings (object or StringDtype)
+            assert df["date_column"].dtype == object or isinstance(df["date_column"].dtype, pd.StringDtype)
             assert df["date_column"].iloc[0] == "2024-01-01"
 
     def test_normalize_numbers_disabled(self, temp_dir):
@@ -291,8 +291,8 @@ class TestNormalizationToggle:
         with MessyWorkbook(file_path, sheet_config=config) as mwb:
             df = mwb.to_dataframe()
 
-            # Number strings should remain as strings
-            assert df["amount"].dtype == object
+            # Number strings should remain as strings (object or StringDtype)
+            assert df["amount"].dtype == object or isinstance(df["amount"].dtype, pd.StringDtype)
 
     def test_normalize_whitespace_disabled(self, temp_dir):
         """normalize_whitespace=False should preserve whitespace."""

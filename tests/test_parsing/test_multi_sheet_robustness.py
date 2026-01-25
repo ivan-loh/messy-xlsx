@@ -358,9 +358,9 @@ class TestColumnNameCleaning:
         sheets = read_all_sheets(concatenated_key_xlsx)
         df = sheets["Data"]
 
-        # CompositeKey column should exist and have data (column name is lowercase)
-        assert "compositekey" in df.columns
-        assert "TP04820011024-404 REV C.05" in df["compositekey"].values
+        # CompositeKey column should exist and have data (camelCase -> snake_case)
+        assert "composite_key" in df.columns
+        assert "TP04820011024-404 REV C.05" in df["composite_key"].values
 
 
 # ============================================================================

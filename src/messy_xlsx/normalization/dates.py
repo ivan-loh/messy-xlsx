@@ -168,7 +168,9 @@ class DateNormalizer:
 
     def _looks_like_text_dates(self, series: pd.Series) -> bool:
         """Check if column contains text dates."""
-        if series.dtype != object:
+        # Accept both object dtype and StringDtype
+        is_string_type = series.dtype == object or isinstance(series.dtype, pd.StringDtype)
+        if not is_string_type:
             return False
 
         sample = series.dropna().head(20).astype(str)
