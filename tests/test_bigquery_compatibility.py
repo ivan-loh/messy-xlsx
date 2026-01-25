@@ -217,6 +217,58 @@ class TestSanitizeColumnNameFunction:
         assert sanitize_column_name("Amount ($)") == "amount"
         assert sanitize_column_name("Sales (Q1-2024)") == "sales_q1_2024"
 
+    def test_camel_case_to_snake_case(self):
+        """camelCase and PascalCase should be converted to snake_case."""
+        assert sanitize_column_name("firstName") == "first_name"
+        assert sanitize_column_name("lastName") == "last_name"
+        assert sanitize_column_name("FirstName") == "first_name"
+        assert sanitize_column_name("createdAt") == "created_at"
+        assert sanitize_column_name("updatedAt") == "updated_at"
+        assert sanitize_column_name("isActive") == "is_active"
+        assert sanitize_column_name("hasPermission") == "has_permission"
+
+    def test_camel_case_with_acronyms(self):
+        """Acronyms in camelCase should be handled correctly."""
+        assert sanitize_column_name("XMLParser") == "xml_parser"
+        assert sanitize_column_name("getHTTPResponse") == "get_http_response"
+        assert sanitize_column_name("parseJSON") == "parse_json"
+        assert sanitize_column_name("userID") == "user_id"
+        assert sanitize_column_name("apiURL") == "api_url"
+
+    def test_already_snake_case(self):
+        """Already snake_case names should remain unchanged."""
+        assert sanitize_column_name("first_name") == "first_name"
+        assert sanitize_column_name("created_at") == "created_at"
+        assert sanitize_column_name("is_active") == "is_active"
+
+    def test_reserved_words_get_prefix(self):
+        """BigQuery reserved words should get 'col_' prefix."""
+        assert sanitize_column_name("select") == "col_select"
+        assert sanitize_column_name("from") == "col_from"
+        assert sanitize_column_name("where") == "col_where"
+        assert sanitize_column_name("order") == "col_order"
+        assert sanitize_column_name("group") == "col_group"
+        assert sanitize_column_name("having") == "col_having"
+        assert sanitize_column_name("join") == "col_join"
+        assert sanitize_column_name("union") == "col_union"
+        assert sanitize_column_name("limit") == "col_limit"
+        assert sanitize_column_name("null") == "col_null"
+
+    def test_reserved_words_case_insensitive(self):
+        """Reserved word detection should be case-insensitive."""
+        assert sanitize_column_name("SELECT") == "col_select"
+        assert sanitize_column_name("Select") == "col_select"
+        assert sanitize_column_name("FROM") == "col_from"
+        assert sanitize_column_name("Where") == "col_where"
+
+    def test_reserved_word_as_part_of_name(self):
+        """Reserved words as part of a larger name should NOT get prefix."""
+        assert sanitize_column_name("select_all") == "select_all"
+        assert sanitize_column_name("from_date") == "from_date"
+        assert sanitize_column_name("order_id") == "order_id"
+        assert sanitize_column_name("date_created") == "date_created"
+        assert sanitize_column_name("user_count") == "user_count"
+
     def test_digit_prefix(self):
         """Names starting with digits get 'col_' prefix."""
         assert sanitize_column_name("123-ID") == "col_123_id"
@@ -259,8 +311,8 @@ class TestSanitizeColumnNameFunction:
     def test_lowercase_conversion(self):
         """All names should be converted to lowercase."""
         assert sanitize_column_name("UPPERCASE") == "uppercase"
-        assert sanitize_column_name("MixedCase") == "mixedcase"
-        assert sanitize_column_name("camelCase") == "camelcase"
+        assert sanitize_column_name("MixedCase") == "mixed_case"  # camelCase -> snake_case
+        assert sanitize_column_name("camelCase") == "camel_case"  # camelCase -> snake_case
 
     def test_max_length_truncation(self):
         """Names exceeding max_length should be truncated."""
@@ -408,6 +460,60 @@ class TestSanitizeColumnNamesConfig:
 
         # Columns should still be sanitized
         assert list(df.columns) == ["first_name", "amount"]
+
+    def test_camelcase_columns_in_real_file(self, tmp_path):
+        """camelCase columns from real files should be converted to snake_case."""
+        import openpyxl
+
+        file_path = tmp_path / "camel.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["firstName", "lastName", "emailAddress", "createdAt"])
+        ws.append(["Alice", "Smith", "alice@example.com", "2024-01-01"])
+        ws.append(["Bob", "Jones", "bob@example.com", "2024-01-02"])
+        wb.save(file_path)
+
+        with MessyWorkbook(file_path) as mwb:
+            df = mwb.to_dataframe()
+
+        expected_columns = ["first_name", "last_name", "email_address", "created_at"]
+        assert list(df.columns) == expected_columns
+
+    def test_reserved_word_columns_in_real_file(self, tmp_path):
+        """Reserved word columns should get 'col_' prefix for easy querying."""
+        import openpyxl
+
+        file_path = tmp_path / "reserved.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["select", "from", "where", "having", "order"])
+        ws.append(["A", "B", "C", "D", 1])
+        ws.append(["E", "F", "G", "H", 2])
+        wb.save(file_path)
+
+        with MessyWorkbook(file_path) as mwb:
+            df = mwb.to_dataframe()
+
+        expected_columns = ["col_select", "col_from", "col_where", "col_having", "col_order"]
+        assert list(df.columns) == expected_columns
+
+    def test_mixed_camelcase_and_reserved_words(self, tmp_path):
+        """Test combination of camelCase conversion and reserved word handling."""
+        import openpyxl
+
+        file_path = tmp_path / "mixed.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        # Mix of camelCase, reserved words, spaces, and normal names
+        ws.append(["userId", "First Name", "select", "orderDate", "limit"])
+        ws.append([1, "Alice", "A", "2024-01-01", 100])
+        wb.save(file_path)
+
+        with MessyWorkbook(file_path) as mwb:
+            df = mwb.to_dataframe()
+
+        expected = ["user_id", "first_name", "col_select", "order_date", "col_limit"]
+        assert list(df.columns) == expected
 
 
 def convert_to_arrow(df: pd.DataFrame) -> tuple[pa.Table | None, str | None]:

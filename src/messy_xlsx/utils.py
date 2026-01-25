@@ -94,12 +94,54 @@ def column_index_to_letter(index: int) -> str:
 # String Processing Functions
 # ============================================================================
 
+# BigQuery reserved words that require quoting in queries
+# https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#reserved_keywords
+BIGQUERY_RESERVED_WORDS = frozenset({
+    "all", "and", "any", "array", "as", "asc", "assert_rows_modified", "at",
+    "between", "by", "case", "cast", "collate", "contains", "create", "cross",
+    "cube", "current", "default", "define", "desc", "distinct", "else", "end",
+    "enum", "escape", "except", "exclude", "exists", "extract", "false", "fetch",
+    "following", "for", "from", "full", "group", "grouping", "groups", "hash",
+    "having", "if", "ignore", "in", "inner", "intersect", "interval", "into",
+    "is", "join", "lateral", "left", "like", "limit", "lookup", "merge", "natural",
+    "new", "no", "not", "null", "nulls", "of", "on", "or", "order", "outer",
+    "over", "partition", "preceding", "proto", "qualify", "range", "recursive",
+    "respect", "right", "rollup", "rows", "select", "set", "some", "struct",
+    "tablesample", "then", "to", "treat", "true", "unbounded", "union", "unnest",
+    "using", "when", "where", "window", "with", "within",
+})
+
+
+def _camel_to_snake(name: str) -> str:
+    """
+    Convert camelCase or PascalCase to snake_case.
+
+    Examples:
+        firstName -> first_name
+        XMLParser -> xml_parser
+        getHTTPResponse -> get_http_response
+        already_snake -> already_snake
+    """
+    # Insert underscore before uppercase letters that follow lowercase letters
+    result = re.sub(r"([a-z])([A-Z])", r"\1_\2", name)
+    # Insert underscore before uppercase letters that are followed by lowercase
+    # (handles cases like XMLParser -> xml_parser)
+    result = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", result)
+    return result
+
+
 def sanitize_column_name(name: Any, max_length: int = 300) -> str:
     """
     Sanitize a value for use as a BigQuery-compatible column name.
 
     Transforms headers to match: ^[a-zA-Z_][a-zA-Z0-9_]*$
     Converts to lowercase for consistency.
+
+    Features:
+        - Converts camelCase/PascalCase to snake_case
+        - Replaces spaces and special characters with underscores
+        - Prefixes reserved words with 'col_' to avoid quoting in queries
+        - Handles names starting with digits
 
     Args:
         name: The column name to sanitize (any type, will be converted to string)
@@ -116,8 +158,11 @@ def sanitize_column_name(name: Any, max_length: int = 300) -> str:
     if not name_str or name_str.lower() == "nan":
         return "unnamed"
 
+    # Convert camelCase/PascalCase to snake_case before lowercasing
+    result = _camel_to_snake(name_str)
+
     # Lowercase for consistency
-    result = name_str.lower()
+    result = result.lower()
 
     # Replace non-ASCII and special chars with underscore
     result = re.sub(r"[^a-z0-9_]", "_", result)
@@ -135,6 +180,10 @@ def sanitize_column_name(name: Any, max_length: int = 300) -> str:
     # Handle empty result
     if not result:
         return "unnamed"
+
+    # Prefix reserved words to avoid needing backticks in queries
+    if result in BIGQUERY_RESERVED_WORDS:
+        result = f"col_{result}"
 
     # Truncate if too long
     if len(result) > max_length:
