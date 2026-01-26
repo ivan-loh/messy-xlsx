@@ -415,3 +415,87 @@ class TestColumnNamePatternMatching:
             else:
                 # For non-date columns, should NOT be datetime
                 assert not is_datetime, f"Column '{column_name}' was incorrectly converted to datetime"
+
+
+class TestIncludeHiddenRows:
+    """Tests for include_hidden parameter to read filtered/hidden Excel rows."""
+
+    def test_hidden_rows_excluded_by_default(self, temp_dir):
+        """Hidden rows should be excluded by default (include_hidden=False)."""
+        file_path = temp_dir / "hidden.xlsx"
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["name", "value"])
+        ws.append(["Alice", 100])
+        ws.append(["Bob", 200])  # This row will be hidden
+        ws.append(["Charlie", 300])
+        # Hide row 3 (Bob's row)
+        ws.row_dimensions[3].hidden = True
+        wb.save(file_path)
+        wb.close()
+
+        # Default behavior: exclude hidden rows
+        with MessyWorkbook(file_path) as mwb:
+            df = mwb.to_dataframe()
+
+        # Should only have 2 data rows (Alice and Charlie)
+        assert len(df) == 2
+        assert "alice" in df["name"].values or "Alice" in df["name"].values
+        assert "charlie" in df["name"].values or "Charlie" in df["name"].values
+
+    def test_include_hidden_reads_all_rows(self, temp_dir):
+        """include_hidden=True should read all rows including hidden ones."""
+        file_path = temp_dir / "hidden.xlsx"
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["name", "value"])
+        ws.append(["Alice", 100])
+        ws.append(["Bob", 200])  # This row will be hidden
+        ws.append(["Charlie", 300])
+        # Hide row 3 (Bob's row)
+        ws.row_dimensions[3].hidden = True
+        wb.save(file_path)
+        wb.close()
+
+        # With include_hidden=True
+        config = SheetConfig(include_hidden=True)
+        with MessyWorkbook(file_path, sheet_config=config) as mwb:
+            df = mwb.to_dataframe()
+
+        # Should have all 3 data rows
+        assert len(df) == 3
+
+    def test_multiple_hidden_rows(self, temp_dir):
+        """Multiple hidden rows should all be excluded by default."""
+        file_path = temp_dir / "multi_hidden.xlsx"
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["id", "status"])
+        for i in range(1, 11):
+            ws.append([i, "active" if i % 2 == 0 else "inactive"])
+
+        # Hide all odd rows (inactive ones)
+        for row_idx in range(2, 12):  # Data starts at row 2
+            if (row_idx - 1) % 2 == 1:  # Odd IDs
+                ws.row_dimensions[row_idx].hidden = True
+
+        wb.save(file_path)
+        wb.close()
+
+        # Default: exclude hidden
+        with MessyWorkbook(file_path) as mwb:
+            df = mwb.to_dataframe()
+
+        # Should only have even IDs (5 rows)
+        assert len(df) == 5
+
+        # With include_hidden=True
+        config = SheetConfig(include_hidden=True)
+        with MessyWorkbook(file_path, sheet_config=config) as mwb:
+            df_all = mwb.to_dataframe()
+
+        # Should have all 10 rows
+        assert len(df_all) == 10

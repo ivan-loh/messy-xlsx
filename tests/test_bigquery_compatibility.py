@@ -280,7 +280,20 @@ class TestSanitizeColumnNameFunction:
         assert sanitize_column_name("email@domain") == "email_domain"
         assert sanitize_column_name("price#1") == "price_1"
         assert sanitize_column_name("user.name") == "user_name"
-        assert sanitize_column_name("field/value") == "field_value"
+
+    def test_slash_abbreviations_removed(self):
+        """Slashes in abbreviations like P/O, M/C, J/O should be removed (not converted to underscore)."""
+        # Common Excel abbreviations
+        assert sanitize_column_name("P/O No.") == "po_no"
+        assert sanitize_column_name("P/O No") == "po_no"
+        assert sanitize_column_name("M/C") == "mc"
+        assert sanitize_column_name("J/O No.") == "jo_no"
+        assert sanitize_column_name("J/O No") == "jo_no"
+        assert sanitize_column_name("A/C") == "ac"
+        assert sanitize_column_name("B/L") == "bl"
+        # Generic slash handling
+        assert sanitize_column_name("field/value") == "fieldvalue"
+        assert sanitize_column_name("path/to/file") == "pathtofile"
 
     def test_unicode_characters(self):
         """Unicode characters should be removed (not BigQuery compatible)."""
