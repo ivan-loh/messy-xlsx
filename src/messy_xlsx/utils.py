@@ -139,6 +139,7 @@ def sanitize_column_name(name: Any, max_length: int = 300) -> str:
 
     Features:
         - Converts camelCase/PascalCase to snake_case
+        - Removes slashes (for abbreviations like P/O → po, M/C → mc)
         - Replaces spaces and special characters with underscores
         - Prefixes reserved words with 'col_' to avoid quoting in queries
         - Handles names starting with digits
@@ -163,6 +164,9 @@ def sanitize_column_name(name: Any, max_length: int = 300) -> str:
 
     # Lowercase for consistency
     result = result.lower()
+
+    # Remove slashes (common in abbreviations like P/O, M/C, J/O)
+    result = result.replace("/", "")
 
     # Replace non-ASCII and special chars with underscore
     result = re.sub(r"[^a-z0-9_]", "_", result)
