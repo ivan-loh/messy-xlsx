@@ -7,7 +7,6 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # ============================================================================
 # Format Models
 # ============================================================================
@@ -55,6 +54,7 @@ class StructureInfo:
     blank_rows: list[int] = field(default_factory=list)
     inconsistent_columns: bool = False
     has_formulas: bool = False
+    sparse_columns: list[int] = field(default_factory=list)
     suggested_skip_rows: int = 0
     suggested_skip_footer: int = 0
     suggested_overrides: dict[str, Any] = field(default_factory=dict)
@@ -96,6 +96,25 @@ class TableInfo:
 # ============================================================================
 # Configuration Models
 # ============================================================================
+
+@dataclass
+class SheetError:
+    """Error information for a sheet that failed to parse."""
+
+    sheet_name: str
+    error_type: str
+    message: str
+    context: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "sheet_name": self.sheet_name,
+            "error_type": self.error_type,
+            "message": self.message,
+            "context": self.context,
+        }
+
 
 @dataclass
 class SheetConfig:

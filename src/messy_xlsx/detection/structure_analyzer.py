@@ -5,7 +5,7 @@
 # ============================================================================
 
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import openpyxl
 
@@ -13,7 +13,6 @@ from messy_xlsx.cache import StructureCache, get_structure_cache
 from messy_xlsx.detection.locale_detector import LocaleDetector
 from messy_xlsx.exceptions import StructureError
 from messy_xlsx.models import StructureInfo, TableInfo
-
 
 # ============================================================================
 # Type Aliases
@@ -54,7 +53,7 @@ class StructureAnalyzer:
 
         # Only use cache for file paths (not file-like objects)
         if not is_fileobj:
-            file_path = Path(file_source)
+            file_path = Path(file_source)  # type: ignore[arg-type]
             if not force:
                 cached = self.cache.get(file_path, sheet)
                 if cached:
@@ -96,8 +95,9 @@ class StructureAnalyzer:
             metadata     = self._detect_metadata_rows(ws, data_region, header_info)
             tables       = self._detect_multiple_tables(ws, data_region, header_info)
             locale_info  = self.locale_detector.detect(ws, data_region)
-            blank_rows   = self._detect_blank_rows(ws, data_region)
-            has_formulas = self._detect_formulas(ws, data_region)
+            blank_rows      = self._detect_blank_rows(ws, data_region)
+            has_formulas    = self._detect_formulas(ws, data_region)
+            sparse_columns  = self._detect_sparse_columns(ws, data_region)
 
             result = StructureInfo(
                 data_start_row       = data_region["start_row"],
@@ -120,6 +120,7 @@ class StructureAnalyzer:
                 table_ranges         = [self._table_to_dict(t) for t in tables],
                 blank_rows           = blank_rows,
                 has_formulas         = has_formulas,
+                sparse_columns       = sparse_columns,
                 suggested_skip_rows  = self._suggest_skip_rows(metadata, header_info),
                 suggested_skip_footer = self._suggest_skip_footer(ws, data_region),
             )
@@ -133,10 +134,9 @@ class StructureAnalyzer:
         finally:
             wb.close()
 
-    def _detect_data_region(self, ws) -> dict:
+    def _detect_data_region(self, ws: Any) -> dict[str, int]:
         """Find the boundaries of actual data."""
         max_row_hint = ws.max_row or 1
-        max_col_hint = ws.max_column or 1
 
         scan_limit = min(MAX_ANALYSIS_ROWS, max_row_hint)
 
@@ -165,7 +165,7 @@ class StructureAnalyzer:
             if min_row and empty_row_streak > 100:
                 break
 
-        if max_row and scan_limit < max_row_hint:
+        if max_row and scan_limit < max_row_hint and empty_row_streak < 10:
             max_row = max_row_hint
 
         if min_row is None:
@@ -178,7 +178,7 @@ class StructureAnalyzer:
             "end_col": max_col or 1,
         }
 
-    def _detect_merged_cells(self, ws) -> list[tuple[int, int, int, int]]:
+    def _detect_merged_cells(self, ws: Any) -> list[tuple[int, int, int, int]]:
         """Detect all merged cell ranges."""
         merged = []
         try:
@@ -194,7 +194,7 @@ class StructureAnalyzer:
             pass
         return merged
 
-    def _detect_hidden_content(self, ws) -> tuple[list[int], list[int]]:
+    def _detect_hidden_content(self, ws: Any) -> tuple[list[int], list[int]]:
         """Detect hidden rows and columns."""
         hidden_rows = []
         hidden_cols = []
@@ -215,11 +215,11 @@ class StructureAnalyzer:
 
     def _detect_headers(
         self,
-        ws,
-        data_region: dict,
-        merged_ranges: list,
+        ws: Any,
+        data_region: dict[str, int],
+        merged_ranges: list[tuple[int, int, int, int]],
         header_patterns: list[str] | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Detect header row(s) with confidence scoring."""
         import re
 
@@ -343,9 +343,9 @@ class StructureAnalyzer:
 
     def _detect_metadata_rows(
         self,
-        ws,
-        data_region: dict,
-        header_info: dict,
+        ws: Any,
+        data_region: dict[str, int],
+        header_info: dict[str, Any],
     ) -> list[int]:
         """Detect metadata/title rows before the header."""
         metadata_rows = []
@@ -369,9 +369,9 @@ class StructureAnalyzer:
 
     def _detect_multiple_tables(
         self,
-        ws,
-        data_region: dict,
-        header_info: dict,
+        ws: Any,
+        data_region: dict[str, int],
+        header_info: dict[str, Any],
     ) -> list[TableInfo]:
         """Detect multiple tables separated by blank rows."""
         total_rows = data_region["end_row"] - data_region["start_row"] + 1
@@ -440,7 +440,7 @@ class StructureAnalyzer:
 
         return tables
 
-    def _detect_blank_rows(self, ws, data_region: dict) -> list[int]:
+    def _detect_blank_rows(self, ws: Any, data_region: dict[str, int]) -> list[int]:
         """Find blank rows within data region."""
         total_rows = data_region["end_row"] - data_region["start_row"] + 1
 
@@ -464,31 +464,31 @@ class StructureAnalyzer:
 
         return blank_rows
 
-    def _detect_blank_rows_sampled(self, ws, data_region: dict) -> list[int]:
+    def _detect_blank_rows_sampled(self, ws: Any, data_region: dict[str, int]) -> list[int]:
         """Sample-based blank row detection for large files."""
         start = data_region["start_row"]
         end   = data_region["end_row"]
 
-        sample_rows = []
+        sample_rows: list[int] = []
         sample_rows.extend(range(start, min(start + 300, end + 1)))
         sample_rows.extend(range(max(start, end - 300), end + 1))
 
         blank_rows = []
         for row_idx in sorted(set(sample_rows)):
-            row = list(ws.iter_rows(
+            row = next(ws.iter_rows(
                 min_row     = row_idx,
                 max_row     = row_idx,
                 min_col     = data_region["start_col"],
                 max_col     = data_region["end_col"],
                 values_only = True
-            ))[0]
+            ))
 
             if all(v is None for v in row):
                 blank_rows.append(row_idx)
 
         return blank_rows
 
-    def _detect_formulas(self, ws, data_region: dict) -> bool:
+    def _detect_formulas(self, ws: Any, data_region: dict[str, int]) -> bool:
         """Check if sheet contains formulas."""
         total_rows = data_region["end_row"] - data_region["start_row"] + 1
 
@@ -505,6 +505,35 @@ class StructureAnalyzer:
                     pass
 
         return False
+
+    def _detect_sparse_columns(self, ws: Any, data_region: dict[str, int]) -> list[int]:
+        """Identify columns that are >90% empty within the data region."""
+        total_rows = data_region["end_row"] - data_region["start_row"] + 1
+        if total_rows == 0:
+            return []
+
+        sample_limit = min(MAX_SAMPLE_ROWS, total_rows)
+        num_cols = data_region["end_col"] - data_region["start_col"] + 1
+        filled = [0] * num_cols
+
+        for row in ws.iter_rows(
+            min_row     = data_region["start_row"],
+            max_row     = data_region["start_row"] + sample_limit - 1,
+            min_col     = data_region["start_col"],
+            max_col     = data_region["end_col"],
+            values_only = True,
+        ):
+            for col_offset, value in enumerate(row):
+                if value is not None:
+                    filled[col_offset] += 1
+
+        threshold = sample_limit * 0.1  # >90% empty means <10% filled
+        sparse = []
+        for col_offset, count in enumerate(filled):
+            if count < threshold:
+                sparse.append(data_region["start_col"] + col_offset)
+
+        return sparse
 
     def _group_consecutive(self, numbers: list[int]) -> list[list[int]]:
         """Group consecutive numbers."""
@@ -570,7 +599,7 @@ class StructureAnalyzer:
             return len(metadata_rows)
         return 0
 
-    def _suggest_skip_footer(self, ws, data_region: dict) -> int:
+    def _suggest_skip_footer(self, ws: Any, data_region: dict[str, int]) -> int:
         """Suggest number of footer rows to skip."""
         skip = 0
         for row_idx in range(data_region["end_row"], max(1, data_region["end_row"] - 5), -1):

@@ -4,9 +4,10 @@
 # Imports
 # ============================================================================
 
+from typing import Any
+
 import numpy as np
 import pandas as pd
-
 
 # ============================================================================
 # Core
@@ -47,8 +48,10 @@ class TypeCoercionNormalizer:
             return series
 
         # Check what types are present (excluding NoneType)
+        # Sample up to 1000 values - sufficient to detect mixed types
+        sample = non_null.iloc[:1000]
         types = set()
-        for val in non_null:
+        for val in sample:
             if val is not None:
                 # Group numeric types together
                 if isinstance(val, (int, np.integer)):
@@ -67,7 +70,7 @@ class TypeCoercionNormalizer:
 
         # Mixed types detected - convert all to string
         # This ensures BigQuery/Arrow compatibility
-        def to_string(val):
+        def to_string(val: Any) -> str | None:
             if val is None:
                 return None
             if isinstance(val, float) and np.isnan(val):

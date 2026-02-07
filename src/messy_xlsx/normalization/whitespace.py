@@ -8,7 +8,6 @@ import re
 
 import pandas as pd
 
-
 # ============================================================================
 # Compiled patterns (avoid recompiling on each call)
 # ============================================================================
@@ -47,7 +46,21 @@ class WhitespaceNormalizer:
         """Normalize whitespace in a single column."""
         result = series.copy()
 
-        mask = result.notna() & (result.apply(type) == str)
+        non_null_mask = result.notna()
+        if not non_null_mask.any():
+            return result
+
+        # Fast path: sample up to 100 non-null values to check if all are strings.
+        # Object columns are usually all-string; avoid per-element isinstance scan.
+        non_null_vals = result[non_null_mask]
+        sample = non_null_vals.iloc[:100]
+        all_strings = all(isinstance(v, str) for v in sample)
+
+        if all_strings:
+            mask = non_null_mask
+        else:
+            is_str = result.apply(lambda x: isinstance(x, str))
+            mask = non_null_mask & is_str.astype(bool)
 
         if not mask.any():
             return result

@@ -134,6 +134,101 @@ class TestFormulaEvaluationModes:
             assert len(df) == 1
 
 
+class TestExceptionSerialization:
+    """Test to_dict() on each exception class."""
+
+    def test_base_exception_to_dict(self):
+        from messy_xlsx.exceptions import MessyXlsxError
+
+        e = MessyXlsxError("something went wrong", context={"key": "val"})
+        d = e.to_dict()
+        assert d["error"] == "MessyXlsxError"
+        assert d["message"] == "something went wrong"
+        assert d["context"] == {"key": "val"}
+
+    def test_file_error_to_dict(self):
+        from messy_xlsx.exceptions import FileError
+
+        e = FileError("not found", file_path="/tmp/x.xlsx", operation="open")
+        d = e.to_dict()
+        assert d["error"] == "FileError"
+        assert d["context"]["file_path"] == "/tmp/x.xlsx"
+        assert d["context"]["operation"] == "open"
+
+    def test_format_error_to_dict(self):
+        from messy_xlsx.exceptions import FormatError
+
+        e = FormatError(
+            "bad format",
+            file_path="/tmp/x.xlsx",
+            detected_format="csv",
+            attempted_formats=["xlsx", "xls"],
+        )
+        d = e.to_dict()
+        assert d["error"] == "FormatError"
+        assert d["context"]["detected_format"] == "csv"
+        assert d["context"]["attempted_formats"] == ["xlsx", "xls"]
+
+    def test_structure_error_to_dict(self):
+        from messy_xlsx.exceptions import StructureError
+
+        e = StructureError("no header", sheet="Sheet1", detection_phase="headers")
+        d = e.to_dict()
+        assert d["error"] == "StructureError"
+        assert d["context"]["sheet"] == "Sheet1"
+        assert d["context"]["detection_phase"] == "headers"
+
+    def test_normalization_error_to_dict(self):
+        from messy_xlsx.exceptions import NormalizationError
+
+        e = NormalizationError(
+            "type mismatch",
+            column="price",
+            row=5,
+            value="abc",
+            expected_type="float",
+        )
+        d = e.to_dict()
+        assert d["error"] == "NormalizationError"
+        assert d["context"]["column"] == "price"
+        assert d["context"]["row"] == 5
+        assert d["context"]["expected_type"] == "float"
+
+    def test_formula_error_to_dict(self):
+        from messy_xlsx.exceptions import FormulaError
+
+        e = FormulaError("eval failed", cell_ref="A1", formula="=1/0")
+        d = e.to_dict()
+        assert d["error"] == "FormulaError"
+        assert d["context"]["cell_ref"] == "A1"
+        assert d["context"]["formula"] == "=1/0"
+
+    def test_circular_reference_error_to_dict(self):
+        from messy_xlsx.exceptions import CircularReferenceError
+
+        e = CircularReferenceError("cycle detected", cycle=["A1", "B1", "A1"])
+        d = e.to_dict()
+        assert d["error"] == "CircularReferenceError"
+        assert d["context"]["cycle"] == ["A1", "B1", "A1"]
+
+    def test_unsupported_function_error_to_dict(self):
+        from messy_xlsx.exceptions import UnsupportedFunctionError
+
+        e = UnsupportedFunctionError("WEBSERVICE", cell_ref="B2")
+        d = e.to_dict()
+        assert d["error"] == "UnsupportedFunctionError"
+        assert d["context"]["function_name"] == "WEBSERVICE"
+        assert d["context"]["cell_ref"] == "B2"
+
+    def test_none_context_values_excluded(self):
+        from messy_xlsx.exceptions import FileError
+
+        e = FileError("error", file_path=None, operation=None)
+        d = e.to_dict()
+        assert "file_path" not in d["context"]
+        assert "operation" not in d["context"]
+
+
 class TestUnsupportedFunctions:
     """Test handling of unsupported Excel functions."""
 

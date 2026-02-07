@@ -4,11 +4,15 @@
 # Imports
 # ============================================================================
 
+from typing import Any
+
+import pandas as pd
+
 from messy_xlsx.exceptions import (
     CircularReferenceError,
     FileError,
-    FormulaError,
     FormatError,
+    FormulaError,
     MessyXlsxError,
     NormalizationError,
     StructureError,
@@ -23,18 +27,18 @@ from messy_xlsx.models import (
     CellValue,
     FormatInfo,
     SheetConfig,
+    SheetError,
     StructureInfo,
 )
-from messy_xlsx.workbook import MessyWorkbook
 from messy_xlsx.multi_sheet import (
-    MultiSheetParser,
     MultiSheetOptions,
+    MultiSheetParser,
     SheetInfo,
-    read_all_sheets,
     analyze_excel,
+    read_all_sheets,
 )
 from messy_xlsx.utils import sanitize_column_name
-
+from messy_xlsx.workbook import MessyWorkbook
 
 # ============================================================================
 # Package Metadata
@@ -47,6 +51,7 @@ __all__ = [
     "CellValue",
     "FormatInfo",
     "SheetConfig",
+    "SheetError",
     "StructureInfo",
     "MessyXlsxError",
     "FileError",
@@ -74,14 +79,18 @@ __all__ = [
 # Convenience Functions
 # ============================================================================
 
-def read_excel(file_path: str, sheet: str | None = None, **config_kwargs):
+def read_excel(
+    file_path: str, sheet: str | None = None, **config_kwargs: Any
+) -> pd.DataFrame:
     """Quick function to read an Excel file to a pandas DataFrame."""
     config = SheetConfig(**config_kwargs) if config_kwargs else None
     wb = MessyWorkbook(file_path, sheet_config=config)
     return wb.to_dataframe(sheet=sheet)
 
 
-def read_excel_tables(file_path: str, sheet: str | None = None) -> list:
+def read_excel_tables(
+    file_path: str, sheet: str | None = None
+) -> list[pd.DataFrame]:
     """Read all detected tables from a sheet."""
     wb = MessyWorkbook(file_path)
     sheet_obj = wb.get_sheet(sheet or wb.sheet_names[0])

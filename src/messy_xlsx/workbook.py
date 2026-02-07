@@ -4,7 +4,8 @@
 # Imports
 # ============================================================================
 
-import io
+import logging
+import re
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -17,16 +18,18 @@ from messy_xlsx.detection.structure_analyzer import StructureAnalyzer
 from messy_xlsx.exceptions import FileError, FormatError
 from messy_xlsx.formulas.config import FormulaConfig, FormulaEvaluationMode
 from messy_xlsx.formulas.engine import FormulaEngine
-from messy_xlsx.models import CellValue, SheetConfig, StructureInfo
+from messy_xlsx.models import CellValue, SheetConfig, SheetError, StructureInfo
 from messy_xlsx.normalization.pipeline import NormalizationPipeline
 from messy_xlsx.parsing.base_handler import ParseOptions
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
 from messy_xlsx.sheet import MessySheet
 
-
 # ============================================================================
 # Core
 # ============================================================================
+
+logger = logging.getLogger(__name__)
+
 
 class MessyWorkbook:
     """Main entry point for parsing Excel files."""
@@ -57,9 +60,13 @@ class MessyWorkbook:
         # Determine if input is file path or file-like object
         self._is_fileobj = hasattr(file_path_or_buffer, "read")
 
+        self._file_path: Path | None
+        self._file_buffer: BinaryIO | None
+        self._filename_hint: str | None
+
         if self._is_fileobj:
             self._file_path = None
-            self._file_buffer = file_path_or_buffer
+            self._file_buffer = file_path_or_buffer  # type: ignore[assignment]
             self._filename_hint = filename
 
             # Detect format from file object
@@ -69,7 +76,7 @@ class MessyWorkbook:
             if hasattr(file_path_or_buffer, "seek"):
                 file_path_or_buffer.seek(0)
         else:
-            self._file_path = Path(file_path_or_buffer)
+            self._file_path = Path(file_path_or_buffer)  # type: ignore[arg-type]
             self._file_buffer = None
             self._filename_hint = None
 
@@ -82,7 +89,7 @@ class MessyWorkbook:
             self._format_info = self._detector.detect(self._file_path)
 
         if self._format_info.format_type == "unknown":
-            file_desc = self._filename_hint or self._file_path or "<stream>"
+            file_desc: str | Path = self._filename_hint or self._file_path or "<stream>"
             raise FormatError(
                 f"Unknown file format: {file_desc}",
                 file_path = str(file_desc),
@@ -90,7 +97,7 @@ class MessyWorkbook:
 
         # Validate extension matches detected format for Excel files
         # This catches files with .xlsx extension but different content
-        if not self._is_fileobj:
+        if not self._is_fileobj and self._file_path is not None:
             file_ext = self._file_path.suffix.lower()
             excel_extensions = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"}
             if file_ext in excel_extensions and self._format_info.format_type not in ("xlsx", "xlsm", "xls", "xltx", "xltm"):
@@ -101,13 +108,12 @@ class MessyWorkbook:
                 )
 
         # Get sheet names and validate file is readable
-        source = self._file_buffer if self._is_fileobj else self._file_path
-        self._sheet_names = self._registry.get_sheet_names(source)
+        self._sheet_names = self._registry.get_sheet_names(self.source)
 
         # Validate that the file is actually readable (not just format-detected)
         # This catches corrupted files that pass format detection but can't be opened
         if self._format_info.format_type in ("xlsx", "xlsm", "xltx", "xltm", "xls"):
-            is_valid, error = self._registry.validate(source, self._format_info.format_type)
+            is_valid, error = self._registry.validate(self.source, self._format_info.format_type)
             if not is_valid:
                 file_desc = self._filename_hint or self._file_path or "<stream>"
                 raise FormatError(
@@ -121,8 +127,9 @@ class MessyWorkbook:
         if self._formula_config.mode != FormulaEvaluationMode.DISABLED:
             if self._formula_engine.is_available:
                 try:
-                    source = self._file_buffer if self._is_fileobj else self._file_path
-                    self._formula_engine.load_workbook(source)
+                    formula_source = self._file_path or self._file_buffer
+                    if formula_source is not None:
+                        self._formula_engine.load_workbook(formula_source)  # type: ignore[arg-type]
                 except Exception:
                     pass
 
@@ -136,7 +143,11 @@ class MessyWorkbook:
     @property
     def source(self) -> Path | BinaryIO:
         """The source file path or buffer."""
-        return self._file_buffer if self._is_fileobj else self._file_path
+        if self._is_fileobj and self._file_buffer is not None:
+            return self._file_buffer
+        if self._file_path is not None:
+            return self._file_path
+        raise FileError("No file source available")
 
     @property
     def sheet_names(self) -> list[str]:
@@ -177,14 +188,39 @@ class MessyWorkbook:
     def to_dataframes(
         self,
         config: SheetConfig | None = None,
-    ) -> dict[str, pd.DataFrame]:
-        """Convert all sheets to DataFrames."""
+        include_errors: bool = False,
+    ) -> dict[str, pd.DataFrame] | tuple[dict[str, pd.DataFrame], list[SheetError]]:
+        """Convert all sheets to DataFrames.
+
+        Args:
+            config: Optional sheet configuration.
+            include_errors: If True, return a tuple of (results, errors) instead
+                of just results. Each error contains structured information about
+                which sheet failed and why.
+
+        Returns:
+            If include_errors is False (default): dict mapping sheet name to DataFrame.
+            If include_errors is True: tuple of (results_dict, errors_list).
+        """
         result = {}
+        errors: list[SheetError] = []
         for name in self._sheet_names:
             try:
                 result[name] = self._parse_sheet(name, config)
             except Exception as e:
-                pass
+                logger.warning("Failed to parse sheet %r, skipping", name, exc_info=True)
+                if include_errors:
+                    context = {}
+                    if hasattr(e, "context"):
+                        context = e.context
+                    errors.append(SheetError(
+                        sheet_name=name,
+                        error_type=type(e).__name__,
+                        message=str(e),
+                        context=context,
+                    ))
+        if include_errors:
+            return result, errors
         return result
 
     def get_structure(self, sheet: str | None = None) -> StructureInfo:
@@ -201,6 +237,7 @@ class MessyWorkbook:
         """Get a single cell value."""
         self._ensure_workbook()
 
+        assert self._wb is not None
         ws   = self._wb[sheet]
         cell = ws.cell(row, col)
 
@@ -271,7 +308,7 @@ class MessyWorkbook:
         )
 
         # Reset buffer position before parsing
-        if self._is_fileobj and hasattr(self._file_buffer, "seek"):
+        if self._is_fileobj and self._file_buffer is not None and hasattr(self._file_buffer, "seek"):
             self._file_buffer.seek(0)
 
         df = self._registry.parse(
@@ -315,13 +352,34 @@ class MessyWorkbook:
         if effective_config.column_renames:
             df = df.rename(columns=effective_config.column_renames)
 
+        # Drop rows matching regex pattern
+        if effective_config.drop_regex and not df.empty:
+            pattern = re.compile(effective_config.drop_regex)
+            mask = df.apply(
+                lambda row: any(
+                    bool(pattern.search(str(v)))
+                    for v in row
+                    if v is not None and not (isinstance(v, float) and pd.isna(v))
+                ),
+                axis=1,
+            )
+            df = df[~mask].reset_index(drop=True)
+
+        # Drop rows matching column-value conditions
+        if effective_config.drop_conditions and not df.empty:
+            for condition in effective_config.drop_conditions:
+                col = condition.get("column")
+                value = condition.get("value")
+                if col is not None and col in df.columns:
+                    df = df[df[col] != value].reset_index(drop=True)
+
         return df
 
     def _analyze_structure(self, sheet: str, config: SheetConfig | None = None) -> StructureInfo:
         """Analyze sheet structure."""
         header_patterns = config.header_patterns if config else None
         # Reset buffer position before analysis
-        if self._is_fileobj and hasattr(self._file_buffer, "seek"):
+        if self._is_fileobj and self._file_buffer is not None and hasattr(self._file_buffer, "seek"):
             self._file_buffer.seek(0)
         return self._analyzer.analyze(self.source, sheet, header_patterns=header_patterns)
 
@@ -427,7 +485,7 @@ class MessyWorkbook:
         """Ensure openpyxl workbook is loaded."""
         if self._wb is None:
             # Reset buffer position before loading
-            if self._is_fileobj and hasattr(self._file_buffer, "seek"):
+            if self._is_fileobj and self._file_buffer is not None and hasattr(self._file_buffer, "seek"):
                 self._file_buffer.seek(0)
 
             # Load with data_only=False to preserve formula information
@@ -454,7 +512,7 @@ class MessyWorkbook:
             return "date"
         return "text"
 
-    def _is_cell_merged(self, ws, row: int, col: int) -> bool:
+    def _is_cell_merged(self, ws: Any, row: int, col: int) -> bool:
         """Check if cell is part of a merged range."""
         try:
             for merged_range in ws.merged_cells.ranges:
@@ -467,7 +525,7 @@ class MessyWorkbook:
             pass
         return False
 
-    def _is_cell_hidden(self, ws, row: int, col: int) -> bool:
+    def _is_cell_hidden(self, ws: Any, row: int, col: int) -> bool:
         """Check if cell is in a hidden row or column."""
         try:
             if row in ws.row_dimensions and ws.row_dimensions[row].hidden:
@@ -489,7 +547,7 @@ class MessyWorkbook:
     def __enter__(self) -> "MessyWorkbook":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
 
     def __repr__(self) -> str:
