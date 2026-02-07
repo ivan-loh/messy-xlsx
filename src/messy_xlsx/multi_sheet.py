@@ -5,16 +5,16 @@
 # ============================================================================
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any
 
 import pandas as pd
 
 from messy_xlsx.normalization import MissingValueHandler, NumberNormalizer
-from messy_xlsx.parsing import XLSXHandler, XLSHandler, ParseOptions
+from messy_xlsx.parsing import FormatHandler, ParseOptions, XLSHandler, XLSXHandler
 from messy_xlsx.utils import sanitize_column_name
-
 
 # ============================================================================
 # Config
@@ -126,6 +126,7 @@ class MultiSheetParser:
         self.options = options or MultiSheetOptions()
 
         # Select handler based on extension
+        self._handler: FormatHandler
         ext = self.file_path.suffix.lower()
         if ext in (".xlsx", ".xlsm"):
             self._handler = XLSXHandler()
@@ -363,7 +364,7 @@ class MultiSheetParser:
     def _clean_column_names(self, df: pd.DataFrame) -> pd.DataFrame:
         """Clean column names for database compatibility."""
         new_columns = []
-        seen = {}
+        seen: dict[str, int] = {}
 
         for col in df.columns:
             clean = sanitize_column_name(col)
@@ -390,8 +391,11 @@ class MultiSheetParser:
         for col in df.columns:
             if df[col].dtype == object:
                 # Check for mixed numeric/string types
+                # Sample up to 1000 values - sufficient to detect mixed types
+                non_null = df[col].dropna()
+                sample = non_null.iloc[:1000]
                 types = set()
-                for val in df[col].dropna():
+                for val in sample:
                     if isinstance(val, (int, float)):
                         types.add("numeric")
                     elif isinstance(val, str):
@@ -414,7 +418,7 @@ class MultiSheetParser:
 
 def read_all_sheets(
     file_path: str | Path,
-    **options_kwargs,
+    **options_kwargs: Any,
 ) -> dict[str, pd.DataFrame]:
     """
     Read all data sheets from an Excel file.
