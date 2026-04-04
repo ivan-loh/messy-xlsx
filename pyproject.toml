@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "messy-xlsx"
-version = "0.7.2"
+version = "0.8.0"
 description = "A Python library for parsing messy Excel files with intelligent structure detection and formula evaluation"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "Ivan" }
 ]
@@ -25,9 +25,10 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Office/Business :: Financial :: Spreadsheet",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
@@ -53,10 +54,17 @@ all = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "pytest-benchmark>=4.0",
     "hypothesis>=6.0",
     "pyarrow>=14.0",
     "ruff>=0.1.0",
     "mypy>=1.0",
+    "pre-commit>=3.0",
+]
+docs = [
+    "mkdocs>=1.5",
+    "mkdocs-material>=9.0",
+    "mkdocstrings[python]>=0.24",
 ]
 
 [project.urls]
@@ -88,19 +96,59 @@ select = [
     "B",      # flake8-bugbear
     "C4",     # flake8-comprehensions
     "UP",     # pyupgrade
+    "SIM",    # flake8-simplify
+    "RET",    # flake8-return
+    "RUF",    # ruff-specific rules
+    "C901",   # mccabe complexity
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
+    "RET504", # unnecessary assignment before return (style preference)
+    "SIM108", # use ternary operator (can hurt readability)
+    "SIM105", # contextlib.suppress — prefer explicit try/except for clarity
 ]
 
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "C901"]
+# Pre-existing complex functions — refactor incrementally, don't block CI
+"src/messy_xlsx/detection/structure_analyzer.py" = ["C901"]
+"src/messy_xlsx/normalization/missing_values.py" = ["C901"]
+"src/messy_xlsx/normalization/type_coercion.py" = ["C901"]
+"src/messy_xlsx/multi_sheet.py" = ["C901"]
+"src/messy_xlsx/parsing/csv_handler.py" = ["C901"]
+"src/messy_xlsx/parsing/xls_handler.py" = ["C901"]
+"src/messy_xlsx/workbook.py" = ["C901"]
+"src/messy_xlsx/formulas/engine.py" = ["C901"]
+
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_ignores = true
 disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "pandas.*",
+    "openpyxl.*",
+    "fastexcel.*",
+    "xlrd.*",
+    "formulas.*",
+    "xlcalculator.*",
+]
+ignore_missing_imports = true
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+skips = ["B101"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]

@@ -2,13 +2,12 @@
 
 import io
 
-import pandas as pd
 import pytest
-
-xlrd = pytest.importorskip("xlrd")
 
 from messy_xlsx.parsing.base_handler import ParseOptions
 from messy_xlsx.parsing.xls_handler import XLSHandler
+
+xlrd = pytest.importorskip("xlrd")
 
 
 def _create_xls(data, sheet_name="Sheet1", header=True):

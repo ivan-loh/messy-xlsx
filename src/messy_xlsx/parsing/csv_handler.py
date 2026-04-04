@@ -6,17 +6,25 @@
 
 import csv
 import io
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
 
 import numpy as np
 import pandas as pd
 
-from messy_xlsx.exceptions import FileError, FormatError
-from messy_xlsx.parsing.base_handler import FileSource, FormatHandler, ParseOptions
+from messy_xlsx.exceptions import FormatError
+from messy_xlsx.parsing.base_handler import (
+    FileSource,
+    FormatHandler,
+    ParseOptions,
+    get_file_desc,
+    is_fileobj,
+    reset_buffer,
+)
 
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # Config
@@ -39,6 +47,7 @@ METADATA_PATTERNS = [
 # ============================================================================
 # Header Detection
 # ============================================================================
+
 
 @dataclass
 class _RowProfile:
@@ -93,9 +102,7 @@ class MetadataRowDetector:
         except (ValueError, TypeError):
             return False
 
-    def _score_as_metadata(
-        self, profile: _RowProfile, consensus: _RowProfile
-    ) -> float:
+    def _score_as_metadata(self, profile: _RowProfile, consensus: _RowProfile) -> float:
         """Score how likely a row is metadata (0-1, higher = more likely)."""
         if profile.is_empty:
             return 1.0
@@ -105,9 +112,8 @@ class MetadataRowDetector:
         if profile.empty_ratio > consensus.empty_ratio + 0.3:
             score += 0.35
 
-        if consensus.cell_count > 0:
-            if profile.cell_count / consensus.cell_count < 0.4:
-                score += 0.35
+        if consensus.cell_count > 0 and profile.cell_count / consensus.cell_count < 0.4:
+            score += 0.35
 
         if profile.has_metadata_pattern:
             score += 0.4
@@ -143,7 +149,14 @@ class MetadataRowDetector:
                 on_bad_lines="warn",
                 skip_blank_lines=False,
             )
-        except Exception:
+        except (
+            pd.errors.ParserError,
+            pd.errors.EmptyDataError,
+            UnicodeDecodeError,
+            ValueError,
+            OSError,
+        ) as e:
+            logger.debug("Metadata detection failed for %s: %s", file_path, e)
             return 0
 
         if len(df) < 3:
@@ -190,7 +203,14 @@ class MetadataRowDetector:
                 on_bad_lines="warn",
                 skip_blank_lines=False,
             )
-        except Exception:
+        except (
+            pd.errors.ParserError,
+            pd.errors.EmptyDataError,
+            UnicodeDecodeError,
+            ValueError,
+            OSError,
+        ) as e:
+            logger.debug("Metadata detection failed for text data: %s", e)
             return 0
 
         if len(df) < 3:
@@ -226,6 +246,7 @@ class MetadataRowDetector:
 # Core
 # ============================================================================
 
+
 class CSVHandler(FormatHandler):
     """Handler for CSV and TSV files."""
 
@@ -244,16 +265,14 @@ class CSVHandler(FormatHandler):
         options: ParseOptions,
     ) -> pd.DataFrame:
         """Parse CSV/TSV file to DataFrame."""
-        is_fileobj = hasattr(file_source, "read")
-        file_desc = "<stream>" if is_fileobj else str(file_source)
+        is_stream = is_fileobj(file_source)
+        file_desc = get_file_desc(file_source)
 
-        if is_fileobj:
+        if is_stream:
             # For file-like objects, read content and detect from bytes
-            if hasattr(file_source, "seek"):
-                file_source.seek(0)
-            raw_data = file_source.read()
-            if hasattr(file_source, "seek"):
-                file_source.seek(0)
+            reset_buffer(file_source)
+            raw_data = file_source.read()  # type: ignore[union-attr]
+            reset_buffer(file_source)
 
             encoding = self._detect_encoding_from_bytes(raw_data, options.encoding)
             delimiter = self._detect_delimiter_from_bytes(raw_data, encoding)
@@ -262,20 +281,22 @@ class CSVHandler(FormatHandler):
             text_data = raw_data.decode(encoding, errors="ignore")
             source_for_pandas = io.StringIO(text_data)
         else:
-            encoding = self._detect_encoding(file_source, options.encoding)
-            delimiter = self._detect_delimiter(file_source, encoding)
-            source_for_pandas = file_source
+            encoding = self._detect_encoding(file_source, options.encoding)  # type: ignore[arg-type]
+            delimiter = self._detect_delimiter(file_source, encoding)  # type: ignore[arg-type]
+            source_for_pandas = file_source  # type: ignore[assignment]
 
         # Auto-detect metadata rows to skip
         skip_rows = options.skip_rows
         if options.auto_detect_header and skip_rows == 0:
-            if is_fileobj:
+            if is_stream:
                 skip_rows = self._detector.detect_skip_rows_from_text(text_data, delimiter)
                 # Reset StringIO after detection
                 source_for_pandas = io.StringIO(text_data)
             else:
                 skip_rows = self._detector.detect_skip_rows(
-                    file_source, encoding, delimiter
+                    file_source,  # type: ignore[arg-type]
+                    encoding,
+                    delimiter,
                 )
 
         na_values = options.na_values or DEFAULT_NA_VALUES
@@ -287,25 +308,25 @@ class CSVHandler(FormatHandler):
         try:
             df = pd.read_csv(
                 source_for_pandas,
-                encoding      = None if is_fileobj else encoding,  # Already decoded for StringIO
-                delimiter     = delimiter,
-                skiprows      = skip_rows if options.header_rows <= 1 else 0,
-                skipfooter    = options.skip_footer,
-                nrows         = options.max_rows,
-                na_values     = na_values,
-                header        = header,
-                engine        = engine,
-                on_bad_lines  = "warn",  # Handle malformed rows gracefully
+                encoding=None if is_stream else encoding,  # Already decoded for StringIO
+                delimiter=delimiter,
+                skiprows=skip_rows if options.header_rows <= 1 else 0,
+                skipfooter=options.skip_footer,
+                nrows=options.max_rows,
+                na_values=na_values,
+                header=header,
+                engine=engine,
+                on_bad_lines="warn",  # Handle malformed rows gracefully
             )
-        except UnicodeDecodeError:
-            if is_fileobj:
+        except UnicodeDecodeError as err:
+            if is_stream:
                 raise FormatError(
-                    f"Cannot decode CSV data",
-                    file_path        = file_desc,
-                    detected_format  = "csv",
-                )
+                    "Cannot decode CSV data",
+                    file_path=file_desc,
+                    detected_format="csv",
+                ) from err
             df = self._read_with_encoding_fallback(
-                file_source,
+                file_source,  # type: ignore[arg-type]
                 delimiter,
                 options,
                 na_values,
@@ -313,17 +334,17 @@ class CSVHandler(FormatHandler):
         except Exception as e:
             raise FormatError(
                 f"Cannot parse CSV file: {e}",
-                file_path        = file_desc,
-                detected_format  = "csv",
+                file_path=file_desc,
+                detected_format="csv",
             ) from e
 
         if options.header_rows > 1:
             if options.skip_rows > 0:
-                df = df.iloc[options.skip_rows:]
+                df = df.iloc[options.skip_rows :]
 
             df, columns = self._generate_column_names(df, options.header_rows)
-            df.columns  = columns
-            df          = df.reset_index(drop=True)
+            df.columns = columns
+            df = df.reset_index(drop=True)
         elif options.header_rows == 0:
             df.columns = [f"col_{i}" for i in range(len(df.columns))]
 
@@ -334,7 +355,7 @@ class CSVHandler(FormatHandler):
         try:
             with open(file_path, "rb") as f:
                 raw_data = f.read(10000)
-        except Exception:
+        except OSError:
             return default
 
         return self._detect_encoding_from_bytes(raw_data, default)
@@ -362,9 +383,9 @@ class CSVHandler(FormatHandler):
     def _detect_delimiter(self, file_path: Path, encoding: str) -> str:
         """Detect CSV delimiter."""
         try:
-            with open(file_path, "r", encoding=encoding, errors="ignore") as f:
+            with open(file_path, encoding=encoding, errors="ignore") as f:
                 sample = f.read(8192)
-        except Exception:
+        except OSError:
             return ","
 
         return self._detect_delimiter_from_text(sample)
@@ -373,7 +394,7 @@ class CSVHandler(FormatHandler):
         """Detect delimiter from raw bytes."""
         try:
             sample = raw_data[:8192].decode(encoding, errors="ignore")
-        except Exception:
+        except (UnicodeDecodeError, LookupError):
             return ","
 
         return self._detect_delimiter_from_text(sample)
@@ -393,9 +414,9 @@ class CSVHandler(FormatHandler):
         if not lines:
             return ","
 
-        delimiters     = [",", "\t", ";", "|"]
+        delimiters = [",", "\t", ";", "|"]
         best_delimiter = ","
-        best_score     = 0.0
+        best_score = 0.0
 
         for delim in delimiters:
             counts = [line.count(delim) for line in lines]
@@ -412,7 +433,7 @@ class CSVHandler(FormatHandler):
             score = avg_count / (variance + 1)
 
             if score > best_score:
-                best_score     = score
+                best_score = score
                 best_delimiter = delim
 
         return best_delimiter
@@ -433,14 +454,14 @@ class CSVHandler(FormatHandler):
             try:
                 df = pd.read_csv(
                     file_path,
-                    encoding   = encoding,
-                    delimiter  = delimiter,
-                    skiprows   = options.skip_rows if options.header_rows <= 1 else 0,
-                    skipfooter = options.skip_footer,
-                    nrows      = options.max_rows,
-                    na_values  = na_values,
-                    header     = header,
-                    engine     = engine,
+                    encoding=encoding,
+                    delimiter=delimiter,
+                    skiprows=options.skip_rows if options.header_rows <= 1 else 0,
+                    skipfooter=options.skip_footer,
+                    nrows=options.max_rows,
+                    na_values=na_values,
+                    header=header,
+                    engine=engine,
                 )
                 return df
             except UnicodeDecodeError as e:
@@ -451,10 +472,10 @@ class CSVHandler(FormatHandler):
                 continue
 
         raise FormatError(
-            f"Cannot read CSV with any encoding",
-            file_path          = str(file_path),
-            detected_format    = "csv",
-            attempted_formats  = [f"csv[{enc}]" for enc in ENCODING_FALLBACKS],
+            "Cannot read CSV with any encoding",
+            file_path=str(file_path),
+            detected_format="csv",
+            attempted_formats=[f"csv[{enc}]" for enc in ENCODING_FALLBACKS],
         )
 
     def get_sheet_names(self, file_source: FileSource) -> list[str]:
@@ -463,22 +484,18 @@ class CSVHandler(FormatHandler):
 
     def validate(self, file_source: FileSource) -> tuple[bool, str | None]:
         """Validate that file can be parsed."""
-        is_fileobj = hasattr(file_source, "read")
-
-        if is_fileobj:
+        if is_fileobj(file_source):
             try:
-                if hasattr(file_source, "seek"):
-                    file_source.seek(0)
-                data = file_source.read(1024)
-                if hasattr(file_source, "seek"):
-                    file_source.seek(0)
+                reset_buffer(file_source)
+                file_source.read(1024)  # type: ignore[union-attr]
+                reset_buffer(file_source)
                 return True, None
             except Exception as e:
                 return False, str(e)
         else:
             try:
-                encoding = self._detect_encoding(file_source, "utf-8")
-                with open(file_source, "r", encoding=encoding, errors="ignore") as f:
+                encoding = self._detect_encoding(file_source, "utf-8")  # type: ignore[arg-type]
+                with open(file_source, encoding=encoding, errors="ignore") as f:  # type: ignore[arg-type]
                     f.read(1024)
                 return True, None
             except Exception as e:

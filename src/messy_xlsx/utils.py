@@ -7,10 +7,10 @@
 import re
 from typing import Any
 
-
 # ============================================================================
 # Cell Reference Functions
 # ============================================================================
+
 
 def cell_ref_to_coords(ref: str) -> tuple[str | None, int, int]:
     """Parse an Excel cell reference to (sheet, row, col)."""
@@ -72,6 +72,7 @@ def parse_range(range_str: str) -> tuple[str | None, int, int, int, int]:
 # Column Conversion Functions
 # ============================================================================
 
+
 def column_letter_to_index(letters: str) -> int:
     """Convert column letters to 1-based index."""
     result = 0
@@ -96,20 +97,106 @@ def column_index_to_letter(index: int) -> str:
 
 # BigQuery reserved words that require quoting in queries
 # https://cloud.google.com/bigquery/docs/reference/standard-sql/lexical#reserved_keywords
-BIGQUERY_RESERVED_WORDS = frozenset({
-    "all", "and", "any", "array", "as", "asc", "assert_rows_modified", "at",
-    "between", "by", "case", "cast", "collate", "contains", "create", "cross",
-    "cube", "current", "default", "define", "desc", "distinct", "else", "end",
-    "enum", "escape", "except", "exclude", "exists", "extract", "false", "fetch",
-    "following", "for", "from", "full", "group", "grouping", "groups", "hash",
-    "having", "if", "ignore", "in", "inner", "intersect", "interval", "into",
-    "is", "join", "lateral", "left", "like", "limit", "lookup", "merge", "natural",
-    "new", "no", "not", "null", "nulls", "of", "on", "or", "order", "outer",
-    "over", "partition", "preceding", "proto", "qualify", "range", "recursive",
-    "respect", "right", "rollup", "rows", "select", "set", "some", "struct",
-    "tablesample", "then", "to", "treat", "true", "unbounded", "union", "unnest",
-    "using", "when", "where", "window", "with", "within",
-})
+BIGQUERY_RESERVED_WORDS = frozenset(
+    {
+        "all",
+        "and",
+        "any",
+        "array",
+        "as",
+        "asc",
+        "assert_rows_modified",
+        "at",
+        "between",
+        "by",
+        "case",
+        "cast",
+        "collate",
+        "contains",
+        "create",
+        "cross",
+        "cube",
+        "current",
+        "default",
+        "define",
+        "desc",
+        "distinct",
+        "else",
+        "end",
+        "enum",
+        "escape",
+        "except",
+        "exclude",
+        "exists",
+        "extract",
+        "false",
+        "fetch",
+        "following",
+        "for",
+        "from",
+        "full",
+        "group",
+        "grouping",
+        "groups",
+        "hash",
+        "having",
+        "if",
+        "ignore",
+        "in",
+        "inner",
+        "intersect",
+        "interval",
+        "into",
+        "is",
+        "join",
+        "lateral",
+        "left",
+        "like",
+        "limit",
+        "lookup",
+        "merge",
+        "natural",
+        "new",
+        "no",
+        "not",
+        "null",
+        "nulls",
+        "of",
+        "on",
+        "or",
+        "order",
+        "outer",
+        "over",
+        "partition",
+        "preceding",
+        "proto",
+        "qualify",
+        "range",
+        "recursive",
+        "respect",
+        "right",
+        "rollup",
+        "rows",
+        "select",
+        "set",
+        "some",
+        "struct",
+        "tablesample",
+        "then",
+        "to",
+        "treat",
+        "true",
+        "unbounded",
+        "union",
+        "unnest",
+        "using",
+        "when",
+        "where",
+        "window",
+        "with",
+        "within",
+    }
+)
 
 
 def _camel_to_snake(name: str) -> str:

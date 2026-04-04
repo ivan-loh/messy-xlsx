@@ -4,11 +4,13 @@
 # Imports
 # ============================================================================
 
+import logging
 import re
 from dataclasses import dataclass
 
 import openpyxl
 
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # Configuration
@@ -30,6 +32,7 @@ COMMA_THOUSANDS_PATTERN = re.compile(r"\d,\d{3}")
 # Models
 # ============================================================================
 
+
 @dataclass
 class LocaleInfo:
     """Detected locale information."""
@@ -44,10 +47,13 @@ class LocaleInfo:
 # Locale Detector
 # ============================================================================
 
+
 class LocaleDetector:
     """Detect number format locale from cell values and formats."""
 
-    def detect(self, ws: openpyxl.worksheet.worksheet.Worksheet, data_region: dict | None = None) -> LocaleInfo:
+    def detect(
+        self, ws: openpyxl.worksheet.worksheet.Worksheet, data_region: dict | None = None
+    ) -> LocaleInfo:
         """Detect locale from worksheet."""
         format_codes = []
         text_values = []
@@ -72,7 +78,8 @@ class LocaleDetector:
                     if isinstance(cell.value, str):
                         text_values.append(cell.value)
 
-                except Exception:
+                except (AttributeError, IndexError, TypeError) as e:
+                    logger.debug("Locale detection skipped cell (%d, %d): %s", row, col, e)
                     continue
 
         european_from_formats = self._check_format_codes(format_codes)

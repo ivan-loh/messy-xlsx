@@ -1,7 +1,6 @@
 """Unit tests for HandlerRegistry."""
 
-import pytest
-from messy_xlsx.parsing import HandlerRegistry, XLSXHandler, CSVHandler
+from messy_xlsx.parsing import CSVHandler, HandlerRegistry, XLSXHandler
 
 
 class TestHandlerRegistry:
@@ -44,14 +43,12 @@ class TestHandlerRegistry:
     def test_parse_with_fallback(self, sample_xlsx):
         """Test parsing with fallback chain."""
         from messy_xlsx.parsing import ParseOptions
+
         registry = HandlerRegistry()
 
         # parse() method already implements fallback logic
         df = registry.parse(
-            file_source=sample_xlsx,
-            sheet="Data",
-            options=ParseOptions(),
-            format_type="xlsx"
+            file_source=sample_xlsx, sheet="Data", options=ParseOptions(), format_type="xlsx"
         )
 
         assert df is not None

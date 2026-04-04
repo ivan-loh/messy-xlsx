@@ -8,7 +8,6 @@ import re
 
 import pandas as pd
 
-
 # ============================================================================
 # Config
 # ============================================================================
@@ -96,6 +95,7 @@ DATE_PATTERNS = [
 # Core
 # ============================================================================
 
+
 class SemanticTypeInference:
     """Infer column types from semantic patterns in names."""
 
@@ -135,7 +135,7 @@ class SemanticTypeInference:
     ) -> list[dict]:
         """Detect when inferred type doesn't match actual data type."""
         warnings = []
-        hints    = hints or self.infer_types(df)
+        hints = hints or self.infer_types(df)
 
         for col, expected_type in hints.items():
             if col not in df.columns:
@@ -145,29 +145,36 @@ class SemanticTypeInference:
 
             if expected_type == "DECIMAL":
                 if "datetime" in actual_dtype or "timestamp" in actual_dtype:
-                    warnings.append({
-                        "column": col,
-                        "expected": "numeric",
-                        "actual": actual_dtype,
-                        "suggestion": f'type_hints: {{"{col}": "DECIMAL"}}',
-                    })
+                    warnings.append(
+                        {
+                            "column": col,
+                            "expected": "numeric",
+                            "actual": actual_dtype,
+                            "suggestion": f'type_hints: {{"{col}": "DECIMAL"}}',
+                        }
+                    )
 
             elif expected_type == "VARCHAR":
                 if "int" in actual_dtype or "float" in actual_dtype:
-                    warnings.append({
-                        "column": col,
-                        "expected": "text",
-                        "actual": actual_dtype,
-                        "suggestion": f'type_hints: {{"{col}": "VARCHAR"}}',
-                    })
+                    warnings.append(
+                        {
+                            "column": col,
+                            "expected": "text",
+                            "actual": actual_dtype,
+                            "suggestion": f'type_hints: {{"{col}": "VARCHAR"}}',
+                        }
+                    )
 
-            elif expected_type == "TIMESTAMP":
-                if "int" in actual_dtype or "float" in actual_dtype:
-                    warnings.append({
+            elif expected_type == "TIMESTAMP" and (
+                "int" in actual_dtype or "float" in actual_dtype
+            ):
+                warnings.append(
+                    {
                         "column": col,
                         "expected": "datetime",
                         "actual": actual_dtype,
                         "suggestion": f'type_hints: {{"{col}": "TIMESTAMP"}}',
-                    })
+                    }
+                )
 
         return warnings

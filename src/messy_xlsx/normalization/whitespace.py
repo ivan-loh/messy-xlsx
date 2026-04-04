@@ -22,6 +22,7 @@ _ALL_WS_PATTERN = re.compile(r"[\s\xa0]+")
 # Core
 # ============================================================================
 
+
 class WhitespaceNormalizer:
     """Clean whitespace issues in text data."""
 

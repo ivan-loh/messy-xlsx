@@ -8,7 +8,6 @@ Tests for:
 """
 
 import io
-from pathlib import Path
 
 import openpyxl
 import pandas as pd
@@ -94,9 +93,7 @@ class TestDateParsingFix:
         wb.save(file_path)
         wb.close()
 
-        config = SheetConfig(
-            type_hints={"serial_date": "TIMESTAMP"}
-        )
+        config = SheetConfig(type_hints={"serial_date": "TIMESTAMP"})
 
         with MessyWorkbook(file_path, sheet_config=config) as mwb:
             df = mwb.to_dataframe()
@@ -271,7 +268,9 @@ class TestNormalizationToggle:
             df = mwb.to_dataframe()
 
             # Date strings should remain as strings (object or StringDtype)
-            assert df["date_column"].dtype == object or isinstance(df["date_column"].dtype, pd.StringDtype)
+            assert df["date_column"].dtype == object or isinstance(
+                df["date_column"].dtype, pd.StringDtype
+            )
             assert df["date_column"].iloc[0] == "2024-01-01"
 
     def test_normalize_numbers_disabled(self, temp_dir):
@@ -308,7 +307,7 @@ class TestNormalizationToggle:
         config = SheetConfig(normalize_whitespace=False)
 
         with MessyWorkbook(file_path, sheet_config=config) as mwb:
-            df = mwb.to_dataframe()
+            mwb.to_dataframe()
 
             # Whitespace should be preserved
             # Note: Leading/trailing spaces may still be stripped by other processes
@@ -355,12 +354,11 @@ class TestPandasDeprecationFixes:
             warnings.simplefilter("always")
 
             with MessyWorkbook(file_path) as mwb:
-                df = mwb.to_dataframe()
+                mwb.to_dataframe()
 
             # Filter for the specific deprecation
             datetime_warnings = [
-                warning for warning in w
-                if "infer_datetime_format" in str(warning.message)
+                warning for warning in w if "infer_datetime_format" in str(warning.message)
             ]
             assert len(datetime_warnings) == 0, f"Found warnings: {datetime_warnings}"
 
@@ -368,28 +366,31 @@ class TestPandasDeprecationFixes:
 class TestColumnNamePatternMatching:
     """Tests for column name pattern matching in date detection."""
 
-    @pytest.mark.parametrize("column_name,should_be_date", [
-        # Date-like names (should be converted if values look like dates)
-        ("date", True),
-        ("created_at", True),
-        ("updated_time", True),
-        ("birth_date", True),
-        ("start_date", True),
-        ("end_date", True),
-        # Non-date names (should NOT be converted even if values are in range)
-        ("count", False),
-        ("total", False),
-        ("quantity", False),
-        ("transaction_id", False),
-        ("user_count", False),
-        ("order_total", False),
-        ("item_qty", False),
-        ("price", False),
-        ("amount", False),
-        ("score", False),
-        ("rank", False),
-        ("age", False),
-    ])
+    @pytest.mark.parametrize(
+        "column_name,should_be_date",
+        [
+            # Date-like names (should be converted if values look like dates)
+            ("date", True),
+            ("created_at", True),
+            ("updated_time", True),
+            ("birth_date", True),
+            ("start_date", True),
+            ("end_date", True),
+            # Non-date names (should NOT be converted even if values are in range)
+            ("count", False),
+            ("total", False),
+            ("quantity", False),
+            ("transaction_id", False),
+            ("user_count", False),
+            ("order_total", False),
+            ("item_qty", False),
+            ("price", False),
+            ("amount", False),
+            ("score", False),
+            ("rank", False),
+            ("age", False),
+        ],
+    )
     def test_column_name_date_detection(self, temp_dir, column_name, should_be_date):
         """Test that column names affect date detection for numeric values."""
         file_path = temp_dir / f"test_{column_name}.xlsx"
@@ -414,7 +415,9 @@ class TestColumnNamePatternMatching:
                 pass
             else:
                 # For non-date columns, should NOT be datetime
-                assert not is_datetime, f"Column '{column_name}' was incorrectly converted to datetime"
+                assert not is_datetime, (
+                    f"Column '{column_name}' was incorrectly converted to datetime"
+                )
 
 
 class TestIncludeHiddenRows:

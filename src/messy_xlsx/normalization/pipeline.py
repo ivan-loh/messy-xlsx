@@ -13,10 +13,10 @@ from messy_xlsx.normalization.type_coercion import TypeCoercionNormalizer
 from messy_xlsx.normalization.type_inference import SemanticTypeInference
 from messy_xlsx.normalization.whitespace import WhitespaceNormalizer
 
-
 # ============================================================================
 # Core
 # ============================================================================
+
 
 class NormalizationPipeline:
     """Orchestrate data normalization steps."""
@@ -29,12 +29,12 @@ class NormalizationPipeline:
         preserve_linebreaks: bool = False,
     ):
         """Initialize pipeline."""
-        self.whitespace        = WhitespaceNormalizer()
-        self.numbers           = NumberNormalizer(decimal_separator, thousands_separator)
-        self.dates             = DateNormalizer()
-        self.missing           = MissingValueHandler(extra_missing_values)
-        self.type_coercion     = TypeCoercionNormalizer()
-        self.type_inference    = SemanticTypeInference()
+        self.whitespace = WhitespaceNormalizer()
+        self.numbers = NumberNormalizer(decimal_separator, thousands_separator)
+        self.dates = DateNormalizer()
+        self.missing = MissingValueHandler(extra_missing_values)
+        self.type_coercion = TypeCoercionNormalizer()
+        self.type_inference = SemanticTypeInference()
         self.preserve_linebreaks = preserve_linebreaks
 
     def normalize(

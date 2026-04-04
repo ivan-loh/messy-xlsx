@@ -1,8 +1,7 @@
 """Unit tests for FormulaEngine."""
 
-import pytest
-from messy_xlsx.formulas import FormulaEngine, FormulaConfig, FormulaEvaluationMode
 from messy_xlsx import MessyWorkbook
+from messy_xlsx.formulas import FormulaConfig, FormulaEngine, FormulaEvaluationMode
 
 
 class TestFormulaEngine:
@@ -39,12 +38,9 @@ class TestFormulaEngine:
 
     def test_unsupported_function_handling(self):
         """Test handling unsupported functions."""
-        config = FormulaConfig(
-            raise_on_unsupported=False,
-            unsupported_value="#UNSUPPORTED"
-        )
+        config = FormulaConfig(raise_on_unsupported=False, unsupported_value="#UNSUPPORTED")
 
-        engine = FormulaEngine(config)
+        FormulaEngine(config)
 
         # Should not raise error, return placeholder
         assert config.unsupported_value == "#UNSUPPORTED"

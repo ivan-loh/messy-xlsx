@@ -7,15 +7,24 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+from messy_xlsx.enums import (
+    DataType,
+    FormatType,
+    HeaderDetectionMode,
+    HeaderFallback,
+    MergeStrategy,
+)
+
 # ============================================================================
 # Format Models
 # ============================================================================
+
 
 @dataclass
 class FormatInfo:
     """Information about detected file format."""
 
-    format_type: str
+    format_type: FormatType | str
     confidence: float = 1.0
     version: str | None = None
     encoding: str | None = None
@@ -23,10 +32,15 @@ class FormatInfo:
     is_encrypted: bool = False
     is_compressed: bool = False
 
+    def __post_init__(self) -> None:
+        if isinstance(self.format_type, str) and not isinstance(self.format_type, FormatType):
+            self.format_type = FormatType(self.format_type)
+
 
 # ============================================================================
 # Structure Models
 # ============================================================================
+
 
 @dataclass
 class StructureInfo:
@@ -97,6 +111,7 @@ class TableInfo:
 # Configuration Models
 # ============================================================================
 
+
 @dataclass
 class SheetError:
     """Error information for a sheet that failed to parse."""
@@ -128,16 +143,16 @@ class SheetConfig:
     type_hints: dict[str, str] = field(default_factory=dict)
     auto_detect: bool = True
     include_hidden: bool = False
-    merge_strategy: str = "fill"
+    merge_strategy: MergeStrategy | str = MergeStrategy.FILL
     locale: str | None = None
     evaluate_formulas: bool = True
     drop_regex: str | None = None
     drop_conditions: list[dict[str, Any]] = field(default_factory=list)
 
     # Header detection configuration
-    header_detection_mode: str = "smart"
+    header_detection_mode: HeaderDetectionMode | str = HeaderDetectionMode.SMART
     header_confidence_threshold: float = 0.7
-    header_fallback: str = "first_row"
+    header_fallback: HeaderFallback | str = HeaderFallback.FIRST_ROW
     multi_row_headers: bool = False
     header_patterns: list[str] | None = None
 
@@ -150,10 +165,39 @@ class SheetConfig:
     # Column name sanitization (ON by default for BigQuery compatibility)
     sanitize_column_names: bool = True
 
+    def __post_init__(self) -> None:
+        # Enum coercion — backward compatible with raw strings
+        if isinstance(self.merge_strategy, str) and not isinstance(
+            self.merge_strategy, MergeStrategy
+        ):
+            self.merge_strategy = MergeStrategy(self.merge_strategy)
+        if isinstance(self.header_detection_mode, str) and not isinstance(
+            self.header_detection_mode, HeaderDetectionMode
+        ):
+            self.header_detection_mode = HeaderDetectionMode(self.header_detection_mode)
+        if isinstance(self.header_fallback, str) and not isinstance(
+            self.header_fallback, HeaderFallback
+        ):
+            self.header_fallback = HeaderFallback(self.header_fallback)
+
+        # Bounds validation
+        if self.skip_rows < 0:
+            raise ValueError(f"skip_rows must be >= 0, got {self.skip_rows}")
+        if self.header_rows < 0:
+            raise ValueError(f"header_rows must be >= 0, got {self.header_rows}")
+        if self.skip_footer < 0:
+            raise ValueError(f"skip_footer must be >= 0, got {self.skip_footer}")
+        if not (0.0 <= self.header_confidence_threshold <= 1.0):
+            raise ValueError(
+                f"header_confidence_threshold must be between 0.0 and 1.0, "
+                f"got {self.header_confidence_threshold}"
+            )
+
 
 # ============================================================================
 # Cell Models
 # ============================================================================
+
 
 @dataclass
 class CellValue:
@@ -163,8 +207,12 @@ class CellValue:
     formula: str | None = None
     is_merged: bool = False
     is_hidden: bool = False
-    data_type: str = "empty"
+    data_type: DataType | str = DataType.EMPTY
     original_format: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.data_type, str) and not isinstance(self.data_type, DataType):
+            self.data_type = DataType(self.data_type)
 
     @property
     def is_formula(self) -> bool:

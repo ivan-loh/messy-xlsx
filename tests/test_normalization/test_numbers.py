@@ -13,9 +13,7 @@ class TestNumberNormalizer:
         """Test normalizing US number format."""
         normalizer = NumberNormalizer(decimal_separator=".", thousands_separator=",")
 
-        df = pd.DataFrame({
-            "amount": ["1,234.56", "2,345.67", "3,456.78"]
-        })
+        df = pd.DataFrame({"amount": ["1,234.56", "2,345.67", "3,456.78"]})
 
         result = normalizer.normalize(df)
 
@@ -26,9 +24,7 @@ class TestNumberNormalizer:
         """Test normalizing European number format."""
         normalizer = NumberNormalizer(decimal_separator=",", thousands_separator=".")
 
-        df = pd.DataFrame({
-            "amount": ["1.234,56", "2.345,67", "3.456,78"]
-        })
+        df = pd.DataFrame({"amount": ["1.234,56", "2.345,67", "3.456,78"]})
 
         result = normalizer.normalize(df)
 
@@ -39,9 +35,7 @@ class TestNumberNormalizer:
         """Test removing currency symbols."""
         normalizer = NumberNormalizer(decimal_separator=".", thousands_separator=",")
 
-        df = pd.DataFrame({
-            "amount": ["$1,234.56", "€2,345.67", "£3,456.78"]
-        })
+        df = pd.DataFrame({"amount": ["$1,234.56", "€2,345.67", "£3,456.78"]})
 
         result = normalizer.normalize(df)
 
@@ -52,9 +46,7 @@ class TestNumberNormalizer:
         """Test handling accounting format (negative in parentheses)."""
         normalizer = NumberNormalizer(decimal_separator=".", thousands_separator=",")
 
-        df = pd.DataFrame({
-            "amount": ["1,234.56", "(234.56)", "567.89"]
-        })
+        df = pd.DataFrame({"amount": ["1,234.56", "(234.56)", "567.89"]})
 
         result = normalizer.normalize(df)
 
@@ -64,10 +56,9 @@ class TestNumberNormalizer:
         """Test automatic locale detection."""
         normalizer = NumberNormalizer()  # Auto-detect when None
 
-        df = pd.DataFrame({
-            "us_format": ["1,234.56", "2,345.67"],
-            "eu_format": ["1.234,56", "2.345,67"]
-        })
+        df = pd.DataFrame(
+            {"us_format": ["1,234.56", "2,345.67"], "eu_format": ["1.234,56", "2.345,67"]}
+        )
 
         result = normalizer.normalize(df)
 
@@ -78,9 +69,7 @@ class TestNumberNormalizer:
         """Test that integer values are preserved."""
         normalizer = NumberNormalizer(decimal_separator=".", thousands_separator=",")
 
-        df = pd.DataFrame({
-            "count": [100, 200, 300]
-        })
+        df = pd.DataFrame({"count": [100, 200, 300]})
 
         result = normalizer.normalize(df)
 

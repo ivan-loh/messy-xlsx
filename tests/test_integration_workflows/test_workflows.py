@@ -1,9 +1,6 @@
 """Integration tests for common workflows."""
 
-from pathlib import Path
-
 import openpyxl
-import pytest
 
 from messy_xlsx import MessyWorkbook, SheetConfig, read_excel
 
@@ -63,8 +60,7 @@ class TestEndToEndWorkflows:
 
             # 2. Create config based on analysis
             config = SheetConfig(
-                skip_rows=structure.suggested_skip_rows,
-                locale=structure.detected_locale
+                skip_rows=structure.suggested_skip_rows, locale=structure.detected_locale
             )
 
             # 3. Parse with config
@@ -107,6 +103,7 @@ class TestEndToEndWorkflows:
 
             # Missing values should be standardized
             import pandas as pd
+
             assert pd.isna(df.iloc[1]["amount"])
 
 
@@ -121,7 +118,7 @@ class TestConfigurationChaining:
             merge_strategy="fill",
             locale="auto",
             evaluate_formulas=True,
-            include_hidden=False
+            include_hidden=False,
         )
 
         with MessyWorkbook(messy_xlsx, sheet_config=config) as wb:
@@ -141,7 +138,7 @@ class TestConfigurationChaining:
 
         config = SheetConfig(
             type_hints={"id": "VARCHAR"},  # Preserve leading zeros
-            column_renames={"id": "customer_id", "name": "item_name"}
+            column_renames={"id": "customer_id", "name": "item_name"},
         )
 
         with MessyWorkbook(file_path, sheet_config=config) as mwb:

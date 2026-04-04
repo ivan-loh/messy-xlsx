@@ -5,6 +5,7 @@
 # ============================================================================
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,6 @@ from messy_xlsx.formulas.config import (
     FormulaEvaluationMode,
 )
 
-
 # ============================================================================
 # Config
 # ============================================================================
@@ -31,22 +31,23 @@ log = logging.getLogger(__name__)
 # Core
 # ============================================================================
 
+
 class FormulaEngine:
     """Formula evaluation engine with library fallback chain."""
 
     def __init__(self, config: FormulaConfig | None = None):
         """Initialize engine."""
-        self.config            = config or FormulaConfig()
+        self.config = config or FormulaConfig()
         self._cache: dict[str, Any] = {}
         self._eval_stack: list[str] = []
-        self._custom_functions: dict[str, callable] = {}
+        self._custom_functions: dict[str, Callable[..., Any]] = {}
 
         self._init_xlcalculator()
         self._init_formulas()
 
-        self._xlcalc_model     = None
+        self._xlcalc_model = None
         self._xlcalc_evaluator = None
-        self._formulas_model   = None
+        self._formulas_model = None
         self._current_file: Path | None = None
 
     def _init_xlcalculator(self) -> None:
@@ -55,8 +56,8 @@ class FormulaEngine:
             from xlcalculator import Evaluator, ModelCompiler
 
             self.xlcalc_available = True
-            self._ModelCompiler   = ModelCompiler
-            self._Evaluator       = Evaluator
+            self._ModelCompiler = ModelCompiler
+            self._Evaluator = Evaluator
             log.debug("xlcalculator available")
         except ImportError:
             self.xlcalc_available = False
@@ -68,7 +69,7 @@ class FormulaEngine:
             import formulas
 
             self.formulas_available = True
-            self._formulas          = formulas
+            self._formulas = formulas
             log.debug("formulas library available")
         except ImportError:
             self.formulas_available = False
@@ -91,20 +92,18 @@ class FormulaEngine:
 
         if self.xlcalc_available:
             try:
-                compiler              = self._ModelCompiler()
-                self._xlcalc_model    = compiler.read_and_parse_archive(str(file_path))
+                compiler = self._ModelCompiler()
+                self._xlcalc_model = compiler.read_and_parse_archive(str(file_path))
                 self._xlcalc_evaluator = self._Evaluator(self._xlcalc_model)
                 log.debug(f"Loaded {file_path} with xlcalculator")
             except Exception as e:
                 log.warning(f"xlcalculator failed to load {file_path}: {e}")
-                self._xlcalc_model     = None
+                self._xlcalc_model = None
                 self._xlcalc_evaluator = None
 
         if self.formulas_available:
             try:
-                self._formulas_model = (
-                    self._formulas.ExcelModel().loads(str(file_path)).finish()
-                )
+                self._formulas_model = self._formulas.ExcelModel().loads(str(file_path)).finish()
                 log.debug(f"Loaded {file_path} with formulas library")
             except Exception as e:
                 log.warning(f"formulas library failed to load {file_path}: {e}")
@@ -124,32 +123,34 @@ class FormulaEngine:
         if self.config.mode == FormulaEvaluationMode.CACHED_ONLY:
             return cached_value
 
-        if self.config.mode == FormulaEvaluationMode.CACHED_WITH_FALLBACK:
-            if cached_value is not None:
-                return cached_value
+        if (
+            self.config.mode == FormulaEvaluationMode.CACHED_WITH_FALLBACK
+            and cached_value is not None
+        ):
+            return cached_value
 
         from openpyxl.utils import get_column_letter
 
         col_letter = get_column_letter(col)
-        cell_ref   = f"{sheet}!{col_letter}{row}"
+        cell_ref = f"{sheet}!{col_letter}{row}"
 
         if cell_ref in self._cache:
             return self._cache[cell_ref]
 
         if cell_ref in self._eval_stack:
-            cycle = self._eval_stack + [cell_ref]
+            cycle = [*self._eval_stack, cell_ref]
             return self._handle_circular_ref(cycle, cached_value)
 
         if len(self._eval_stack) > self.config.max_depth:
             raise FormulaError(
                 f"Evaluation depth exceeded ({self.config.max_depth})",
-                cell_ref = cell_ref,
+                cell_ref=cell_ref,
             )
 
         self._eval_stack.append(cell_ref)
 
         try:
-            result             = self._evaluate_formula(cell_ref)
+            result = self._evaluate_formula(cell_ref)
             self._cache[cell_ref] = result
             return result
         finally:
@@ -174,10 +175,9 @@ class FormulaEngine:
                 parts = cell_ref.split("!")
                 if len(parts) == 2:
                     sheet, cell = parts
-                    book        = list(self._formulas_model.books.values())[0]
-                    if sheet in book:
-                        if cell in book[sheet]:
-                            return book[sheet][cell].value
+                    book = next(iter(self._formulas_model.books.values()))
+                    if sheet in book and cell in book[sheet]:
+                        return book[sheet][cell].value
             except Exception as e:
                 error_str = str(e).lower()
                 if "not supported" in error_str:
@@ -199,7 +199,7 @@ class FormulaEngine:
         if self.config.circular_strategy == CircularRefStrategy.ERROR:
             raise CircularReferenceError(
                 "Circular reference detected",
-                cycle = cycle,
+                cycle=cycle,
             )
 
         if self.config.circular_strategy == CircularRefStrategy.RETURN_CACHED:
@@ -207,7 +207,7 @@ class FormulaEngine:
                 return cached_value
             raise CircularReferenceError(
                 "Circular reference with no cached value",
-                cycle = cycle,
+                cycle=cycle,
             )
 
         if self.config.circular_strategy == CircularRefStrategy.ITERATE:
@@ -220,7 +220,7 @@ class FormulaEngine:
 
         return cached_value
 
-    def register_function(self, name: str, func: callable) -> None:
+    def register_function(self, name: str, func: Callable[..., Any]) -> None:
         """Register a custom Excel function."""
         self._custom_functions[name.upper()] = func
 

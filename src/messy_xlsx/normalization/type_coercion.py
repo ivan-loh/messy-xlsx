@@ -13,6 +13,7 @@ import pandas as pd
 # Core
 # ============================================================================
 
+
 class TypeCoercionNormalizer:
     """
     Ensure columns have consistent types for BigQuery/Arrow compatibility.

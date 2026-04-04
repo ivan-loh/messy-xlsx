@@ -3,7 +3,8 @@
 [![Tests](https://github.com/ivan-loh/messy-xlsx/actions/workflows/test.yml/badge.svg)](https://github.com/ivan-loh/messy-xlsx/actions/workflows/test.yml)
 [![PyPI version](https://badge.fury.io/py/messy-xlsx.svg)](https://badge.fury.io/py/messy-xlsx)
 
-Parse Excel files (XLSX, XLS, CSV) to pandas DataFrames with structure detection and normalization.
+Parse messy Excel files (XLSX, XLS, CSV) to clean pandas DataFrames with
+intelligent structure detection, merged cell handling, and type normalization.
 
 ## Install
 
@@ -15,9 +16,12 @@ pip install messy-xlsx[formulas]
 
 # Optional: legacy .xls support
 pip install messy-xlsx[xls]
+
+# Everything
+pip install messy-xlsx[all]
 ```
 
-## Usage
+## Quick Start
 
 ```python
 from messy_xlsx import MessyWorkbook, SheetConfig, read_excel
@@ -42,34 +46,56 @@ wb = MessyWorkbook(io.BytesIO(content), filename="data.xlsx")
 ## Configuration
 
 ```python
+from messy_xlsx import SheetConfig, MergeStrategy, HeaderDetectionMode
+
 config = SheetConfig(
     # Row handling
     skip_rows=0,
     header_rows=1,
     skip_footer=0,
-    cell_range=None,              # "A1:F100"
+    cell_range=None,                       # "A1:F100"
 
     # Detection
     auto_detect=True,
-    header_detection_mode="smart", # "smart", "auto", "manual"
+    header_detection_mode="smart",         # or HeaderDetectionMode.SMART
     header_confidence_threshold=0.7,
 
     # Parsing
-    merge_strategy="fill",        # "fill", "skip", "first_only"
+    merge_strategy="fill",                 # or MergeStrategy.FILL
     include_hidden=False,
-    locale="auto",                # "auto", "en_US", "de_DE"
 
     # Normalization
     normalize=True,
     normalize_dates=True,
     normalize_numbers=True,
     normalize_whitespace=True,
+    sanitize_column_names=True,            # BigQuery-compatible names
 
     # Formulas
     evaluate_formulas=True,
 )
 
 wb = MessyWorkbook("data.xlsx", sheet_config=config)
+```
+
+All string-based config values accept both raw strings and enum types:
+
+```python
+from messy_xlsx import MergeStrategy
+
+# These are equivalent:
+SheetConfig(merge_strategy="fill")
+SheetConfig(merge_strategy=MergeStrategy.FILL)
+
+# Enums compare equal to strings:
+assert MergeStrategy.FILL == "fill"  # True
+```
+
+Invalid values raise `ValueError` at construction time:
+
+```python
+SheetConfig(skip_rows=-1)              # ValueError
+SheetConfig(merge_strategy="banana")   # ValueError
 ```
 
 ## Multi-Sheet
@@ -90,7 +116,8 @@ for sheet in info:
 
 ## Output
 
-Output is compatible with BigQuery/Arrow. Mixed-type columns are coerced to strings.
+Output is compatible with BigQuery/Arrow. Column names are sanitized by default
+and mixed-type columns are coerced to strings.
 
 ## Dependencies
 
@@ -103,6 +130,22 @@ Output is compatible with BigQuery/Arrow. Mixed-type columns are coerced to stri
 Optional:
 - formulas, xlcalculator (formula evaluation)
 - xlrd (XLS support)
+
+## Development
+
+```bash
+# Install with dev dependencies
+make install
+
+# Run tests, lint, type check
+make ci
+
+# Run benchmarks
+make benchmark
+
+# Serve documentation locally
+make docs
+```
 
 ## License
 

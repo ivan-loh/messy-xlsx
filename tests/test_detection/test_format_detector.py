@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from messy_xlsx.detection import FormatDetector
+from messy_xlsx.exceptions import FormatError
 
 
 class TestFormatDetector:
@@ -29,12 +30,12 @@ class TestFormatDetector:
         """Test error handling for nonexistent file."""
         detector = FormatDetector()
 
-        with pytest.raises(Exception):
+        with pytest.raises(FormatError):
             detector.detect(Path("/nonexistent/file.xlsx"))
 
     def test_binary_signature_detection(self, sample_xlsx):
         """Test binary signature matching."""
-        detector = FormatDetector()
+        FormatDetector()
 
         # Read first 8 bytes
         with open(sample_xlsx, "rb") as f:

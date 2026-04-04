@@ -1,7 +1,6 @@
 """Unit tests for XLSXHandler."""
 
-import pytest
-from messy_xlsx.parsing import XLSXHandler, ParseOptions
+from messy_xlsx.parsing import ParseOptions, XLSXHandler
 
 
 class TestXLSXHandler:

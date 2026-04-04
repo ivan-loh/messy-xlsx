@@ -10,7 +10,6 @@ import pytest
 
 from messy_xlsx import MessyWorkbook, SheetConfig, sanitize_column_name
 
-
 # Find all sample files
 SAMPLES_DIR = Path(__file__).parent / "samples"
 SAMPLE_FILES = list(SAMPLES_DIR.glob("*.xlsx")) + list(SAMPLES_DIR.glob("*.csv"))
@@ -29,7 +28,9 @@ def check_bigquery_compatible(df: pd.DataFrame) -> list[str]:
 
         # Check column name is valid identifier (letters, numbers, underscore, starting with letter/underscore)
         if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", col_str):
-            issues.append(f"Column '{col}' has invalid name for BigQuery (must be alphanumeric + underscore)")
+            issues.append(
+                f"Column '{col}' has invalid name for BigQuery (must be alphanumeric + underscore)"
+            )
 
         # Check for mixed types in object columns
         if df[col].dtype == object:
@@ -47,7 +48,9 @@ def check_bigquery_compatible(df: pd.DataFrame) -> list[str]:
 
                 # Check for np.nan in object columns (should be None)
                 if has_nan_float:
-                    issues.append(f"Column '{col}' has np.nan in object column (should be None for BigQuery)")
+                    issues.append(
+                        f"Column '{col}' has np.nan in object column (should be None for BigQuery)"
+                    )
 
                 # Check for mixed types (allow str only, or numeric only)
                 if len(types) > 1:
@@ -59,7 +62,9 @@ def check_bigquery_compatible(df: pd.DataFrame) -> list[str]:
                 # Check for unhashable/complex types that BigQuery can't handle
                 for val in non_null:
                     if isinstance(val, (list, dict, set, tuple)):
-                        issues.append(f"Column '{col}' contains {type(val).__name__} (not BigQuery compatible)")
+                        issues.append(
+                            f"Column '{col}' contains {type(val).__name__} (not BigQuery compatible)"
+                        )
                         break
 
     return issues
@@ -85,14 +90,16 @@ class TestBigQueryCompatibility:
                     # Filter known issues that are acceptable
                     # Column names with spaces are common in real files
                     critical_issues = [
-                        i for i in issues
+                        i
+                        for i in issues
                         if "np.nan in object column" in i  # This is the critical one
                         or "contains list" in i
                         or "contains dict" in i
                     ]
 
-                    assert critical_issues == [], \
+                    assert critical_issues == [], (
                         f"BigQuery critical issues in {sample_file.name} sheet '{sheet_name}': {critical_issues}"
+                    )
 
         except Exception as e:
             # Some files might have issues - log but don't fail
@@ -129,7 +136,7 @@ class TestBigQueryCompatibility:
         ws.append(["name", "value"])
         ws.append(["Alice", 100])
         ws.append(["NA", 200])  # NA should become None
-        ws.append(["", 300])   # Empty should become None
+        ws.append(["", 300])  # Empty should become None
         ws.append([None, 400])
         wb.save(file_path)
 
@@ -178,8 +185,9 @@ class TestBigQueryCompatibility:
 
         for col in df.columns:
             for val in df[col].dropna():
-                assert not isinstance(val, (list, dict, set, tuple)), \
+                assert not isinstance(val, (list, dict, set, tuple)), (
                     f"Column {col} contains complex type: {type(val)}"
+                )
 
 
 class TestColumnNameNormalization:
@@ -347,16 +355,27 @@ class TestSanitizeColumnNameFunction:
     def test_bigquery_pattern_compliance(self):
         """All results should match BigQuery's column name pattern."""
         test_cases = [
-            "First Name", "Amount ($)", "123-ID", "Sales (Q1-2024)",
-            "email@domain.com", "user.name", "UPPERCASE", "  spaces  ",
-            "_underscore_", "normal_name", "αβγ", "日本語",
+            "First Name",
+            "Amount ($)",
+            "123-ID",
+            "Sales (Q1-2024)",
+            "email@domain.com",
+            "user.name",
+            "UPPERCASE",
+            "  spaces  ",
+            "_underscore_",
+            "normal_name",
+            "αβγ",
+            "日本語",
         ]
         pattern = re.compile(r"^[a-z_][a-z0-9_]*$")
 
         for name in test_cases:
             result = sanitize_column_name(name)
             if result != "unnamed":  # unnamed is also valid
-                assert pattern.match(result), f"'{name}' -> '{result}' doesn't match BigQuery pattern"
+                assert pattern.match(result), (
+                    f"'{name}' -> '{result}' doesn't match BigQuery pattern"
+                )
 
 
 class TestSanitizeColumnNamesConfig:
@@ -409,7 +428,7 @@ class TestSanitizeColumnNamesConfig:
 
         config = SheetConfig(
             sanitize_column_names=True,
-            column_renames={"first_name": "user_name"}  # Rename after sanitization
+            column_renames={"first_name": "user_name"},  # Rename after sanitization
         )
         with MessyWorkbook(file_path, sheet_config=config) as mwb:
             df = mwb.to_dataframe()
@@ -554,14 +573,27 @@ def validate_arrow_schema_for_bq(table: pa.Table) -> list[str]:
     issues = []
 
     # Map Arrow types to BigQuery compatibility
-    bq_compatible_types = {
-        pa.int8(), pa.int16(), pa.int32(), pa.int64(),
-        pa.uint8(), pa.uint16(), pa.uint32(), pa.uint64(),
-        pa.float16(), pa.float32(), pa.float64(),
+    {
+        pa.int8(),
+        pa.int16(),
+        pa.int32(),
+        pa.int64(),
+        pa.uint8(),
+        pa.uint16(),
+        pa.uint32(),
+        pa.uint64(),
+        pa.float16(),
+        pa.float32(),
+        pa.float64(),
         pa.bool_(),
-        pa.string(), pa.large_string(), pa.utf8(), pa.large_utf8(),
-        pa.binary(), pa.large_binary(),
-        pa.date32(), pa.date64(),
+        pa.string(),
+        pa.large_string(),
+        pa.utf8(),
+        pa.large_utf8(),
+        pa.binary(),
+        pa.large_binary(),
+        pa.date32(),
+        pa.date64(),
     }
 
     for field in table.schema:
@@ -609,8 +641,9 @@ class TestPyArrowConversion:
                     # Try to convert to Arrow
                     table, error = convert_to_arrow(df)
 
-                    assert error is None, \
+                    assert error is None, (
                         f"Failed to convert {sample_file.name} sheet '{sheet_name}' to Arrow: {error}"
+                    )
 
                     # Validate schema
                     schema_issues = validate_arrow_schema_for_bq(table)
@@ -618,8 +651,9 @@ class TestPyArrowConversion:
                     # Filter out acceptable issues (nested types might be intentional)
                     critical_issues = [i for i in schema_issues if "not BQ compatible" in i]
 
-                    assert critical_issues == [], \
+                    assert critical_issues == [], (
                         f"Arrow schema issues in {sample_file.name}: {critical_issues}"
+                    )
 
         except Exception as e:
             pytest.skip(f"Could not process {sample_file.name}: {e}")
@@ -672,6 +706,7 @@ class TestPyArrowConversion:
 
         # Write to Parquet
         import pyarrow.parquet as pq
+
         pq.write_table(table, parquet_path)
 
         # Read back and verify

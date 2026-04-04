@@ -6,9 +6,7 @@
 
 import re
 
-import numpy as np
 import pandas as pd
-
 
 # ============================================================================
 # Config
@@ -20,7 +18,8 @@ EXCEL_DATE_MAX = 60000
 
 # Pre-compile all patterns at module level for performance
 _DATE_COLUMN_PATTERNS = [
-    re.compile(p) for p in [
+    re.compile(p)
+    for p in [
         r"(?i)date",
         r"(?i)time",
         r"(?i)timestamp",
@@ -40,7 +39,8 @@ _DATE_COLUMN_PATTERNS = [
 ]
 
 _NON_DATE_COLUMN_PATTERNS = [
-    re.compile(p) for p in [
+    re.compile(p)
+    for p in [
         r"(?i)count",
         r"(?i)total",
         r"(?i)sum",
@@ -80,27 +80,28 @@ _NON_DATE_COLUMN_PATTERNS = [
 
 # Common date formats to try (ordered by likelihood)
 _COMMON_DATE_FORMATS = [
-    "%Y-%m-%d",           # 2024-01-15
-    "%d/%m/%Y",           # 15/01/2024
-    "%m/%d/%Y",           # 01/15/2024
-    "%Y/%m/%d",           # 2024/01/15
-    "%d-%m-%Y",           # 15-01-2024
-    "%m-%d-%Y",           # 01-15-2024
-    "%d.%m.%Y",           # 15.01.2024
+    "%Y-%m-%d",  # 2024-01-15
+    "%d/%m/%Y",  # 15/01/2024
+    "%m/%d/%Y",  # 01/15/2024
+    "%Y/%m/%d",  # 2024/01/15
+    "%d-%m-%Y",  # 15-01-2024
+    "%m-%d-%Y",  # 01-15-2024
+    "%d.%m.%Y",  # 15.01.2024
     "%Y-%m-%d %H:%M:%S",  # 2024-01-15 10:30:00
     "%d/%m/%Y %H:%M:%S",  # 15/01/2024 10:30:00
     "%m/%d/%Y %H:%M:%S",  # 01/15/2024 10:30:00
     "%Y-%m-%dT%H:%M:%S",  # 2024-01-15T10:30:00 (ISO)
-    "%B %d, %Y",          # January 15, 2024
-    "%b %d, %Y",          # Jan 15, 2024
-    "%d %B %Y",           # 15 January 2024
-    "%d %b %Y",           # 15 Jan 2024
+    "%B %d, %Y",  # January 15, 2024
+    "%b %d, %Y",  # Jan 15, 2024
+    "%d %B %Y",  # 15 January 2024
+    "%d %b %Y",  # 15 Jan 2024
 ]
 
 
 # ============================================================================
 # Core
 # ============================================================================
+
 
 class DateNormalizer:
     """Normalize dates with multiple format support."""
@@ -118,7 +119,9 @@ class DateNormalizer:
             # Skip if semantic hint says not a date
             if col in semantic_hints:
                 hint = semantic_hints[col].upper()
-                if any(t in hint for t in ["DECIMAL", "NUMERIC", "INTEGER", "FLOAT", "VARCHAR", "TEXT"]):
+                if any(
+                    t in hint for t in ["DECIMAL", "NUMERIC", "INTEGER", "FLOAT", "VARCHAR", "TEXT"]
+                ):
                     continue
                 # Explicitly marked as timestamp - always convert
                 if "TIMESTAMP" in hint or "DATE" in hint:
@@ -146,11 +149,7 @@ class DateNormalizer:
                 return False
 
         # Then check if name suggests date
-        for pattern in _DATE_COLUMN_PATTERNS:
-            if pattern.search(col_name):
-                return True
-
-        return False
+        return any(pattern.search(col_name) for pattern in _DATE_COLUMN_PATTERNS)
 
     def _is_numeric_date_candidate(self, series: pd.Series) -> bool:
         """Check if column could be Excel serial dates (numeric check only)."""
@@ -162,9 +161,9 @@ class DateNormalizer:
             return False
 
         in_range = (sample >= EXCEL_DATE_MIN) & (sample <= EXCEL_DATE_MAX)
-        is_integer = (sample % 1 == 0)
+        is_integer = sample % 1 == 0
 
-        return (in_range & is_integer).mean() > 0.8
+        return bool((in_range & is_integer).mean() > 0.8)
 
     def _looks_like_text_dates(self, series: pd.Series) -> bool:
         """Check if column contains text dates."""
@@ -185,7 +184,7 @@ class DateNormalizer:
         # Fallback to mixed format detection (slower)
         try:
             parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
-            return parsed.notna().sum() > len(sample) * 0.5
+            return bool(parsed.notna().sum() > len(sample) * 0.5)
         except Exception:
             return False
 

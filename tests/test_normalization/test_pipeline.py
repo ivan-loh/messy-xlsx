@@ -1,7 +1,6 @@
 """Unit tests for NormalizationPipeline."""
 
 import pandas as pd
-import pytest
 
 from messy_xlsx.normalization import NormalizationPipeline
 
@@ -13,10 +12,7 @@ class TestNormalizationPipeline:
         """Test that all normalization steps execute."""
         pipeline = NormalizationPipeline(decimal_separator=".", thousands_separator=",")
 
-        df = pd.DataFrame({
-            "text": ["  hello  ", "world  "],
-            "amount": ["$1,234.56", "$2,345.67"]
-        })
+        df = pd.DataFrame({"text": ["  hello  ", "world  "], "amount": ["$1,234.56", "$2,345.67"]})
 
         result = pipeline.normalize(df)
 
@@ -30,9 +26,7 @@ class TestNormalizationPipeline:
         """Test that normalization steps run in correct order."""
         pipeline = NormalizationPipeline(decimal_separator=".", thousands_separator=",")
 
-        df = pd.DataFrame({
-            "messy": ["  $1,234.56  ", "  NA  ", "  $2,345.67  "]
-        })
+        df = pd.DataFrame({"messy": ["  $1,234.56  ", "  NA  ", "  $2,345.67  "]})
 
         result = pipeline.normalize(df)
 
@@ -56,11 +50,9 @@ class TestNormalizationPipeline:
         """Test that appropriate column types are preserved."""
         pipeline = NormalizationPipeline()
 
-        df = pd.DataFrame({
-            "int_col": [1, 2, 3],
-            "float_col": [1.5, 2.5, 3.5],
-            "str_col": ["a", "b", "c"]
-        })
+        df = pd.DataFrame(
+            {"int_col": [1, 2, 3], "float_col": [1.5, 2.5, 3.5], "str_col": ["a", "b", "c"]}
+        )
 
         result = pipeline.normalize(df)
 

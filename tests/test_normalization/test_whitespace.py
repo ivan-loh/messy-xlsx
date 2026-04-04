@@ -1,7 +1,6 @@
 """Unit tests for WhitespaceNormalizer."""
 
 import pandas as pd
-import pytest
 
 from messy_xlsx.normalization import WhitespaceNormalizer
 
@@ -13,9 +12,7 @@ class TestWhitespaceNormalizer:
         """Test stripping leading and trailing whitespace."""
         normalizer = WhitespaceNormalizer()
 
-        df = pd.DataFrame({
-            "text": ["  hello  ", "  world", "foo  "]
-        })
+        df = pd.DataFrame({"text": ["  hello  ", "  world", "foo  "]})
 
         result = normalizer.normalize(df)
 
@@ -27,9 +24,7 @@ class TestWhitespaceNormalizer:
         """Test collapsing internal whitespace."""
         normalizer = WhitespaceNormalizer()
 
-        df = pd.DataFrame({
-            "text": ["hello    world", "foo  bar"]
-        })
+        df = pd.DataFrame({"text": ["hello    world", "foo  bar"]})
 
         result = normalizer.normalize(df)
 
@@ -40,9 +35,7 @@ class TestWhitespaceNormalizer:
         """Test removing non-breaking spaces."""
         normalizer = WhitespaceNormalizer()
 
-        df = pd.DataFrame({
-            "text": ["hello\xa0world"]
-        })
+        df = pd.DataFrame({"text": ["hello\xa0world"]})
 
         result = normalizer.normalize(df)
 
@@ -52,9 +45,7 @@ class TestWhitespaceNormalizer:
         """Test that numeric values are not affected."""
         normalizer = WhitespaceNormalizer()
 
-        df = pd.DataFrame({
-            "number": [123, 456, 789]
-        })
+        df = pd.DataFrame({"number": [123, 456, 789]})
 
         result = normalizer.normalize(df)
 
@@ -64,9 +55,7 @@ class TestWhitespaceNormalizer:
         """Test handling empty strings."""
         normalizer = WhitespaceNormalizer()
 
-        df = pd.DataFrame({
-            "text": ["", "  ", "hello"]
-        })
+        df = pd.DataFrame({"text": ["", "  ", "hello"]})
 
         result = normalizer.normalize(df)
 
