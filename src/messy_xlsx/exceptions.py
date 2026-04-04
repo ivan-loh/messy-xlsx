@@ -6,10 +6,10 @@
 
 from typing import Any
 
-
 # ============================================================================
 # Base Exception
 # ============================================================================
+
 
 class MessyXlsxError(Exception):
     """Base exception for all messy-xlsx errors."""
@@ -37,6 +37,7 @@ class MessyXlsxError(Exception):
 # ============================================================================
 # File-Related Exceptions
 # ============================================================================
+
 
 class FileError(MessyXlsxError):
     """Raised for file I/O issues."""
@@ -93,6 +94,7 @@ class StructureError(MessyXlsxError):
 # Data Processing Exceptions
 # ============================================================================
 
+
 class NormalizationError(MessyXlsxError):
     """Raised when data normalization fails."""
 
@@ -119,6 +121,7 @@ class NormalizationError(MessyXlsxError):
 # ============================================================================
 # Formula-Related Exceptions
 # ============================================================================
+
 
 class FormulaError(MessyXlsxError):
     """Base exception for formula evaluation failures."""

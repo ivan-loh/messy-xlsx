@@ -2,7 +2,6 @@
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from messy_xlsx.normalization.type_coercion import TypeCoercionNormalizer
 
@@ -74,11 +73,13 @@ class TestTypeCoercionNormalizer:
 
     def test_multiple_columns_independent(self):
         """Each column should be coerced independently."""
-        df = pd.DataFrame({
-            "pure_str": pd.array(["a", "b"], dtype=object),
-            "mixed": pd.array(["x", 1], dtype=object),
-            "nums": [10, 20],
-        })
+        df = pd.DataFrame(
+            {
+                "pure_str": pd.array(["a", "b"], dtype=object),
+                "mixed": pd.array(["x", 1], dtype=object),
+                "nums": [10, 20],
+            }
+        )
         result = self.normalizer.normalize(df)
         assert list(result["pure_str"]) == ["a", "b"]
         assert list(result["mixed"]) == ["x", "1"]

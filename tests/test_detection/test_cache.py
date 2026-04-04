@@ -4,15 +4,14 @@ import time
 from pathlib import Path
 
 import openpyxl
-import pytest
 
 from messy_xlsx.cache import LRUCache, StructureCache
 from messy_xlsx.models import StructureInfo
 
-
 # ============================================================================
 # LRUCache Tests
 # ============================================================================
+
 
 class TestLRUCache:
     """Test generic LRU cache."""
@@ -48,7 +47,7 @@ class TestLRUCache:
         # Now "b" is least recently used
         cache.put("d", 4)
         assert cache.get("b") is None  # evicted
-        assert cache.get("a") == 1     # still present
+        assert cache.get("a") == 1  # still present
 
     def test_access_order_updates_on_put(self):
         cache: LRUCache[int] = LRUCache(maxsize=3)
@@ -59,7 +58,7 @@ class TestLRUCache:
         cache.put("a", 10)
         cache.put("d", 4)
         assert cache.get("b") is None  # evicted
-        assert cache.get("a") == 10    # still present, updated value
+        assert cache.get("a") == 10  # still present, updated value
 
     def test_invalidate_existing_key(self):
         cache: LRUCache[str] = LRUCache(maxsize=10)
@@ -118,17 +117,18 @@ class TestLRUCache:
 # StructureCache Tests
 # ============================================================================
 
+
 def _make_structure_info(**kwargs):
     """Create a minimal StructureInfo for testing."""
-    defaults = dict(
-        data_start_row=1,
-        data_end_row=10,
-        data_start_col=1,
-        data_end_col=5,
-        header_row=1,
-        header_rows_count=1,
-        header_confidence=0.9,
-    )
+    defaults = {
+        "data_start_row": 1,
+        "data_end_row": 10,
+        "data_start_col": 1,
+        "data_end_col": 5,
+        "header_row": 1,
+        "header_rows_count": 1,
+        "header_confidence": 0.9,
+    }
     defaults.update(kwargs)
     return StructureInfo(**defaults)
 

@@ -2,8 +2,6 @@
 Basic tests for messy-xlsx library.
 """
 
-import pytest
-
 
 class TestImports:
     """Test that all modules can be imported."""
@@ -20,10 +18,7 @@ class TestImports:
         """Test models module import."""
         from messy_xlsx.models import (
             CellValue,
-            FormatInfo,
             SheetConfig,
-            StructureInfo,
-            TableInfo,
         )
 
         assert CellValue is not None
@@ -34,12 +29,8 @@ class TestImports:
         from messy_xlsx.exceptions import (
             CircularReferenceError,
             FileError,
-            FormatError,
             FormulaError,
             MessyXlsxError,
-            NormalizationError,
-            StructureError,
-            UnsupportedFunctionError,
         )
 
         assert issubclass(FileError, MessyXlsxError)
@@ -49,8 +40,6 @@ class TestImports:
         """Test detection modules import."""
         from messy_xlsx.detection import (
             FormatDetector,
-            LocaleDetector,
-            StructureAnalyzer,
         )
 
         assert FormatDetector is not None
@@ -58,11 +47,6 @@ class TestImports:
     def test_import_parsing(self):
         """Test parsing modules import."""
         from messy_xlsx.parsing import (
-            CSVHandler,
-            FormatHandler,
-            HandlerRegistry,
-            ParseOptions,
-            XLSHandler,
             XLSXHandler,
         )
 
@@ -71,12 +55,7 @@ class TestImports:
     def test_import_normalization(self):
         """Test normalization modules import."""
         from messy_xlsx.normalization import (
-            DateNormalizer,
-            MissingValueHandler,
             NormalizationPipeline,
-            NumberNormalizer,
-            SemanticTypeInference,
-            WhitespaceNormalizer,
         )
 
         assert NormalizationPipeline is not None
@@ -84,10 +63,7 @@ class TestImports:
     def test_import_formulas(self):
         """Test formulas modules import."""
         from messy_xlsx.formulas import (
-            CircularRefStrategy,
-            FormulaConfig,
             FormulaEngine,
-            FormulaEvaluationMode,
         )
 
         assert FormulaEngine is not None
@@ -203,24 +179,27 @@ class TestNormalization:
         from messy_xlsx.normalization import WhitespaceNormalizer
 
         normalizer = WhitespaceNormalizer()
-        df = pd.DataFrame({
-            "text": ["  hello  ", "world  ", "  foo bar  "],
-        })
+        df = pd.DataFrame(
+            {
+                "text": ["  hello  ", "world  ", "  foo bar  "],
+            }
+        )
 
         result = normalizer.normalize(df)
         assert result["text"].tolist() == ["hello", "world", "foo bar"]
 
     def test_missing_value_handling(self):
         """Test missing value standardization."""
-        import numpy as np
         import pandas as pd
 
         from messy_xlsx.normalization import MissingValueHandler
 
         handler = MissingValueHandler()
-        df = pd.DataFrame({
-            "col": ["value", "NA", "N/A", "null", ""],
-        })
+        df = pd.DataFrame(
+            {
+                "col": ["value", "NA", "N/A", "null", ""],
+            }
+        )
 
         result = handler.normalize(df, drop_empty_rows=False)
         assert pd.isna(result["col"].iloc[1])

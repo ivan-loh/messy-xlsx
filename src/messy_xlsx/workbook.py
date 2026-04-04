@@ -49,12 +49,12 @@ class MessyWorkbook:
             formula_config: Configuration for formula evaluation
             filename: Optional filename hint when using file-like objects (for format detection)
         """
-        self._sheet_config   = sheet_config or SheetConfig()
+        self._sheet_config = sheet_config or SheetConfig()
         self._formula_config = formula_config or FormulaConfig()
 
-        self._detector      = FormatDetector()
-        self._registry      = HandlerRegistry()
-        self._analyzer      = StructureAnalyzer(get_structure_cache())
+        self._detector = FormatDetector()
+        self._registry = HandlerRegistry()
+        self._analyzer = StructureAnalyzer(get_structure_cache())
         self._formula_engine = FormulaEngine(self._formula_config)
 
         # Determine if input is file path or file-like object
@@ -83,7 +83,7 @@ class MessyWorkbook:
             if not self._file_path.exists():
                 raise FileError(
                     f"File not found: {self._file_path}",
-                    file_path = str(self._file_path),
+                    file_path=str(self._file_path),
                 )
 
             self._format_info = self._detector.detect(self._file_path)
@@ -92,7 +92,7 @@ class MessyWorkbook:
             file_desc: str | Path = self._filename_hint or self._file_path or "<stream>"
             raise FormatError(
                 f"Unknown file format: {file_desc}",
-                file_path = str(file_desc),
+                file_path=str(file_desc),
             )
 
         # Validate extension matches detected format for Excel files
@@ -100,7 +100,13 @@ class MessyWorkbook:
         if not self._is_fileobj and self._file_path is not None:
             file_ext = self._file_path.suffix.lower()
             excel_extensions = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"}
-            if file_ext in excel_extensions and self._format_info.format_type not in ("xlsx", "xlsm", "xls", "xltx", "xltm"):
+            if file_ext in excel_extensions and self._format_info.format_type not in (
+                "xlsx",
+                "xlsm",
+                "xls",
+                "xltx",
+                "xltm",
+            ):
                 raise FormatError(
                     f"File extension {file_ext} suggests Excel format, but content is {self._format_info.format_type}",
                     file_path=str(self._file_path),
@@ -124,14 +130,14 @@ class MessyWorkbook:
 
         self._sheets: dict[str, MessySheet] = {}
 
-        if self._formula_config.mode != FormulaEvaluationMode.DISABLED:
+        if self._formula_config.mode != FormulaEvaluationMode.DISABLED:  # noqa: SIM102
             if self._formula_engine.is_available:
                 try:
                     formula_source = self._file_path or self._file_buffer
                     if formula_source is not None:
                         self._formula_engine.load_workbook(formula_source)  # type: ignore[arg-type]
-                except Exception:
-                    pass
+                except (OSError, ValueError, TypeError) as e:
+                    logger.debug("Formula engine load failed: %s", e)
 
         self._wb: openpyxl.Workbook | None = None
 
@@ -168,7 +174,7 @@ class MessyWorkbook:
             file_desc = self._file_path or self._filename_hint or "<stream>"
             raise FormatError(
                 f"Sheet '{name}' not found",
-                file_path = str(file_desc),
+                file_path=str(file_desc),
             )
 
         if name not in self._sheets:
@@ -213,12 +219,14 @@ class MessyWorkbook:
                     context = {}
                     if hasattr(e, "context"):
                         context = e.context
-                    errors.append(SheetError(
-                        sheet_name=name,
-                        error_type=type(e).__name__,
-                        message=str(e),
-                        context=context,
-                    ))
+                    errors.append(
+                        SheetError(
+                            sheet_name=name,
+                            error_type=type(e).__name__,
+                            message=str(e),
+                            context=context,
+                        )
+                    )
         if include_errors:
             return result, errors
         return result
@@ -237,27 +245,31 @@ class MessyWorkbook:
         """Get a single cell value."""
         self._ensure_workbook()
 
-        assert self._wb is not None
-        ws   = self._wb[sheet]
+        if self._wb is None:
+            raise FileError("Workbook not loaded — call _ensure_workbook() first")
+        ws = self._wb[sheet]
         cell = ws.cell(row, col)
 
         cached_value = cell.value
 
-        formula    = None
+        formula = None
         is_formula = False
         if hasattr(cell, "data_type") and cell.data_type == "f":
             is_formula = True
-            if hasattr(cell, "value") and isinstance(cell.value, str):
-                if cell.value.startswith("="):
-                    formula = cell.value
+            if (
+                hasattr(cell, "value")
+                and isinstance(cell.value, str)
+                and cell.value.startswith("=")
+            ):
+                formula = cell.value
 
         if is_formula and self._formula_config.mode != FormulaEvaluationMode.DISABLED:
             try:
-                cached_value = self._formula_engine.evaluate(
-                    sheet, row, col, cached_value
+                cached_value = self._formula_engine.evaluate(sheet, row, col, cached_value)
+            except (ValueError, TypeError, KeyError) as e:
+                logger.debug(
+                    "Formula evaluation failed for cell (%s, %d, %d): %s", sheet, row, col, e
                 )
-            except Exception:
-                pass
 
         data_type = self._get_data_type(cached_value)
 
@@ -266,12 +278,12 @@ class MessyWorkbook:
         is_hidden = self._is_cell_hidden(ws, row, col)
 
         return CellValue(
-            value           = cached_value,
-            formula         = formula,
-            is_merged       = is_merged,
-            is_hidden       = is_hidden,
-            data_type       = data_type,
-            original_format = cell.number_format if hasattr(cell, "number_format") else None,
+            value=cached_value,
+            formula=formula,
+            is_merged=is_merged,
+            is_hidden=is_hidden,
+            data_type=data_type,
+            original_format=cell.number_format if hasattr(cell, "number_format") else None,
         )
 
     def get_cell_by_ref(self, ref: str) -> CellValue:
@@ -279,7 +291,7 @@ class MessyWorkbook:
         from messy_xlsx.utils import cell_ref_to_coords
 
         sheet, row, col = cell_ref_to_coords(ref)
-        sheet           = sheet or self._sheet_names[0]
+        sheet = sheet or self._sheet_names[0]
         return self.get_cell(sheet, row, col)
 
     def _parse_sheet(
@@ -292,29 +304,33 @@ class MessyWorkbook:
 
         # Skip structure analysis for CSV/TSV/TXT - these formats don't support openpyxl
         if config.auto_detect and self.format_type not in ("csv", "tsv", "txt"):
-            structure        = self._analyze_structure(sheet, config)
+            structure = self._analyze_structure(sheet, config)
             effective_config = self._apply_structure_detection(config, structure)
         else:
             effective_config = config
 
         parse_options = ParseOptions(
-            skip_rows      = effective_config.skip_rows,
-            header_rows    = effective_config.header_rows,
-            skip_footer    = effective_config.skip_footer,
-            merge_strategy = effective_config.merge_strategy,
-            ignore_hidden  = not effective_config.include_hidden,
-            cell_range     = effective_config.cell_range,
-            data_only      = True,
+            skip_rows=effective_config.skip_rows,
+            header_rows=effective_config.header_rows,
+            skip_footer=effective_config.skip_footer,
+            merge_strategy=effective_config.merge_strategy,
+            ignore_hidden=not effective_config.include_hidden,
+            cell_range=effective_config.cell_range,
+            data_only=True,
         )
 
         # Reset buffer position before parsing
-        if self._is_fileobj and self._file_buffer is not None and hasattr(self._file_buffer, "seek"):
+        if (
+            self._is_fileobj
+            and self._file_buffer is not None
+            and hasattr(self._file_buffer, "seek")
+        ):
             self._file_buffer.seek(0)
 
         df = self._registry.parse(
             self.source,
-            sheet   = sheet,
-            options = parse_options,
+            sheet=sheet,
+            options=parse_options,
         )
 
         # Skip normalization if disabled
@@ -327,8 +343,8 @@ class MessyWorkbook:
             return df
 
         pipeline = NormalizationPipeline(
-            decimal_separator   = None,
-            thousands_separator = None,
+            decimal_separator=None,
+            thousands_separator=None,
         )
 
         type_hints = effective_config.type_hints.copy()
@@ -379,7 +395,11 @@ class MessyWorkbook:
         """Analyze sheet structure."""
         header_patterns = config.header_patterns if config else None
         # Reset buffer position before analysis
-        if self._is_fileobj and self._file_buffer is not None and hasattr(self._file_buffer, "seek"):
+        if (
+            self._is_fileobj
+            and self._file_buffer is not None
+            and hasattr(self._file_buffer, "seek")
+        ):
             self._file_buffer.seek(0)
         return self._analyzer.analyze(self.source, sheet, header_patterns=header_patterns)
 
@@ -392,7 +412,7 @@ class MessyWorkbook:
         from .exceptions import StructureError
 
         # Determine skip_rows and header_rows based on detection mode
-        skip_rows   = config.skip_rows
+        skip_rows = config.skip_rows
         header_rows = config.header_rows
 
         if config.header_detection_mode == "auto":
@@ -401,12 +421,12 @@ class MessyWorkbook:
                 structure.header_row is not None
                 and structure.header_confidence >= config.header_confidence_threshold
             ):
-                skip_rows   = max(0, structure.header_row - 1)
+                skip_rows = max(0, structure.header_row - 1)
                 header_rows = structure.header_rows_count
             else:
                 # Fallback logic
                 if config.header_fallback == "first_row":
-                    skip_rows   = 0
+                    skip_rows = 0
                     header_rows = 1
                 elif config.header_fallback == "none":
                     header_rows = 0
@@ -424,39 +444,41 @@ class MessyWorkbook:
                 and structure.header_row is not None
                 and structure.header_confidence >= config.header_confidence_threshold
             ):
-                skip_rows   = max(0, structure.header_row - 1)
+                skip_rows = max(0, structure.header_row - 1)
                 header_rows = structure.header_rows_count
             else:
-                skip_rows   = config.skip_rows
+                skip_rows = config.skip_rows
                 header_rows = config.header_rows
 
         # "manual" mode: just use config values (no changes)
 
         return SheetConfig(
-            skip_rows             = skip_rows,
-            header_rows           = header_rows,
-            skip_footer           = config.skip_footer if config.skip_footer > 0 else structure.suggested_skip_footer,
-            cell_range            = config.cell_range,
-            column_renames        = config.column_renames,
-            type_hints            = config.type_hints,
-            auto_detect           = False,
-            include_hidden        = config.include_hidden,
-            merge_strategy        = config.merge_strategy,
-            locale                = config.locale or structure.detected_locale,
-            evaluate_formulas     = config.evaluate_formulas,
-            drop_regex            = config.drop_regex,
-            drop_conditions       = config.drop_conditions,
-            header_detection_mode = config.header_detection_mode,
-            header_confidence_threshold = config.header_confidence_threshold,
-            header_fallback       = config.header_fallback,
-            multi_row_headers     = config.multi_row_headers,
-            header_patterns       = config.header_patterns,
+            skip_rows=skip_rows,
+            header_rows=header_rows,
+            skip_footer=config.skip_footer
+            if config.skip_footer > 0
+            else structure.suggested_skip_footer,
+            cell_range=config.cell_range,
+            column_renames=config.column_renames,
+            type_hints=config.type_hints,
+            auto_detect=False,
+            include_hidden=config.include_hidden,
+            merge_strategy=config.merge_strategy,
+            locale=config.locale or structure.detected_locale,
+            evaluate_formulas=config.evaluate_formulas,
+            drop_regex=config.drop_regex,
+            drop_conditions=config.drop_conditions,
+            header_detection_mode=config.header_detection_mode,
+            header_confidence_threshold=config.header_confidence_threshold,
+            header_fallback=config.header_fallback,
+            multi_row_headers=config.multi_row_headers,
+            header_patterns=config.header_patterns,
             # Normalization options
-            normalize             = config.normalize,
-            normalize_dates       = config.normalize_dates,
-            normalize_numbers     = config.normalize_numbers,
-            normalize_whitespace  = config.normalize_whitespace,
-            sanitize_column_names = config.sanitize_column_names,
+            normalize=config.normalize,
+            normalize_dates=config.normalize_dates,
+            normalize_numbers=config.normalize_numbers,
+            normalize_whitespace=config.normalize_whitespace,
+            sanitize_column_names=config.sanitize_column_names,
         )
 
     def _sanitize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -485,15 +507,19 @@ class MessyWorkbook:
         """Ensure openpyxl workbook is loaded."""
         if self._wb is None:
             # Reset buffer position before loading
-            if self._is_fileobj and self._file_buffer is not None and hasattr(self._file_buffer, "seek"):
+            if (
+                self._is_fileobj
+                and self._file_buffer is not None
+                and hasattr(self._file_buffer, "seek")
+            ):
                 self._file_buffer.seek(0)
 
             # Load with data_only=False to preserve formula information
             # Note: read_only=True is incompatible with some features (merged_cells)
             self._wb = openpyxl.load_workbook(
                 self.source,
-                read_only = False,
-                data_only = False,
+                read_only=False,
+                data_only=False,
             )
 
     def _get_data_type(self, value: Any) -> str:
@@ -521,7 +547,7 @@ class MessyWorkbook:
                     and merged_range.min_col <= col <= merged_range.max_col
                 ):
                     return True
-        except Exception:
+        except (AttributeError, TypeError):
             pass
         return False
 
@@ -531,10 +557,11 @@ class MessyWorkbook:
             if row in ws.row_dimensions and ws.row_dimensions[row].hidden:
                 return True
             from openpyxl.utils import get_column_letter
+
             col_letter = get_column_letter(col)
             if col_letter in ws.column_dimensions and ws.column_dimensions[col_letter].hidden:
                 return True
-        except Exception:
+        except (AttributeError, TypeError):
             pass
         return False
 

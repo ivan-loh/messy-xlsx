@@ -1,13 +1,10 @@
 """Tests for edge cases with malformed or unusual files."""
 
-import tempfile
-from pathlib import Path
-
 import openpyxl
 import pytest
 
 from messy_xlsx import MessyWorkbook, SheetConfig
-from messy_xlsx.exceptions import FileError, FormatError, MessyXlsxError
+from messy_xlsx.exceptions import MessyXlsxError
 
 
 class TestEmptyFiles:
@@ -51,9 +48,12 @@ class TestHeaderOnlyFiles:
         wb.close()
 
         from messy_xlsx.models import SheetConfig
+
         with MessyWorkbook(file_path) as mwb:
             # Disable normalization and sanitization to preserve original column names
-            config = SheetConfig(auto_detect=False, header_rows=1, normalize=False, sanitize_column_names=False)
+            config = SheetConfig(
+                auto_detect=False, header_rows=1, normalize=False, sanitize_column_names=False
+            )
             df = mwb.to_dataframe(config=config)
             assert len(df) == 0
             assert list(df.columns) == ["Name", "Age", "City"]
@@ -196,7 +196,7 @@ class TestSpecialCharacters:
         ws.append(["Text"])
         ws.append(["Line1\nLine2\nLine3"])
         ws.append(["Tab\tSeparated"])
-        ws.append(["Quote\"Inside"])
+        ws.append(['Quote"Inside'])
         wb.save(file_path)
         wb.close()
 

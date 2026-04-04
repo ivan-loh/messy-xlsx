@@ -8,17 +8,17 @@ import pandas as pd
 import pytest
 
 from messy_xlsx.multi_sheet import (
-    MultiSheetParser,
     MultiSheetOptions,
+    MultiSheetParser,
     SheetInfo,
-    read_all_sheets,
     analyze_excel,
+    read_all_sheets,
 )
-
 
 # ============================================================================
 # Fixtures
 # ============================================================================
+
 
 @pytest.fixture
 def temp_dir():
@@ -43,7 +43,7 @@ def multi_sheet_xlsx(temp_dir):
     ws1.append(["Widget C", 15.75, 75])
 
     # Sheet 2: Empty sheet
-    ws2 = wb.create_sheet("Empty")
+    wb.create_sheet("Empty")
     # Leave empty
 
     # Sheet 3: Data with metadata header
@@ -191,6 +191,7 @@ def small_sheet_xlsx(temp_dir):
 # Tests: Sheet Analysis
 # ============================================================================
 
+
 class TestSheetAnalysis:
     """Test sheet analysis functionality."""
 
@@ -271,6 +272,7 @@ class TestMetadataDetection:
 # Tests: Parsing
 # ============================================================================
 
+
 class TestParsing:
     """Test sheet parsing functionality."""
 
@@ -287,7 +289,7 @@ class TestParsing:
         """Test that parse_all returns DataFrames."""
         sheets = read_all_sheets(multi_sheet_xlsx)
 
-        for name, df in sheets.items():
+        for _name, df in sheets.items():
             assert isinstance(df, pd.DataFrame)
             assert len(df) > 0
 
@@ -367,7 +369,7 @@ class TestTypeConsistency:
         df = sheets["Data"]
 
         # Code column had mixed int/str, should all be strings now (column name is lowercase)
-        code_types = set(type(v).__name__ for v in df["code"].dropna())
+        code_types = {type(v).__name__ for v in df["code"].dropna()}
         assert len(code_types) == 1, f"Expected single type, got {code_types}"
 
     def test_pure_numeric_stays_numeric(self, multi_sheet_xlsx):
@@ -388,7 +390,7 @@ class TestTypeConsistency:
         df = sheets["Data"]
 
         # Mixed types may still exist (column name is lowercase)
-        code_types = set(type(v).__name__ for v in df["code"].dropna())
+        code_types = {type(v).__name__ for v in df["code"].dropna()}
         # Could be mixed or not depending on pandas inference
         assert len(code_types) >= 1
 
@@ -416,6 +418,7 @@ class TestSmallSheets:
 # ============================================================================
 # Tests: Options
 # ============================================================================
+
 
 class TestOptions:
     """Test MultiSheetOptions functionality."""
@@ -453,6 +456,7 @@ class TestOptions:
 
     def test_custom_sheet_filter(self, multi_sheet_xlsx):
         """Test custom sheet filter function."""
+
         def only_sales(info: SheetInfo) -> bool:
             return "Sales" in info.name
 
@@ -468,6 +472,7 @@ class TestOptions:
 # ============================================================================
 # Tests: Edge Cases
 # ============================================================================
+
 
 class TestEdgeCases:
     """Test edge cases and error handling."""

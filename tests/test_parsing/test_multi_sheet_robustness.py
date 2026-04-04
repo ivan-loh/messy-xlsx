@@ -4,19 +4,17 @@ import tempfile
 from pathlib import Path
 
 import openpyxl
-import pandas as pd
 import pytest
 
 from messy_xlsx.multi_sheet import (
-    MultiSheetParser,
-    read_all_sheets,
     analyze_excel,
+    read_all_sheets,
 )
-
 
 # ============================================================================
 # Fixtures - Real-world patterns from messy files
 # ============================================================================
+
 
 @pytest.fixture
 def temp_dir():
@@ -39,10 +37,10 @@ def plant_column_xlsx(temp_dir):
 
     ws.append(["ID", "Name", "Plant"])
     ws.append(["001", "Item A", "1&3"])  # String
-    ws.append(["002", "Item B", 3])       # Int - this caused mixed types
+    ws.append(["002", "Item B", 3])  # Int - this caused mixed types
     ws.append(["003", "Item C", "1&3"])
     ws.append(["004", "Item D", 3])
-    ws.append(["005", "Item E", "1"])     # String that looks numeric
+    ws.append(["005", "Item E", "1"])  # String that looks numeric
 
     wb.save(file_path)
     wb.close()
@@ -65,7 +63,7 @@ def status_column_xlsx(temp_dir):
     ws.append(["ID", "Status", "Track_Date"])
     ws.append(["001", "OPEN", "ON HOLD"])
     ws.append(["002", "CLOSED", "X"])
-    ws.append(["003", "PENDING", 0])        # Numeric mixed with strings
+    ws.append(["003", "PENDING", 0])  # Numeric mixed with strings
     ws.append(["004", "OPEN", "BUY OFF"])
     ws.append(["005", "CLOSED", "CMM"])
 
@@ -219,7 +217,9 @@ def concatenated_key_xlsx(temp_dir):
     ws.append(["CompositeKey", "PO_No", "Item", "Part_No"])
     ws.append(["TP04820011024-404 REV C.05", "TP0482", "001", "1024-404 REV C.0"])
     ws.append(["1800006680021002554 REV G2", "180000668", "002", "1002554 REV G"])
-    ws.append(["886-11285432-OP002C208S88002 REV 0110", "886-11285432-OP", "002", "C208S88002 REV 01"])
+    ws.append(
+        ["886-11285432-OP002C208S88002 REV 0110", "886-11285432-OP", "002", "C208S88002 REV 01"]
+    )
 
     wb.save(file_path)
     wb.close()
@@ -255,6 +255,7 @@ def numeric_string_column_xlsx(temp_dir):
 # Tests: Mixed Type Handling
 # ============================================================================
 
+
 class TestMixedTypeHandling:
     """Test handling of mixed types that cause PyArrow errors."""
 
@@ -264,7 +265,7 @@ class TestMixedTypeHandling:
         df = sheets["Data"]
 
         # All Plant values should be same type (column name is lowercase)
-        types = set(type(v).__name__ for v in df["plant"].dropna())
+        types = {type(v).__name__ for v in df["plant"].dropna()}
         assert len(types) == 1, f"Mixed types found: {types}"
 
     def test_status_column_text_zero_mix(self, status_column_xlsx):
@@ -273,7 +274,7 @@ class TestMixedTypeHandling:
         df = sheets["Data"]
 
         # Track_Date should have consistent types (column name is lowercase)
-        types = set(type(v).__name__ for v in df["track_date"].dropna())
+        types = {type(v).__name__ for v in df["track_date"].dropna()}
         assert len(types) == 1, f"Mixed types found: {types}"
 
     def test_numeric_string_preserved(self, numeric_string_column_xlsx):
@@ -282,7 +283,7 @@ class TestMixedTypeHandling:
         df = sheets["Data"]
 
         # Mat_Status should all be strings (not partial float conversion, column name is lowercase)
-        types = set(type(v).__name__ for v in df["mat_status"].dropna())
+        types = {type(v).__name__ for v in df["mat_status"].dropna()}
         assert len(types) == 1
         assert "str" in types, "Should preserve as strings"
 
@@ -290,6 +291,7 @@ class TestMixedTypeHandling:
 # ============================================================================
 # Tests: Header Detection Edge Cases
 # ============================================================================
+
 
 class TestHeaderDetectionEdgeCases:
     """Test header detection with tricky patterns."""
@@ -332,6 +334,7 @@ class TestHeaderDetectionEdgeCases:
 # Tests: Column Name Cleaning
 # ============================================================================
 
+
 class TestColumnNameCleaning:
     """Test column name sanitization."""
 
@@ -367,6 +370,7 @@ class TestColumnNameCleaning:
 # Tests: Sparse Data Handling
 # ============================================================================
 
+
 class TestSparseDataHandling:
     """Test handling of sparse/null columns."""
 
@@ -394,6 +398,7 @@ class TestSparseDataHandling:
 # ============================================================================
 # Tests: Data Integrity
 # ============================================================================
+
 
 class TestDataIntegrity:
     """Test that data values are preserved correctly."""
@@ -429,6 +434,7 @@ class TestDataIntegrity:
 # Tests: BigQuery Compatibility
 # ============================================================================
 
+
 class TestBigQueryCompatibility:
     """Test that output is BigQuery-compatible."""
 
@@ -439,14 +445,14 @@ class TestBigQueryCompatibility:
         for name, df in sheets.items():
             for col in df.columns:
                 if df[col].dtype == object:
-                    types = set(type(v).__name__ for v in df[col].dropna())
+                    types = {type(v).__name__ for v in df[col].dropna()}
                     assert len(types) <= 1, f"{name}.{col} has mixed types: {types}"
 
     def test_column_names_alphanumeric(self, trailing_spaces_xlsx):
         """Verify column names are alphanumeric + underscore only."""
         sheets = read_all_sheets(trailing_spaces_xlsx)
 
-        for name, df in sheets.items():
+        for _name, df in sheets.items():
             for col in df.columns:
                 clean = col.replace("_", "")
                 assert clean.isalnum(), f"Column '{col}' invalid for BigQuery"
@@ -473,6 +479,7 @@ class TestBigQueryCompatibility:
 # Tests: Multiple Sheets Combined
 # ============================================================================
 
+
 class TestMultipleSheetsCombined:
     """Test parsing files with multiple problematic sheets."""
 
@@ -483,14 +490,14 @@ class TestMultipleSheetsCombined:
         for name, df in sheets.items():
             for col in df.columns:
                 if df[col].dtype == object:
-                    types = set(type(v).__name__ for v in df[col].dropna())
+                    types = {type(v).__name__ for v in df[col].dropna()}
                     assert len(types) <= 1, f"{name}.{col} mixed: {types}"
 
     def test_all_sheets_clean_columns(self, deep_header_xlsx):
         """Test all sheets have clean column names."""
         sheets = read_all_sheets(deep_header_xlsx)
 
-        for name, df in sheets.items():
+        for _name, df in sheets.items():
             for col in df.columns:
                 assert " " not in col
                 assert "/" not in col

@@ -12,17 +12,16 @@ from messy_xlsx.normalization.type_coercion import TypeCoercionNormalizer
 from messy_xlsx.normalization.type_inference import SemanticTypeInference
 from messy_xlsx.normalization.whitespace import WhitespaceNormalizer
 
-
 # ============================================================================
 # Exports
 # ============================================================================
 
 __all__ = [
-    "NormalizationPipeline",
-    "WhitespaceNormalizer",
-    "NumberNormalizer",
     "DateNormalizer",
     "MissingValueHandler",
-    "TypeCoercionNormalizer",
+    "NormalizationPipeline",
+    "NumberNormalizer",
     "SemanticTypeInference",
+    "TypeCoercionNormalizer",
+    "WhitespaceNormalizer",
 ]

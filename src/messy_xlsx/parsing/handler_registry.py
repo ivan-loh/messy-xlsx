@@ -5,27 +5,32 @@
 # ============================================================================
 
 from pathlib import Path
-from typing import BinaryIO
 
 import pandas as pd
 
 from messy_xlsx.detection.format_detector import FormatDetector
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.models import FormatInfo
-from messy_xlsx.parsing.base_handler import FileSource, FormatHandler, ParseOptions
+from messy_xlsx.parsing.base_handler import (
+    FileSource,
+    FormatHandler,
+    ParseOptions,
+    get_file_desc,
+    is_fileobj,
+)
 from messy_xlsx.parsing.csv_handler import CSVHandler
 from messy_xlsx.parsing.xls_handler import XLSHandler
 from messy_xlsx.parsing.xlsx_handler import XLSXHandler
-
 
 # ============================================================================
 # Core
 # ============================================================================
 
+
 class HandlerRegistry:
     """Registry of format handlers with automatic detection and fallback."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize registry with default handlers."""
         self.handlers: list[FormatHandler] = [
             XLSXHandler(),
@@ -60,8 +65,7 @@ class HandlerRegistry:
         format_type: str | None = None,
     ) -> pd.DataFrame:
         """Parse file with automatic format detection and fallback."""
-        is_fileobj = hasattr(file_source, "read")
-        file_desc = "<stream>" if is_fileobj else str(file_source)
+        file_desc = get_file_desc(file_source)
         options = options or ParseOptions()
 
         if format_type is None:
@@ -73,8 +77,8 @@ class HandlerRegistry:
         if handler is None:
             raise FormatError(
                 f"No handler available for format: {format_type}",
-                file_path        = file_desc,
-                detected_format  = format_type,
+                file_path=file_desc,
+                detected_format=format_type,
             )
 
         errors = []
@@ -98,12 +102,12 @@ class HandlerRegistry:
                 errors.append(f"{fallback_handler.__class__.__name__}: {e}")
                 continue
 
-        name = file_desc if is_fileobj else Path(file_source).name
+        name = file_desc if is_fileobj(file_source) else Path(str(file_source)).name
         raise FormatError(
             f"All handlers failed for {name}",
-            file_path          = file_desc,
-            detected_format    = format_type,
-            attempted_formats  = [h.__class__.__name__ for h in self.handlers],
+            file_path=file_desc,
+            detected_format=format_type,
+            attempted_formats=[h.__class__.__name__ for h in self.handlers],
         )
 
     def get_sheet_names(
@@ -112,8 +116,6 @@ class HandlerRegistry:
         format_type: str | None = None,
     ) -> list[str]:
         """Get sheet names from file."""
-        is_fileobj = hasattr(file_source, "read")
-
         if format_type is None:
             format_info = self.detector.detect(file_source)
             format_type = format_info.format_type

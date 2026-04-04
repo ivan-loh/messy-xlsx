@@ -6,7 +6,7 @@ from pathlib import Path
 import openpyxl
 import pytest
 
-from messy_xlsx import MessyWorkbook, SheetConfig
+from messy_xlsx import MessyWorkbook
 
 
 class TestLargeFilePerformance:
@@ -99,7 +99,7 @@ class TestStructureDetectionPerformance:
         ws = wb.active
         ws.append(["Header1", "Header2", "Header3"])
         for i in range(1000):
-            ws.append([i, i*2, i*3])
+            ws.append([i, i * 2, i * 3])
         wb.save(file_path)
         wb.close()
 
@@ -142,7 +142,7 @@ class TestMemoryUsage:
         ws = wb.active
         ws.append(["A", "B"])
         for i in range(1000):
-            ws.append([i, i*2])
+            ws.append([i, i * 2])
         wb.save(file_path)
         wb.close()
 
@@ -151,7 +151,7 @@ class TestMemoryUsage:
 
             # Iterate through rows
             row_count = 0
-            for row in sheet.iter_rows(min_row=2, max_row=100):
+            for _row in sheet.iter_rows(min_row=2, max_row=100):
                 row_count += 1
 
             assert row_count <= 99  # Should iterate without loading all

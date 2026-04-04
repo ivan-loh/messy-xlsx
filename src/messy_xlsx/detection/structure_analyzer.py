@@ -26,20 +26,21 @@ FileSource = Path | BinaryIO
 # ============================================================================
 
 MAX_ANALYSIS_ROWS = 10_000
-MAX_SAMPLE_ROWS   = 1_000
+MAX_SAMPLE_ROWS = 1_000
 
 
 # ============================================================================
 # Core
 # ============================================================================
 
+
 class StructureAnalyzer:
     """Analyze Excel sheet structure."""
 
     def __init__(self, cache: StructureCache | None = None):
         """Initialize analyzer."""
-        self.cache            = cache or get_structure_cache()
-        self.locale_detector  = LocaleDetector()
+        self.cache = cache or get_structure_cache()
+        self.locale_detector = LocaleDetector()
 
     def analyze(
         self,
@@ -68,61 +69,61 @@ class StructureAnalyzer:
             # Note: Cannot use read_only=True as ReadOnlyWorksheet doesn't have merged_cells
             wb = openpyxl.load_workbook(
                 file_source,
-                read_only = False,
-                data_only = True,
+                read_only=False,
+                data_only=True,
             )
         except Exception as e:
             raise StructureError(
                 f"Cannot open file for analysis: {e}",
-                sheet            = sheet,
-                detection_phase  = "open",
+                sheet=sheet,
+                detection_phase="open",
             ) from e
 
         try:
             if sheet not in wb.sheetnames:
                 raise StructureError(
                     f"Sheet '{sheet}' not found",
-                    sheet            = sheet,
-                    detection_phase  = "sheet_lookup",
+                    sheet=sheet,
+                    detection_phase="sheet_lookup",
                 )
 
             ws = wb[sheet]
 
-            data_region  = self._detect_data_region(ws)
-            merged       = self._detect_merged_cells(ws)
+            data_region = self._detect_data_region(ws)
+            merged = self._detect_merged_cells(ws)
             hidden_rows, hidden_cols = self._detect_hidden_content(ws)
-            header_info  = self._detect_headers(ws, data_region, merged, header_patterns)
-            metadata     = self._detect_metadata_rows(ws, data_region, header_info)
-            tables       = self._detect_multiple_tables(ws, data_region, header_info)
-            locale_info  = self.locale_detector.detect(ws, data_region)
-            blank_rows      = self._detect_blank_rows(ws, data_region)
-            has_formulas    = self._detect_formulas(ws, data_region)
-            sparse_columns  = self._detect_sparse_columns(ws, data_region)
+            header_info = self._detect_headers(ws, data_region, merged, header_patterns)
+            metadata = self._detect_metadata_rows(ws, data_region, header_info)
+            tables = self._detect_multiple_tables(ws, data_region, header_info)
+            locale_info = self.locale_detector.detect(ws, data_region)
+            blank_rows = self._detect_blank_rows(ws, data_region)
+            has_formulas = self._detect_formulas(ws, data_region)
+            sparse_columns = self._detect_sparse_columns(ws, data_region)
 
             result = StructureInfo(
-                data_start_row       = data_region["start_row"],
-                data_end_row         = data_region["end_row"],
-                data_start_col       = data_region["start_col"],
-                data_end_col         = data_region["end_col"],
-                header_row           = header_info.get("header_row"),
-                header_rows_count    = header_info.get("header_rows_count", 1),
-                header_confidence    = header_info.get("confidence", 0.0),
-                metadata_rows        = metadata,
-                merged_ranges        = merged,
-                merged_in_headers    = self._check_merged_in_headers(merged, header_info),
-                merged_in_data       = self._check_merged_in_data(merged, header_info),
-                hidden_rows          = hidden_rows,
-                hidden_columns       = hidden_cols,
-                detected_locale      = locale_info.locale,
-                decimal_separator    = locale_info.decimal_separator,
-                thousands_separator  = locale_info.thousands_separator,
-                num_tables           = len(tables),
-                table_ranges         = [self._table_to_dict(t) for t in tables],
-                blank_rows           = blank_rows,
-                has_formulas         = has_formulas,
-                sparse_columns       = sparse_columns,
-                suggested_skip_rows  = self._suggest_skip_rows(metadata, header_info),
-                suggested_skip_footer = self._suggest_skip_footer(ws, data_region),
+                data_start_row=data_region["start_row"],
+                data_end_row=data_region["end_row"],
+                data_start_col=data_region["start_col"],
+                data_end_col=data_region["end_col"],
+                header_row=header_info.get("header_row"),
+                header_rows_count=header_info.get("header_rows_count", 1),
+                header_confidence=header_info.get("confidence", 0.0),
+                metadata_rows=metadata,
+                merged_ranges=merged,
+                merged_in_headers=self._check_merged_in_headers(merged, header_info),
+                merged_in_data=self._check_merged_in_data(merged, header_info),
+                hidden_rows=hidden_rows,
+                hidden_columns=hidden_cols,
+                detected_locale=locale_info.locale,
+                decimal_separator=locale_info.decimal_separator,
+                thousands_separator=locale_info.thousands_separator,
+                num_tables=len(tables),
+                table_ranges=[self._table_to_dict(t) for t in tables],
+                blank_rows=blank_rows,
+                has_formulas=has_formulas,
+                sparse_columns=sparse_columns,
+                suggested_skip_rows=self._suggest_skip_rows(metadata, header_info),
+                suggested_skip_footer=self._suggest_skip_footer(ws, data_region),
             )
 
             # Only cache for file paths
@@ -183,12 +184,14 @@ class StructureAnalyzer:
         merged = []
         try:
             for merged_range in ws.merged_cells.ranges:
-                merged.append((
-                    merged_range.min_row,
-                    merged_range.min_col,
-                    merged_range.max_row,
-                    merged_range.max_col,
-                ))
+                merged.append(
+                    (
+                        merged_range.min_row,
+                        merged_range.min_col,
+                        merged_range.max_row,
+                        merged_range.max_col,
+                    )
+                )
         except Exception:
             # Silently fail if worksheet doesn't support merged cells
             pass
@@ -207,6 +210,7 @@ class StructureAnalyzer:
             for col_key, dim in ws.column_dimensions.items():
                 if dim.hidden:
                     from openpyxl.utils import column_index_from_string
+
                     hidden_cols.append(column_index_from_string(col_key))
         except Exception:
             pass
@@ -224,9 +228,9 @@ class StructureAnalyzer:
         import re
 
         start_row = data_region["start_row"]
-        end_row   = min(start_row + 15, data_region["end_row"])
+        end_row = min(start_row + 15, data_region["end_row"])
         start_col = data_region["start_col"]
-        end_col   = data_region["end_col"]
+        end_col = data_region["end_col"]
         total_cols = end_col - start_col + 1
 
         best_header_row = None
@@ -298,9 +302,11 @@ class StructureAnalyzer:
             for val in non_empty:
                 val_str = str(val).lower()
                 # Check for snake_case or common header patterns
-                if re.match(r'^[a-z][a-z0-9_]*$', val_str):  # snake_case
-                    header_like_count += 1
-                elif re.search(r'\b(id|name|date|time|code|type|status|number|amount|qty|count|total)\b', val_str, re.I):
+                if re.match(r"^[a-z][a-z0-9_]*$", val_str) or re.search(
+                    r"\b(id|name|date|time|code|type|status|number|amount|qty|count|total)\b",
+                    val_str,
+                    re.I,
+                ):  # snake_case
                     header_like_count += 1
 
             if header_like_count > 0:
@@ -308,9 +314,7 @@ class StructureAnalyzer:
                 confidence += min(0.2, header_ratio * 0.3)
 
             # Boost for merged cells in header
-            has_merged = any(
-                mr[0] == row_idx for mr in merged_ranges
-            )
+            has_merged = any(mr[0] == row_idx for mr in merged_ranges)
             if has_merged:
                 confidence += 0.05
 
@@ -318,8 +322,7 @@ class StructureAnalyzer:
             if header_patterns:
                 row_text = " ".join(str(v) for v in row_values if v is not None).lower()
                 pattern_matches = sum(
-                    1 for pattern in header_patterns
-                    if re.search(pattern, row_text, re.IGNORECASE)
+                    1 for pattern in header_patterns if re.search(pattern, row_text, re.IGNORECASE)
                 )
                 if pattern_matches > 0:
                     confidence += min(0.15, 0.05 * pattern_matches)
@@ -377,66 +380,76 @@ class StructureAnalyzer:
         total_rows = data_region["end_row"] - data_region["start_row"] + 1
 
         if total_rows > MAX_ANALYSIS_ROWS:
-            return [TableInfo(
-                start_row  = data_region["start_row"],
-                end_row    = data_region["end_row"],
-                start_col  = data_region["start_col"],
-                end_col    = data_region["end_col"],
-                has_header = header_info.get("header_row") is not None,
-                header_row = header_info.get("header_row"),
-                confidence = header_info.get("confidence", 1.0),
-            )]
+            return [
+                TableInfo(
+                    start_row=data_region["start_row"],
+                    end_row=data_region["end_row"],
+                    start_col=data_region["start_col"],
+                    end_col=data_region["end_col"],
+                    has_header=header_info.get("header_row") is not None,
+                    header_row=header_info.get("header_row"),
+                    confidence=header_info.get("confidence", 1.0),
+                )
+            ]
 
         blank_rows = self._detect_blank_rows(ws, data_region)
 
         if not blank_rows:
-            return [TableInfo(
-                start_row  = data_region["start_row"],
-                end_row    = data_region["end_row"],
-                start_col  = data_region["start_col"],
-                end_col    = data_region["end_col"],
-                has_header = header_info.get("header_row") is not None,
-                header_row = header_info.get("header_row"),
-                confidence = header_info.get("confidence", 1.0),
-            )]
+            return [
+                TableInfo(
+                    start_row=data_region["start_row"],
+                    end_row=data_region["end_row"],
+                    start_col=data_region["start_col"],
+                    end_col=data_region["end_col"],
+                    has_header=header_info.get("header_row") is not None,
+                    header_row=header_info.get("header_row"),
+                    confidence=header_info.get("confidence", 1.0),
+                )
+            ]
 
         groups = self._group_consecutive(blank_rows)
 
         separators = [g for g in groups if len(g) >= 2]
 
         if not separators:
-            return [TableInfo(
-                start_row  = data_region["start_row"],
-                end_row    = data_region["end_row"],
-                start_col  = data_region["start_col"],
-                end_col    = data_region["end_col"],
-                has_header = header_info.get("header_row") is not None,
-                header_row = header_info.get("header_row"),
-            )]
+            return [
+                TableInfo(
+                    start_row=data_region["start_row"],
+                    end_row=data_region["end_row"],
+                    start_col=data_region["start_col"],
+                    end_col=data_region["end_col"],
+                    has_header=header_info.get("header_row") is not None,
+                    header_row=header_info.get("header_row"),
+                )
+            ]
 
-        tables   = []
+        tables = []
         prev_end = data_region["start_row"] - 1
 
         for sep_group in separators:
             sep_start = min(sep_group)
 
             if sep_start > prev_end + 1:
-                tables.append(TableInfo(
-                    start_row = prev_end + 1,
-                    end_row   = sep_start - 1,
-                    start_col = data_region["start_col"],
-                    end_col   = data_region["end_col"],
-                ))
+                tables.append(
+                    TableInfo(
+                        start_row=prev_end + 1,
+                        end_row=sep_start - 1,
+                        start_col=data_region["start_col"],
+                        end_col=data_region["end_col"],
+                    )
+                )
 
             prev_end = max(sep_group)
 
         if prev_end < data_region["end_row"]:
-            tables.append(TableInfo(
-                start_row = prev_end + 1,
-                end_row   = data_region["end_row"],
-                start_col = data_region["start_col"],
-                end_col   = data_region["end_col"],
-            ))
+            tables.append(
+                TableInfo(
+                    start_row=prev_end + 1,
+                    end_row=data_region["end_row"],
+                    start_col=data_region["start_col"],
+                    end_col=data_region["end_col"],
+                )
+            )
 
         return tables
 
@@ -451,13 +464,13 @@ class StructureAnalyzer:
 
         for row_idx, row in enumerate(
             ws.iter_rows(
-                min_row      = data_region["start_row"],
-                max_row      = data_region["end_row"],
-                min_col      = data_region["start_col"],
-                max_col      = data_region["end_col"],
-                values_only  = True,
+                min_row=data_region["start_row"],
+                max_row=data_region["end_row"],
+                min_col=data_region["start_col"],
+                max_col=data_region["end_col"],
+                values_only=True,
             ),
-            start=data_region["start_row"]
+            start=data_region["start_row"],
         ):
             if all(v is None for v in row):
                 blank_rows.append(row_idx)
@@ -467,7 +480,7 @@ class StructureAnalyzer:
     def _detect_blank_rows_sampled(self, ws: Any, data_region: dict[str, int]) -> list[int]:
         """Sample-based blank row detection for large files."""
         start = data_region["start_row"]
-        end   = data_region["end_row"]
+        end = data_region["end_row"]
 
         sample_rows: list[int] = []
         sample_rows.extend(range(start, min(start + 300, end + 1)))
@@ -475,13 +488,15 @@ class StructureAnalyzer:
 
         blank_rows = []
         for row_idx in sorted(set(sample_rows)):
-            row = next(ws.iter_rows(
-                min_row     = row_idx,
-                max_row     = row_idx,
-                min_col     = data_region["start_col"],
-                max_col     = data_region["end_col"],
-                values_only = True
-            ))
+            row = next(
+                ws.iter_rows(
+                    min_row=row_idx,
+                    max_row=row_idx,
+                    min_col=data_region["start_col"],
+                    max_col=data_region["end_col"],
+                    values_only=True,
+                )
+            )
 
             if all(v is None for v in row):
                 blank_rows.append(row_idx)
@@ -517,11 +532,11 @@ class StructureAnalyzer:
         filled = [0] * num_cols
 
         for row in ws.iter_rows(
-            min_row     = data_region["start_row"],
-            max_row     = data_region["start_row"] + sample_limit - 1,
-            min_col     = data_region["start_col"],
-            max_col     = data_region["end_col"],
-            values_only = True,
+            min_row=data_region["start_row"],
+            max_row=data_region["start_row"] + sample_limit - 1,
+            min_col=data_region["start_col"],
+            max_col=data_region["end_col"],
+            values_only=True,
         ):
             for col_offset, value in enumerate(row):
                 if value is not None:
@@ -540,7 +555,7 @@ class StructureAnalyzer:
         if not numbers:
             return []
 
-        groups        = []
+        groups = []
         current_group = [numbers[0]]
 
         for num in numbers[1:]:
@@ -563,10 +578,7 @@ class StructureAnalyzer:
         if header_row is None:
             return False
 
-        for mr in merged_ranges:
-            if mr[0] <= header_row <= mr[2]:
-                return True
-        return False
+        return any(mr[0] <= header_row <= mr[2] for mr in merged_ranges)
 
     def _check_merged_in_data(
         self,
@@ -576,10 +588,7 @@ class StructureAnalyzer:
         """Check if any merged cells are in data rows."""
         header_row = header_info.get("header_row") or 0
 
-        for mr in merged_ranges:
-            if mr[0] > header_row:
-                return True
-        return False
+        return any(mr[0] > header_row for mr in merged_ranges)
 
     def _table_to_dict(self, table: TableInfo) -> dict:
         """Convert TableInfo to dictionary."""

@@ -11,6 +11,7 @@ from typing import BinaryIO
 
 import pandas as pd
 
+from messy_xlsx.enums import MergeStrategy
 
 # ============================================================================
 # Type Aliases
@@ -20,8 +21,36 @@ FileSource = Path | BinaryIO
 
 
 # ============================================================================
+# Helpers
+# ============================================================================
+
+
+def is_fileobj(source: FileSource) -> bool:
+    """Check if source is a file-like object."""
+    return hasattr(source, "read")
+
+
+def reset_buffer(source: FileSource) -> None:
+    """Reset file-like object to beginning if seekable."""
+    if hasattr(source, "seek"):
+        source.seek(0)
+
+
+def get_file_desc(source: FileSource) -> str:
+    """Get a human-readable description of the source."""
+    return "<stream>" if is_fileobj(source) else str(source)
+
+
+def read_file_content(source: FileSource) -> bytes:
+    """Read full content from file-like object."""
+    reset_buffer(source)
+    return source.read()  # type: ignore[union-attr]
+
+
+# ============================================================================
 # Models
 # ============================================================================
+
 
 @dataclass
 class ParseOptions:
@@ -43,7 +72,7 @@ class ParseOptions:
 
     preserve_formatting: bool = False
 
-    merge_strategy: str = "fill"
+    merge_strategy: MergeStrategy | str = MergeStrategy.FILL
 
     ignore_hidden: bool = False
 
@@ -57,6 +86,7 @@ class ParseOptions:
 # ============================================================================
 # Core
 # ============================================================================
+
 
 class FormatHandler(ABC):
     """Abstract base class for format handlers."""
@@ -93,13 +123,13 @@ class FormatHandler(ABC):
     ) -> pd.DataFrame:
         """Apply skip_rows, skip_footer, and max_rows to DataFrame."""
         if options.skip_rows > 0:
-            df = df.iloc[options.skip_rows:]
+            df = df.iloc[options.skip_rows :]
 
         if options.skip_footer > 0:
-            df = df.iloc[:-options.skip_footer]
+            df = df.iloc[: -options.skip_footer]
 
         if options.max_rows is not None:
-            df = df.iloc[:options.max_rows]
+            df = df.iloc[: options.max_rows]
 
         return df.reset_index(drop=True)
 
@@ -125,7 +155,7 @@ class FormatHandler(ABC):
             return data_df, columns
 
         header_rows_data = df.iloc[:header_rows]
-        data_df          = df.iloc[header_rows:]
+        data_df = df.iloc[header_rows:]
 
         columns = []
         for col_idx in range(len(df.columns)):

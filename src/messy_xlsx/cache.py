@@ -11,7 +11,6 @@ from typing import Generic, TypeVar
 
 from messy_xlsx.models import StructureInfo
 
-
 # ============================================================================
 # Type Variables
 # ============================================================================
@@ -22,6 +21,7 @@ T = TypeVar("T")
 # ============================================================================
 # Generic LRU Cache
 # ============================================================================
+
 
 class LRUCache(Generic[T]):
     """Thread-safe LRU (Least Recently Used) cache."""
@@ -85,6 +85,7 @@ class LRUCache(Generic[T]):
 # ============================================================================
 # Structure-Specific Cache
 # ============================================================================
+
 
 class StructureCache:
     """Specialized cache for StructureInfo results."""

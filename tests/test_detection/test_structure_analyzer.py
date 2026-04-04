@@ -1,8 +1,6 @@
 """Unit tests for StructureAnalyzer."""
 
-import pytest
 from messy_xlsx import MessyWorkbook
-from messy_xlsx.detection import StructureAnalyzer
 from messy_xlsx.cache import StructureCache
 
 
@@ -79,7 +77,7 @@ class TestStructureAnalyzer:
 
     def test_structure_caching(self, sample_xlsx):
         """Test that structure analysis results are cached."""
-        cache = StructureCache()
+        StructureCache()
 
         with MessyWorkbook(sample_xlsx) as wb:
             # First call

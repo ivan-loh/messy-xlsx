@@ -4,12 +4,12 @@
 # Imports
 # ============================================================================
 
-from typing import TYPE_CHECKING, Any, Iterator
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
 from messy_xlsx.models import CellValue, SheetConfig, StructureInfo, TableInfo
-from messy_xlsx.utils import column_index_to_letter
 
 if TYPE_CHECKING:
     from messy_xlsx.workbook import MessyWorkbook
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 # ============================================================================
 # Helper Classes
 # ============================================================================
+
 
 class MessyTable:
     """Represents a detected table within a sheet."""
@@ -59,7 +60,7 @@ class MessyTable:
         """Convert table to DataFrame."""
         range_str = self._info.to_range_string()
 
-        config            = config or SheetConfig()
+        config = config or SheetConfig()
         config.cell_range = range_str
 
         return self._sheet._workbook._parse_sheet(self._sheet.name, config)
@@ -68,6 +69,7 @@ class MessyTable:
 # ============================================================================
 # Core
 # ============================================================================
+
 
 class MessySheet:
     """Wrapper for a single sheet with structure detection."""
@@ -78,8 +80,8 @@ class MessySheet:
         name: str,
     ):
         """Initialize sheet."""
-        self._workbook   = workbook
-        self._name       = name
+        self._workbook = workbook
+        self._name = name
         self._structure: StructureInfo | None = None
 
     @property
@@ -98,10 +100,7 @@ class MessySheet:
     def tables(self) -> list[MessyTable]:
         """Get detected tables in this sheet."""
         structure = self.structure
-        return [
-            MessyTable(self, info)
-            for info in structure.table_ranges
-        ]
+        return [MessyTable(self, info) for info in structure.table_ranges]
 
     @property
     def has_multiple_tables(self) -> bool:
@@ -125,8 +124,8 @@ class MessySheet:
     ) -> Iterator[list[CellValue]]:
         """Iterate over rows of cells."""
         structure = self.structure
-        max_row   = max_row or structure.data_end_row
-        max_col   = max_col or structure.data_end_col
+        max_row = max_row or structure.data_end_row
+        max_col = max_col or structure.data_end_col
 
         for row in range(min_row, max_row + 1):
             row_cells = []
@@ -148,11 +147,10 @@ class MessySheet:
                     row_cells.append(self.get_cell(row, col))
                 result.append(row_cells)
             return result
-        else:
-            from messy_xlsx.utils import cell_ref_to_coords
+        from messy_xlsx.utils import cell_ref_to_coords
 
-            _, row, col = cell_ref_to_coords(ref)
-            return self.get_cell(row, col)
+        _, row, col = cell_ref_to_coords(ref)
+        return self.get_cell(row, col)
 
     def __repr__(self) -> str:
         return f"MessySheet({self._name!r})"

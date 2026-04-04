@@ -4,14 +4,26 @@
 # Imports
 # ============================================================================
 
+import logging
+from typing import Any
+
 import fastexcel
 import numpy as np
 import openpyxl
 import pandas as pd
 
-from messy_xlsx.exceptions        import FileError, FormatError
-from messy_xlsx.parsing.base_handler import FileSource, FormatHandler, ParseOptions
+from messy_xlsx.exceptions import FileError, FormatError
+from messy_xlsx.parsing.base_handler import (
+    FileSource,
+    FormatHandler,
+    ParseOptions,
+    get_file_desc,
+    is_fileobj,
+    read_file_content,
+    reset_buffer,
+)
 
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # Constants
@@ -30,31 +42,9 @@ EXCEL_ERRORS = {
 
 
 # ============================================================================
-# Helpers
-# ============================================================================
-
-def _is_fileobj(source: FileSource) -> bool:
-    return hasattr(source, "read")
-
-
-def _reset_buffer(source: FileSource) -> None:
-    if hasattr(source, "seek"):
-        source.seek(0)
-
-
-def _get_file_desc(source: FileSource) -> str:
-    return "<stream>" if _is_fileobj(source) else str(source)
-
-
-def _read_file_content(source: FileSource) -> bytes:
-    """Read content from file-like object for fastexcel."""
-    _reset_buffer(source)
-    return source.read()
-
-
-# ============================================================================
 # Core
 # ============================================================================
+
 
 class XLSXHandler(FormatHandler):
     """Handler for XLSX and XLSM files."""
@@ -65,20 +55,17 @@ class XLSXHandler(FormatHandler):
     def parse(
         self,
         file_source: FileSource,
-        sheet:       str | None,
-        options:     ParseOptions,
+        sheet: str | None,
+        options: ParseOptions,
     ) -> pd.DataFrame:
         """Parse XLSX/XLSM file to DataFrame."""
         needs_openpyxl = (
-            options.merge_strategy != "skip"
-            or options.ignore_hidden
-            or options.cell_range
+            options.merge_strategy != "skip" or options.ignore_hidden or options.cell_range
         )
 
         if needs_openpyxl:
             return self._parse_openpyxl(file_source, sheet, options)
         return self._parse_fastexcel(file_source, sheet, options)
-
 
     # -------------------------------------------------------------------------
     # Fastexcel (fast path)
@@ -87,21 +74,25 @@ class XLSXHandler(FormatHandler):
     def _parse_fastexcel(
         self,
         file_source: FileSource,
-        sheet:       str | None,
-        options:     ParseOptions,
+        sheet: str | None,
+        options: ParseOptions,
     ) -> pd.DataFrame:
         """Fast path using fastexcel."""
-        is_fileobj = _is_fileobj(file_source)
-        file_desc  = _get_file_desc(file_source)
+        is_stream = is_fileobj(file_source)
+        file_desc = get_file_desc(file_source)
 
-        if is_fileobj:
-            _reset_buffer(file_source)
+        if is_stream:
+            reset_buffer(file_source)
 
         try:
-            content    = _read_file_content(file_source) if is_fileobj else file_source
-            excel_file = fastexcel.read_excel(content)
+            content: bytes | FileSource = (
+                read_file_content(file_source) if is_stream else file_source
+            )
+            excel_file = fastexcel.read_excel(content)  # type: ignore[arg-type]
         except PermissionError as e:
-            raise FileError(f"Permission denied: {file_desc}", file_path=file_desc, operation="open") from e
+            raise FileError(
+                f"Permission denied: {file_desc}", file_path=file_desc, operation="open"
+            ) from e
         except Exception as e:
             raise FormatError(f"Cannot open Excel file: {e}", file_path=file_desc) from e
 
@@ -110,8 +101,8 @@ class XLSXHandler(FormatHandler):
 
             df = excel_file.load_sheet(
                 sheet_idx,
-                skip_rows  = options.skip_rows,
-                header_row = None,
+                skip_rows=options.skip_rows,
+                header_row=None,
             ).to_pandas()
 
             if df.empty:
@@ -125,13 +116,14 @@ class XLSXHandler(FormatHandler):
         except Exception as e:
             raise FormatError(f"Error reading Excel file: {e}", file_path=file_desc) from e
 
-    def _resolve_sheet_index(self, excel_file, sheet: str | None, file_desc: str) -> int:
+    def _resolve_sheet_index(self, excel_file: Any, sheet: str | None, file_desc: str) -> int:
         if not sheet:
             return 0
         if sheet not in excel_file.sheet_names:
-            raise FormatError(f"Sheet '{sheet}' not found", file_path=file_desc, detected_format="xlsx")
-        return excel_file.sheet_names.index(sheet)
-
+            raise FormatError(
+                f"Sheet '{sheet}' not found", file_path=file_desc, detected_format="xlsx"
+            )
+        return int(excel_file.sheet_names.index(sheet))
 
     # -------------------------------------------------------------------------
     # Openpyxl (fallback for advanced features)
@@ -140,26 +132,28 @@ class XLSXHandler(FormatHandler):
     def _parse_openpyxl(
         self,
         file_source: FileSource,
-        sheet:       str | None,
-        options:     ParseOptions,
+        sheet: str | None,
+        options: ParseOptions,
     ) -> pd.DataFrame:
         """Fallback path using openpyxl for advanced features."""
-        read_only  = options.merge_strategy == "skip"
-        is_fileobj = _is_fileobj(file_source)
-        file_desc  = _get_file_desc(file_source)
+        read_only = options.merge_strategy == "skip"
+        is_stream = is_fileobj(file_source)
+        file_desc = get_file_desc(file_source)
 
-        if is_fileobj:
-            _reset_buffer(file_source)
+        if is_stream:
+            reset_buffer(file_source)
 
         try:
             wb = openpyxl.load_workbook(
                 file_source,
-                read_only  = read_only,
-                data_only  = options.data_only,
-                keep_links = False,
+                read_only=read_only,
+                data_only=options.data_only,
+                keep_links=False,
             )
         except PermissionError as e:
-            raise FileError(f"Permission denied: {file_desc}", file_path=file_desc, operation="open") from e
+            raise FileError(
+                f"Permission denied: {file_desc}", file_path=file_desc, operation="open"
+            ) from e
         except Exception as e:
             raise FormatError(f"Cannot open Excel file: {e}", file_path=file_desc) from e
 
@@ -176,7 +170,7 @@ class XLSXHandler(FormatHandler):
             df = pd.DataFrame(data)
 
             if options.skip_rows > 0 and not options.cell_range:
-                df = df.iloc[options.skip_rows:]
+                df = df.iloc[options.skip_rows :]
 
             df = self._apply_options(df, options)
             return self._clean_excel_data(df, options)
@@ -184,20 +178,22 @@ class XLSXHandler(FormatHandler):
         finally:
             wb.close()
 
-    def _resolve_worksheet(self, wb, sheet: str | None, file_desc: str):
+    def _resolve_worksheet(self, wb: Any, sheet: str | None, file_desc: str) -> Any:
         if not sheet:
             return wb.active
         if sheet not in wb.sheetnames:
-            raise FormatError(f"Sheet '{sheet}' not found", file_path=file_desc, detected_format="xlsx")
+            raise FormatError(
+                f"Sheet '{sheet}' not found", file_path=file_desc, detected_format="xlsx"
+            )
         return wb[sheet]
 
-    def _read_worksheet(self, ws, options: ParseOptions) -> list[list]:
+    def _read_worksheet(self, ws: Any, options: ParseOptions) -> list[list[Any]]:
         """Read worksheet data using openpyxl."""
         if options.cell_range:
             return self._read_cell_range(ws, options.cell_range)
         return self._read_full_sheet(ws, options.ignore_hidden)
 
-    def _read_cell_range(self, ws, cell_range: str) -> list[list]:
+    def _read_cell_range(self, ws: Any, cell_range: str) -> list[list[Any]]:
         try:
             rows_iter = ws[cell_range]
             if not isinstance(rows_iter[0], tuple):
@@ -213,7 +209,7 @@ class XLSXHandler(FormatHandler):
         except Exception as e:
             raise FormatError(f"Invalid cell range: {cell_range}", detected_format="xlsx") from e
 
-    def _read_full_sheet(self, ws, ignore_hidden: bool) -> list[list]:
+    def _read_full_sheet(self, ws: Any, ignore_hidden: bool) -> list[list[Any]]:
         hidden_rows, hidden_cols = set(), set()
 
         if ignore_hidden:
@@ -225,15 +221,12 @@ class XLSXHandler(FormatHandler):
             if row_idx in hidden_rows:
                 continue
 
-            row_values = [
-                cell.value for cell in row
-                if cell.column_letter not in hidden_cols
-            ]
+            row_values = [cell.value for cell in row if cell.column_letter not in hidden_cols]
             data.append(row_values)
 
         return data
 
-    def _handle_merged_cells(self, ws, strategy: str) -> None:
+    def _handle_merged_cells(self, ws: Any, strategy: str) -> None:
         """Handle merged cells according to strategy."""
         for merged_range in list(ws.merged_cells.ranges):
             top_left = ws.cell(merged_range.min_row, merged_range.min_col).value
@@ -250,7 +243,6 @@ class XLSXHandler(FormatHandler):
                         if r != merged_range.min_row or c != merged_range.min_col:
                             ws.cell(r, c).value = None
 
-
     # -------------------------------------------------------------------------
     # Common
     # -------------------------------------------------------------------------
@@ -258,11 +250,11 @@ class XLSXHandler(FormatHandler):
     def _apply_options(self, df: pd.DataFrame, options: ParseOptions) -> pd.DataFrame:
         """Apply skip_footer and header options."""
         if options.skip_footer > 0:
-            df = df.iloc[:-options.skip_footer]
+            df = df.iloc[: -options.skip_footer]
 
         if options.header_rows > 0 and len(df) >= options.header_rows:
             df, columns = self._generate_column_names(df, options.header_rows)
-            df.columns  = columns
+            df.columns = columns
             df = df.reset_index(drop=True)
         else:
             df.columns = [f"col_{i}" for i in range(len(df.columns))]
@@ -280,49 +272,54 @@ class XLSXHandler(FormatHandler):
 
         return df
 
-
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
 
     def get_sheet_names(self, file_source: FileSource) -> list[str]:
         """Get list of sheet names."""
-        is_fileobj = _is_fileobj(file_source)
-        file_desc  = _get_file_desc(file_source)
+        is_stream = is_fileobj(file_source)
+        file_desc = get_file_desc(file_source)
 
-        if is_fileobj:
-            _reset_buffer(file_source)
+        if is_stream:
+            reset_buffer(file_source)
 
         try:
-            content    = _read_file_content(file_source) if is_fileobj else file_source
-            excel_file = fastexcel.read_excel(content)
-            return excel_file.sheet_names
-        except Exception:
-            pass
+            content2: bytes | FileSource = (
+                read_file_content(file_source) if is_stream else file_source
+            )
+            excel_file = fastexcel.read_excel(content2)  # type: ignore[arg-type]
+            return list(excel_file.sheet_names)
+        except (OSError, ValueError, RuntimeError) as e:
+            logger.debug("fastexcel sheet name read failed, falling back to openpyxl: %s", e)
 
         # Fallback to openpyxl
         try:
-            if is_fileobj:
-                _reset_buffer(file_source)
-            wb     = openpyxl.load_workbook(file_source, read_only=True)
-            sheets = wb.sheetnames
+            if is_stream:
+                reset_buffer(file_source)
+            wb = openpyxl.load_workbook(file_source, read_only=True)
+            sheets = list(wb.sheetnames)
             wb.close()
             return sheets
         except PermissionError as e:
-            raise FileError(f"Permission denied: {file_desc}", file_path=file_desc, operation="get_sheets") from e
+            raise FileError(
+                f"Permission denied: {file_desc}", file_path=file_desc, operation="get_sheets"
+            ) from e
         except Exception as e:
             raise FormatError(f"Cannot read sheet names: {e}", file_path=file_desc) from e
 
     def validate(self, file_source: FileSource) -> tuple[bool, str | None]:
         """Validate that file can be parsed."""
-        is_fileobj = _is_fileobj(file_source)
+        is_stream = is_fileobj(file_source)
 
-        if is_fileobj:
-            _reset_buffer(file_source)
+        if is_stream:
+            reset_buffer(file_source)
 
         try:
-            content = _read_file_content(file_source) if is_fileobj else file_source
-            fastexcel.read_excel(content)
+            content3: bytes | FileSource = (
+                read_file_content(file_source) if is_stream else file_source
+            )
+            fastexcel.read_excel(content3)  # type: ignore[arg-type]
             return True, None
         except Exception as e:
             return False, str(e)

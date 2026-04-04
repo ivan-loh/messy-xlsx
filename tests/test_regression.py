@@ -48,6 +48,7 @@ class TestRegressionBugs:
 
             # Should parse as 1234.56 (column name is lowercase)
             import pandas as pd
+
             if pd.api.types.is_numeric_dtype(df["amount"]):
                 assert df.iloc[0]["amount"] == pytest.approx(1234.56)
 

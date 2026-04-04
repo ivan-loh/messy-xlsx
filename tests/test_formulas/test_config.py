@@ -1,7 +1,6 @@
 """Unit tests for FormulaConfig."""
 
-import pytest
-from messy_xlsx.formulas import FormulaConfig, FormulaEvaluationMode, CircularRefStrategy
+from messy_xlsx.formulas import CircularRefStrategy, FormulaConfig, FormulaEvaluationMode
 
 
 class TestFormulaConfig:

@@ -7,7 +7,6 @@
 import numpy as np
 import pandas as pd
 
-
 # ============================================================================
 # Config
 # ============================================================================
@@ -50,6 +49,7 @@ EXTENDED_MISSING_VALUES = [
 # ============================================================================
 # Core
 # ============================================================================
+
 
 class MissingValueHandler:
     """
@@ -149,17 +149,13 @@ class MissingValueHandler:
             elif hasattr(col_dtype, "numpy_dtype"):
                 # Handle pandas extension types with numpy backing
                 np_dtype = col_dtype.numpy_dtype
-                if np.issubdtype(np_dtype, np.floating):
-                    null_value = np.nan
-                elif np.issubdtype(np_dtype, np.integer):
+                if np.issubdtype(np_dtype, np.floating) or np.issubdtype(np_dtype, np.integer):
                     null_value = np.nan
                 else:
                     null_value = pd.NA
             elif hasattr(col_dtype, "kind"):
                 # Standard numpy dtypes
-                if np.issubdtype(col_dtype, np.floating):
-                    null_value = np.nan
-                elif np.issubdtype(col_dtype, np.integer):
+                if np.issubdtype(col_dtype, np.floating) or np.issubdtype(col_dtype, np.integer):
                     null_value = np.nan
                 else:
                     null_value = pd.NA

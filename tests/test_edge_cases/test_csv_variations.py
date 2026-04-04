@@ -1,7 +1,6 @@
 """Tests for CSV format variations and edge cases."""
 
-import pytest
-from messy_xlsx import MessyWorkbook, SheetConfig
+from messy_xlsx import MessyWorkbook
 
 
 class TestCSVDelimiters:

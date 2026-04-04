@@ -7,7 +7,6 @@ import pytest
 from messy_xlsx import MessyWorkbook
 from messy_xlsx.exceptions import MessyXlsxError
 
-
 # Get all sample files
 SAMPLES_DIR = Path(__file__).parent / "samples"
 SAMPLE_FILES = sorted(SAMPLES_DIR.glob("*.xlsx"))

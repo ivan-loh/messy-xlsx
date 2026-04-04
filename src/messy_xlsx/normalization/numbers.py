@@ -9,7 +9,6 @@ import re
 import numpy as np
 import pandas as pd
 
-
 # ============================================================================
 # Config - Compiled patterns at module level for performance
 # ============================================================================
@@ -32,6 +31,7 @@ _currency_pattern = re.compile("|".join(re.escape(s) for s in CURRENCY_SYMBOLS))
 # ============================================================================
 # Core
 # ============================================================================
+
 
 class NumberNormalizer:
     """Normalize numbers with locale-aware parsing."""
@@ -119,8 +119,7 @@ class NumberNormalizer:
         if is_accounting.any():
             # Extract content from parentheses and add negative sign
             str_series = str_series.where(
-                ~is_accounting,
-                "-" + str_series.str.replace(r"[()]", "", regex=True).str.strip()
+                ~is_accounting, "-" + str_series.str.replace(r"[()]", "", regex=True).str.strip()
             )
 
         # Vectorized: remove thousands separator

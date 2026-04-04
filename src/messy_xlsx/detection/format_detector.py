@@ -4,14 +4,12 @@
 # Imports
 # ============================================================================
 
-import io
 import zipfile
 from pathlib import Path
 from typing import BinaryIO
 
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.models import FormatInfo
-
 
 # ============================================================================
 # Configuration
@@ -33,10 +31,13 @@ HEADER_SIZE = 8192
 # Format Detector
 # ============================================================================
 
+
 class FormatDetector:
     """Detect file format using binary signatures and content analysis."""
 
-    def detect(self, file_or_path: Path | str | BinaryIO, filename: str | None = None) -> FormatInfo:
+    def detect(
+        self, file_or_path: Path | str | BinaryIO, filename: str | None = None
+    ) -> FormatInfo:
         """Detect file format from path or file-like object.
 
         Args:
@@ -45,7 +46,7 @@ class FormatDetector:
         """
         # Handle file-like objects
         if hasattr(file_or_path, "read"):
-            return self._detect_from_fileobj(file_or_path, filename)
+            return self._detect_from_fileobj(file_or_path, filename)  # type: ignore[arg-type]
 
         # Handle path
         file_path = Path(file_or_path)
@@ -109,12 +110,11 @@ class FormatDetector:
         """Analyze format family from file-like object."""
         if format_family == "zip_based":
             return self._analyze_zip_format_from_fileobj(fileobj)
-        elif format_family == "ole2":
+        if format_family == "ole2":
             return FormatInfo(format_type="xls", confidence=0.95, version="OLE2 Compound Document")
-        elif format_family.startswith("xls_biff"):
+        if format_family.startswith("xls_biff"):
             return FormatInfo(format_type="xls", confidence=0.95, version=format_family.upper())
-        else:
-            return FormatInfo(format_type="unknown", confidence=0.0)
+        return FormatInfo(format_type="unknown", confidence=0.0)
 
     def _analyze_zip_format_from_fileobj(self, fileobj: BinaryIO) -> FormatInfo:
         """Analyze ZIP-based format from file-like object."""
@@ -183,16 +183,17 @@ class FormatDetector:
 
         return FormatInfo(format_type=format_type, confidence=confidence, encoding=encoding)
 
-    def _analyze_format_family(self, file_path: Path, format_family: str, header: bytes) -> FormatInfo:
+    def _analyze_format_family(
+        self, file_path: Path, format_family: str, header: bytes
+    ) -> FormatInfo:
         """Analyze format within a detected family."""
         if format_family == "zip_based":
             return self._analyze_zip_format(file_path)
-        elif format_family == "ole2":
+        if format_family == "ole2":
             return FormatInfo(format_type="xls", confidence=0.95, version="OLE2 Compound Document")
-        elif format_family.startswith("xls_biff"):
+        if format_family.startswith("xls_biff"):
             return FormatInfo(format_type="xls", confidence=0.95, version=format_family.upper())
-        else:
-            return FormatInfo(format_type="unknown", confidence=0.0)
+        return FormatInfo(format_type="unknown", confidence=0.0)
 
     def _analyze_zip_format(self, file_path: Path) -> FormatInfo:
         """Analyze ZIP-based Office Open XML formats."""

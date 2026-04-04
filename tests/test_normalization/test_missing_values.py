@@ -2,7 +2,6 @@
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from messy_xlsx.normalization import MissingValueHandler
 
@@ -14,9 +13,7 @@ class TestMissingValueHandler:
         """Test standardizing various NA patterns."""
         handler = MissingValueHandler()
 
-        df = pd.DataFrame({
-            "col": ["NA", "N/A", "null", "NULL", "value"]
-        })
+        df = pd.DataFrame({"col": ["NA", "N/A", "null", "NULL", "value"]})
 
         result = handler.normalize(df, drop_empty_rows=False)
 
@@ -30,9 +27,7 @@ class TestMissingValueHandler:
         """Test extended list with ambiguous values like dash."""
         handler = MissingValueHandler(use_extended_list=True)
 
-        df = pd.DataFrame({
-            "col": ["-", ".", "?", "value"]
-        })
+        df = pd.DataFrame({"col": ["-", ".", "?", "value"]})
 
         result = handler.normalize(df, drop_empty_rows=False)
 
@@ -45,9 +40,7 @@ class TestMissingValueHandler:
         """Test that dash is NOT converted by default (conservative behavior)."""
         handler = MissingValueHandler()
 
-        df = pd.DataFrame({
-            "col": ["-", "value"]
-        })
+        df = pd.DataFrame({"col": ["-", "value"]})
 
         result = handler.normalize(df, drop_empty_rows=False)
 
@@ -59,9 +52,7 @@ class TestMissingValueHandler:
         """Test handling empty strings."""
         handler = MissingValueHandler()
 
-        df = pd.DataFrame({
-            "col": ["", "  ", "value"]
-        })
+        df = pd.DataFrame({"col": ["", "  ", "value"]})
 
         result = handler.normalize(df, drop_empty_rows=False)
 
@@ -73,10 +64,7 @@ class TestMissingValueHandler:
         """Test dropping rows that are entirely empty."""
         handler = MissingValueHandler()
 
-        df = pd.DataFrame({
-            "a": ["NA", "value", "NA"],
-            "b": ["NA", "data", "NA"]
-        })
+        df = pd.DataFrame({"a": ["NA", "value", "NA"], "b": ["NA", "data", "NA"]})
 
         result = handler.normalize(df, drop_empty_rows=True)
 
@@ -87,9 +75,7 @@ class TestMissingValueHandler:
         """Test that zero values are not treated as missing."""
         handler = MissingValueHandler()
 
-        df = pd.DataFrame({
-            "number": [0, 1, 2]
-        })
+        df = pd.DataFrame({"number": [0, 1, 2]})
 
         result = handler.normalize(df, drop_empty_rows=False)
 
@@ -99,9 +85,7 @@ class TestMissingValueHandler:
         """Test handling None values."""
         handler = MissingValueHandler()
 
-        df = pd.DataFrame({
-            "col": [None, "value", None]
-        })
+        df = pd.DataFrame({"col": [None, "value", None]})
 
         result = handler.normalize(df, drop_empty_rows=False)
 
@@ -112,9 +96,7 @@ class TestMissingValueHandler:
         """Test that preserve_types prevents mixed str/float columns."""
         handler = MissingValueHandler(preserve_types=True)
 
-        df = pd.DataFrame({
-            "col": ["value", "NA", "another"]
-        })
+        df = pd.DataFrame({"col": ["value", "NA", "another"]})
 
         result = handler.normalize(df, drop_empty_rows=False)
 
@@ -123,7 +105,9 @@ class TestMissingValueHandler:
         for i, v in enumerate(result["col"]):
             if pd.isna(v):
                 continue  # NA values are acceptable (may be represented as nan in Arrow strings)
-            assert isinstance(v, str), f"Non-null value at index {i} should be string, got {type(v)}"
+            assert isinstance(v, str), (
+                f"Non-null value at index {i} should be string, got {type(v)}"
+            )
 
         # The middle value (originally "NA") should be null
         assert pd.isna(result["col"].iloc[1]), "NA value should be converted to null"
@@ -132,9 +116,7 @@ class TestMissingValueHandler:
         """Test that preserve_types=False uses np.nan (legacy behavior)."""
         handler = MissingValueHandler(preserve_types=False)
 
-        df = pd.DataFrame({
-            "col": ["value", "NA", "another"]
-        })
+        df = pd.DataFrame({"col": ["value", "NA", "another"]})
 
         result = handler.normalize(df, drop_empty_rows=False)
 

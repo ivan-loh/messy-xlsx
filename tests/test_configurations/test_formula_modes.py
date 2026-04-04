@@ -4,18 +4,21 @@ import openpyxl
 import pytest
 
 from messy_xlsx import MessyWorkbook
-from messy_xlsx.formulas import FormulaConfig, FormulaEvaluationMode, CircularRefStrategy
+from messy_xlsx.formulas import CircularRefStrategy, FormulaConfig, FormulaEvaluationMode
 
 
 class TestFormulaEvaluationModes:
     """Test all formula evaluation modes."""
 
-    @pytest.mark.parametrize("mode", [
-        FormulaEvaluationMode.DISABLED,
-        FormulaEvaluationMode.CACHED_ONLY,
-        FormulaEvaluationMode.CACHED_WITH_FALLBACK,
-        FormulaEvaluationMode.ALWAYS_EVALUATE,
-    ])
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            FormulaEvaluationMode.DISABLED,
+            FormulaEvaluationMode.CACHED_ONLY,
+            FormulaEvaluationMode.CACHED_WITH_FALLBACK,
+            FormulaEvaluationMode.ALWAYS_EVALUATE,
+        ],
+    )
     def test_formula_modes(self, temp_dir, mode):
         """Test all formula evaluation modes."""
         file_path = temp_dir / f"formulas_{mode.value}.xlsx"
@@ -40,11 +43,14 @@ class TestFormulaEvaluationModes:
 class TestCircularReferenceStrategies:
     """Test circular reference handling strategies."""
 
-    @pytest.mark.parametrize("strategy", [
-        CircularRefStrategy.ERROR,
-        CircularRefStrategy.RETURN_CACHED,
-        CircularRefStrategy.ITERATE,
-    ])
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            CircularRefStrategy.ERROR,
+            CircularRefStrategy.RETURN_CACHED,
+            CircularRefStrategy.ITERATE,
+        ],
+    )
     def test_circular_strategies(self, temp_dir, strategy):
         """Test all circular reference strategies."""
         file_path = temp_dir / f"circular_{strategy.value}.xlsx"
@@ -56,10 +62,7 @@ class TestCircularReferenceStrategies:
         wb.save(file_path)
         wb.close()
 
-        config = FormulaConfig(
-            mode=FormulaEvaluationMode.CACHED_ONLY,
-            circular_strategy=strategy
-        )
+        config = FormulaConfig(mode=FormulaEvaluationMode.CACHED_ONLY, circular_strategy=strategy)
 
         with MessyWorkbook(file_path, formula_config=config) as mwb:
             # Should handle based on strategy
@@ -81,10 +84,7 @@ class TestUnsupportedFunctionHandling:
         wb.save(file_path)
         wb.close()
 
-        config = FormulaConfig(
-            mode=FormulaEvaluationMode.CACHED_ONLY,
-            raise_on_unsupported=True
-        )
+        config = FormulaConfig(mode=FormulaEvaluationMode.CACHED_ONLY, raise_on_unsupported=True)
 
         with MessyWorkbook(file_path, formula_config=config) as mwb:
             # Should handle gracefully with cached values
@@ -105,7 +105,7 @@ class TestUnsupportedFunctionHandling:
         config = FormulaConfig(
             mode=FormulaEvaluationMode.CACHED_ONLY,
             raise_on_unsupported=False,
-            unsupported_value="N/A"
+            unsupported_value="N/A",
         )
 
         with MessyWorkbook(file_path, formula_config=config) as mwb:

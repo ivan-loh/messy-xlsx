@@ -1,9 +1,5 @@
 """Unit tests for CSVHandler."""
 
-import tempfile
-from pathlib import Path
-
-import pytest
 from messy_xlsx.parsing import CSVHandler, ParseOptions
 
 
