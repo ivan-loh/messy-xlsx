@@ -8,33 +8,35 @@ class TestFormulaEngine:
     """Test formula evaluation engine."""
 
     def test_cached_value_mode(self, messy_xlsx):
-        """Test using cached values only."""
+        """Test that CACHED_ONLY mode parses without errors."""
         config = FormulaConfig(mode=FormulaEvaluationMode.CACHED_ONLY)
 
         with MessyWorkbook(messy_xlsx, formula_config=config) as wb:
             df = wb.to_dataframe("Report")
 
-            # Should use cached values
-            assert df is not None
+            # Note: formula modes only affect get_cell(), not to_dataframe()
+            # (to_dataframe always uses data_only=True). This test verifies
+            # that the mode doesn't crash the pipeline.
+            assert len(df) > 0
+            assert len(df.columns) > 0
 
     def test_disabled_mode(self, messy_xlsx):
-        """Test formula evaluation disabled."""
+        """Test that DISABLED mode parses without errors."""
         config = FormulaConfig(mode=FormulaEvaluationMode.DISABLED)
 
         with MessyWorkbook(messy_xlsx, formula_config=config) as wb:
             df = wb.to_dataframe("Report")
 
-            assert df is not None
+            assert len(df) > 0
 
     def test_fallback_mode(self, messy_xlsx):
-        """Test fallback evaluation mode."""
+        """Test that CACHED_WITH_FALLBACK mode parses without errors."""
         config = FormulaConfig(mode=FormulaEvaluationMode.CACHED_WITH_FALLBACK)
 
         with MessyWorkbook(messy_xlsx, formula_config=config) as wb:
             df = wb.to_dataframe("Report")
 
-            # Should try to evaluate, fall back to cached
-            assert df is not None
+            assert len(df) > 0
 
     def test_unsupported_function_handling(self):
         """Test handling unsupported functions."""
@@ -46,12 +48,12 @@ class TestFormulaEngine:
         assert config.unsupported_value == "#UNSUPPORTED"
 
     def test_formula_detection(self, messy_xlsx):
-        """Test detecting formulas in cells."""
+        """Test detecting formulas in workbook with known formulas."""
         with MessyWorkbook(messy_xlsx) as wb:
             structure = wb.get_structure("Report")
 
-            # messy_xlsx has formulas
-            assert isinstance(structure.has_formulas, bool)
+            # messy_xlsx fixture has formulas (=B5+C5, =SUM(...))
+            assert structure.has_formulas is True
 
     def test_cell_formula_access(self, messy_xlsx):
         """Test accessing cell formulas."""

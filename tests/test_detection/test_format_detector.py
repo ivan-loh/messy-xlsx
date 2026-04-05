@@ -50,3 +50,24 @@ class TestFormatDetector:
         info = detector.detect(sample_xlsx)
 
         assert 0.0 <= info.confidence <= 1.0
+
+    def test_xlsb_rejected_at_workbook_level(self, temp_dir):
+        """XLSB format should be detected but rejected with a clear error."""
+        import zipfile
+
+        # Create a minimal fake .xlsb file (ZIP with xl/workbook.bin)
+        xlsb_path = temp_dir / "test.xlsb"
+        with zipfile.ZipFile(xlsb_path, "w") as zf:
+            zf.writestr("xl/workbook.bin", b"\x00" * 100)
+            zf.writestr("[Content_Types].xml", '<?xml version="1.0"?><Types></Types>')
+
+        # FormatDetector should detect it as xlsb
+        detector = FormatDetector()
+        info = detector.detect(xlsb_path)
+        assert info.format_type == "xlsb"
+
+        # But MessyWorkbook should reject it with a clear error
+        from messy_xlsx import MessyWorkbook
+
+        with pytest.raises(FormatError, match="XLSB.*not supported"):
+            MessyWorkbook(xlsb_path)

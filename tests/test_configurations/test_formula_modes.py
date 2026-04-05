@@ -20,7 +20,12 @@ class TestFormulaEvaluationModes:
         ],
     )
     def test_formula_modes(self, temp_dir, mode):
-        """Test all formula evaluation modes."""
+        """Test all formula evaluation modes produce consistent DataFrame output.
+
+        Note: formula modes only affect get_cell(), not to_dataframe().
+        to_dataframe() always uses data_only=True. This test verifies that
+        different modes don't crash the pipeline and produce identical results.
+        """
         file_path = temp_dir / f"formulas_{mode.value}.xlsx"
 
         wb = openpyxl.Workbook()
@@ -36,8 +41,9 @@ class TestFormulaEvaluationModes:
 
         with MessyWorkbook(file_path, formula_config=config) as mwb:
             df = mwb.to_dataframe()
-            assert df is not None
             assert len(df) == 1
+            assert df.iloc[0]["a"] == 10
+            assert df.iloc[0]["b"] == 20
 
 
 class TestCircularReferenceStrategies:

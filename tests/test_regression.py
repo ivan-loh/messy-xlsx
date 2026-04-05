@@ -31,13 +31,13 @@ class TestRegressionBugs:
             assert structure.header_confidence >= 0.7
 
     def test_european_numbers_not_corrupted(self, temp_dir):
-        """Regression: European numbers should parse correctly."""
+        """Regression: European numbers should parse correctly with locale."""
         file_path = temp_dir / "european.xlsx"
 
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.append(["Amount"])
-        ws.append(["1.234,56"])  # European format
+        ws.append(["1.234,56"])  # European format: 1234.56
         wb.save(file_path)
         wb.close()
 
@@ -46,11 +46,39 @@ class TestRegressionBugs:
         with MessyWorkbook(file_path, sheet_config=config) as mwb:
             df = mwb.to_dataframe()
 
-            # Should parse as 1234.56 (column name is lowercase)
             import pandas as pd
 
-            if pd.api.types.is_numeric_dtype(df["amount"]):
-                assert df.iloc[0]["amount"] == pytest.approx(1234.56)
+            # Must be numeric — not left as text
+            assert pd.api.types.is_numeric_dtype(df["amount"]), (
+                f"European number was not converted to numeric (dtype={df['amount'].dtype})"
+            )
+            # Must be 1234.56, not corrupted to 1.23456 or 123456
+            assert df.iloc[0]["amount"] == pytest.approx(1234.56)
+
+    def test_comma_decimal_not_corrupted(self, temp_dir):
+        """Regression: comma-decimal '1,23' with de_DE locale must become 1.23, not 123."""
+        file_path = temp_dir / "comma_decimal.xlsx"
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["Amount"])
+        ws.append(["1,23"])
+        ws.append(["4,56"])
+        wb.save(file_path)
+        wb.close()
+
+        config = SheetConfig(locale="de_DE")
+
+        with MessyWorkbook(file_path, sheet_config=config) as mwb:
+            df = mwb.to_dataframe()
+
+            import pandas as pd
+
+            assert pd.api.types.is_numeric_dtype(df["amount"]), (
+                f"Comma-decimal was not converted to numeric (dtype={df['amount'].dtype})"
+            )
+            assert df.iloc[0]["amount"] == pytest.approx(1.23)
+            assert df.iloc[1]["amount"] == pytest.approx(4.56)
 
     def test_merged_cells_dont_crash(self, temp_dir):
         """Regression: Merged cells should not crash parser."""

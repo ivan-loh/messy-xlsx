@@ -148,11 +148,11 @@ class TestStructureDetection:
         with MessyWorkbook(messy_xlsx) as workbook:
             structure = workbook.get_structure()
 
-            # Should detect metadata rows
-            assert len(structure.metadata_rows) >= 0
+            # messy_xlsx fixture has 2 metadata rows before headers
+            assert len(structure.metadata_rows) >= 1
 
-            # Should detect formulas
-            assert structure.has_formulas is True or structure.has_formulas is False
+            # messy_xlsx fixture contains formulas
+            assert structure.has_formulas is True
 
 
 class TestFormatDetection:

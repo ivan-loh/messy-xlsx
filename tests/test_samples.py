@@ -17,10 +17,10 @@ class TestSampleFiles:
     """Test all sample files can be processed."""
 
     def test_can_open_workbook(self, sample_file):
-        """Test that workbook can be opened."""
+        """Test that workbook can be opened with valid sheet names."""
         with MessyWorkbook(sample_file) as wb:
-            assert wb is not None
-            assert len(wb.sheet_names) > 0
+            assert len(wb.sheet_names) >= 1
+            assert all(isinstance(name, str) for name in wb.sheet_names)
 
     def test_format_detection(self, sample_file):
         """Test that format is correctly detected."""
@@ -28,25 +28,28 @@ class TestSampleFiles:
             assert wb.format_type in ["xlsx", "xlsm", "xls", "csv"]
 
     def test_structure_detection(self, sample_file):
-        """Test that structure can be analyzed."""
+        """Test that structure can be analyzed with valid bounds."""
         with MessyWorkbook(sample_file) as wb:
             sheet_name = wb.sheet_names[0]
             structure = wb.get_structure(sheet_name)
 
-            assert structure is not None
             assert structure.data_start_row >= 1
             assert structure.data_end_row >= structure.data_start_row
-            assert structure.num_tables >= 0
+            assert structure.num_tables >= 1
             assert structure.detected_locale in ["en_US", "de_DE", "unknown"]
 
     def test_can_parse_to_dataframe(self, sample_file):
-        """Test that file can be parsed to DataFrame."""
+        """Test that file can be parsed to a non-empty DataFrame."""
         with MessyWorkbook(sample_file) as wb:
             sheet_name = wb.sheet_names[0]
             df = wb.to_dataframe(sheet_name)
 
-            assert df is not None
+            assert len(df) > 0, f"DataFrame has no rows for {sample_file.name}"
             assert len(df.columns) > 0
+            # Column names should be unique after sanitization
+            assert len(df.columns) == len(set(df.columns)), (
+                f"Duplicate columns in {sample_file.name}: {list(df.columns)}"
+            )
 
     def test_multi_sheet_parsing(self, sample_file):
         """Test parsing all sheets in workbook."""

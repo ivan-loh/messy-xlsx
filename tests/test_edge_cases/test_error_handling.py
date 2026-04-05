@@ -34,8 +34,11 @@ class TestFormulaErrors:
 
         with MessyWorkbook(file_path, formula_config=config) as mwb:
             df = mwb.to_dataframe()
-            # Should handle errors gracefully
-            assert len(df) >= 0
+            # Should handle errors gracefully — some rows may be dropped
+            # during normalization (missing value cleanup), but we should
+            # get at least some data rows back
+            assert len(df) >= 1
+            assert "error_type" in df.columns
 
 
 class TestCircularReferences:
@@ -254,7 +257,7 @@ class TestUnsupportedFunctions:
 
         with MessyWorkbook(file_path, formula_config=config) as mwb:
             df = mwb.to_dataframe()
-            assert len(df) >= 0
+            assert len(df) == 1
 
 
 # ============================================================================

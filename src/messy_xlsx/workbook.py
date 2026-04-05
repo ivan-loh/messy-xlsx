@@ -95,6 +95,15 @@ class MessyWorkbook:
                 file_path=str(file_desc),
             )
 
+        if self._format_info.format_type == "xlsb":
+            file_desc = self._filename_hint or self._file_path or "<stream>"
+            raise FormatError(
+                "XLSB (Excel Binary) format is not supported. "
+                "Please convert the file to XLSX format.",
+                file_path=str(file_desc),
+                detected_format="xlsb",
+            )
+
         # Validate extension matches detected format for Excel files
         # This catches files with .xlsx extension but different content
         if not self._is_fileobj and self._file_path is not None:
@@ -129,15 +138,7 @@ class MessyWorkbook:
                 )
 
         self._sheets: dict[str, MessySheet] = {}
-
-        if self._formula_config.mode != FormulaEvaluationMode.DISABLED:  # noqa: SIM102
-            if self._formula_engine.is_available:
-                try:
-                    formula_source = self._file_path or self._file_buffer
-                    if formula_source is not None:
-                        self._formula_engine.load_workbook(formula_source)  # type: ignore[arg-type]
-                except (OSError, ValueError, TypeError) as e:
-                    logger.debug("Formula engine load failed: %s", e)
+        self._formula_loaded = False
 
         self._wb: openpyxl.Workbook | None = None
 
@@ -244,6 +245,7 @@ class MessyWorkbook:
     ) -> CellValue:
         """Get a single cell value."""
         self._ensure_workbook()
+        self._ensure_formula_engine()
 
         if self._wb is None:
             raise FileError("Workbook not loaded — call _ensure_workbook() first")
@@ -309,6 +311,11 @@ class MessyWorkbook:
         else:
             effective_config = config
 
+        # Enable CSV metadata/header auto-detection when auto_detect is on
+        auto_detect_header = (
+            config.auto_detect and self.format_type in ("csv", "tsv", "txt")
+        )
+
         parse_options = ParseOptions(
             skip_rows=effective_config.skip_rows,
             header_rows=effective_config.header_rows,
@@ -317,6 +324,7 @@ class MessyWorkbook:
             ignore_hidden=not effective_config.include_hidden,
             cell_range=effective_config.cell_range,
             data_only=True,
+            auto_detect_header=auto_detect_header,
         )
 
         # Reset buffer position before parsing
@@ -342,9 +350,15 @@ class MessyWorkbook:
                 df = df.rename(columns=effective_config.column_renames)
             return df
 
+        # Derive decimal/thousands separators from locale if provided
+        decimal_sep = None
+        thousands_sep = None
+        if effective_config.locale and effective_config.locale != "auto":
+            decimal_sep, thousands_sep = self._locale_to_separators(effective_config.locale)
+
         pipeline = NormalizationPipeline(
-            decimal_separator=None,
-            thousands_separator=None,
+            decimal_separator=decimal_sep,
+            thousands_separator=thousands_sep,
         )
 
         type_hints = effective_config.type_hints.copy()
@@ -422,6 +436,14 @@ class MessyWorkbook:
                 and structure.header_confidence >= config.header_confidence_threshold
             ):
                 skip_rows = max(0, structure.header_row - 1)
+                # Adjust for hidden rows: skip_rows is based on raw row numbers,
+                # but the handler removes hidden rows before applying the offset.
+                # Subtract hidden rows that appear before the header row.
+                if structure.hidden_rows and not config.include_hidden:
+                    hidden_before_header = sum(
+                        1 for r in structure.hidden_rows if r < structure.header_row
+                    )
+                    skip_rows = max(0, skip_rows - hidden_before_header)
                 header_rows = structure.header_rows_count
             else:
                 # Fallback logic
@@ -445,6 +467,12 @@ class MessyWorkbook:
                 and structure.header_confidence >= config.header_confidence_threshold
             ):
                 skip_rows = max(0, structure.header_row - 1)
+                # Adjust for hidden rows (same as auto mode)
+                if structure.hidden_rows and not config.include_hidden:
+                    hidden_before_header = sum(
+                        1 for r in structure.hidden_rows if r < structure.header_row
+                    )
+                    skip_rows = max(0, skip_rows - hidden_before_header)
                 header_rows = structure.header_rows_count
             else:
                 skip_rows = config.skip_rows
@@ -452,12 +480,27 @@ class MessyWorkbook:
 
         # "manual" mode: just use config values (no changes)
 
+        # Determine skip_footer: user override > multi-table constraint > detected footer
+        skip_footer = structure.suggested_skip_footer
+        if config.skip_footer > 0:
+            skip_footer = config.skip_footer
+        # When multiple tables detected, constrain to the first table
+        elif structure.num_tables > 1 and structure.table_ranges:
+            first_table_end = structure.table_ranges[0]["end_row"]
+            rows_after_first_table = structure.data_end_row - first_table_end
+            # Adjust for hidden rows that will be removed from after the first table
+            if structure.hidden_rows and not config.include_hidden:
+                hidden_after = sum(
+                    1 for r in structure.hidden_rows if r > first_table_end
+                )
+                rows_after_first_table -= hidden_after
+            if rows_after_first_table > 0:
+                skip_footer = max(skip_footer, rows_after_first_table)
+
         return SheetConfig(
             skip_rows=skip_rows,
             header_rows=header_rows,
-            skip_footer=config.skip_footer
-            if config.skip_footer > 0
-            else structure.suggested_skip_footer,
+            skip_footer=skip_footer,
             cell_range=config.cell_range,
             column_renames=config.column_renames,
             type_hints=config.type_hints,
@@ -481,6 +524,37 @@ class MessyWorkbook:
             sanitize_column_names=config.sanitize_column_names,
         )
 
+    @staticmethod
+    def _locale_to_separators(locale_str: str) -> tuple[str | None, str | None]:
+        """Convert locale string to (decimal_separator, thousands_separator).
+
+        Returns (decimal_sep, thousands_sep). For locales where the thousands
+        separator is a space (FR, SE, RU, etc.), we return " " so the number
+        normalizer strips spaces before parsing.
+        """
+        lang = locale_str.split("_")[0].lower()
+        country = locale_str.split("_")[1].upper() if "_" in locale_str else ""
+
+        # Swiss German uses period as decimal (unlike other German)
+        if lang == "de" and country == "CH":
+            return ".", "'"
+
+        # Comma-decimal with period thousands (DE, NL, IT, ES, PT, etc.)
+        comma_decimal_dot_thousands = {
+            "de", "nl", "it", "es", "pt", "el", "tr", "id",
+        }
+        # Comma-decimal with space thousands (FR, SE, NO, FI, PL, RU, etc.)
+        comma_decimal_space_thousands = {
+            "fr", "sv", "nb", "nn", "fi", "pl", "cs", "sk", "hu",
+            "ro", "bg", "hr", "sl", "sr", "da", "ru", "uk",
+        }
+
+        if lang in comma_decimal_dot_thousands:
+            return ",", "."
+        if lang in comma_decimal_space_thousands:
+            return ",", " "
+        return ".", ","
+
     def _sanitize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """Sanitize column names for BigQuery compatibility."""
         from .utils import sanitize_column_name
@@ -502,6 +576,21 @@ class MessyWorkbook:
 
         df.columns = new_columns
         return df
+
+    def _ensure_formula_engine(self) -> None:
+        """Lazily load formula engine on first get_cell() call."""
+        if self._formula_loaded:
+            return
+        self._formula_loaded = True
+
+        if self._formula_config.mode != FormulaEvaluationMode.DISABLED:
+            if self._formula_engine.is_available:
+                try:
+                    formula_source = self._file_path or self._file_buffer
+                    if formula_source is not None:
+                        self._formula_engine.load_workbook(formula_source)  # type: ignore[arg-type]
+                except (OSError, ValueError, TypeError) as e:
+                    logger.debug("Formula engine load failed: %s", e)
 
     def _ensure_workbook(self) -> None:
         """Ensure openpyxl workbook is loaded."""

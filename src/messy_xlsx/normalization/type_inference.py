@@ -81,14 +81,18 @@ DATE_PATTERNS = [
     r".*start.*",
     r".*end.*",
     r".*period.*",
-    r".*year.*",
-    r".*month.*",
-    r".*day.*",
     r".*born.*",
     r".*birth.*",
     r".*expir.*",
     r".*valid.*",
 ]
+
+# Standalone temporal component names should be treated as numeric, not dates.
+# "year", "month", "day" by themselves are typically numeric columns (e.g., year=2024).
+# Only compound names like "birth_date" or "start_day" should be treated as dates.
+_STANDALONE_TEMPORAL_COMPONENTS = re.compile(
+    r"^(year|month|day|fiscal.?year)$", re.IGNORECASE
+)
 
 
 # ============================================================================
@@ -113,6 +117,10 @@ class SemanticTypeInference:
     def _infer_from_name(self, col_name: str) -> str | None:
         """Infer type from column name."""
         col_lower = col_name.lower().strip()
+
+        # Standalone temporal component names (year, month, day) are numeric, not dates
+        if _STANDALONE_TEMPORAL_COMPONENTS.match(col_lower):
+            return "DECIMAL"
 
         for pattern in DATE_PATTERNS:
             if re.match(pattern, col_lower):
@@ -141,7 +149,11 @@ class SemanticTypeInference:
             if col not in df.columns:
                 continue
 
-            actual_dtype = str(df[col].dtype)
+            column_positions = [idx for idx, name in enumerate(df.columns) if name == col]
+            if not column_positions:
+                continue
+
+            actual_dtype = str(df.iloc[:, column_positions[0]].dtype)
 
             if expected_type == "DECIMAL":
                 if "datetime" in actual_dtype or "timestamp" in actual_dtype:

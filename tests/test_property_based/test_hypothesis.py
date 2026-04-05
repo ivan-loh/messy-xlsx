@@ -1,6 +1,7 @@
 """Property-based tests using hypothesis."""
 
 import openpyxl
+import pandas as pd
 import pytest
 
 pytest.importorskip("hypothesis")
@@ -64,7 +65,7 @@ class TestPropertyBased:
         max_examples=20, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture]
     )
     def test_any_text_value(self, temp_dir, text_value):
-        """Test parser handles any text value."""
+        """Test parser handles any text value without crashing."""
         file_path = temp_dir / "text_test.xlsx"
 
         wb = openpyxl.Workbook()
@@ -83,7 +84,20 @@ class TestPropertyBased:
 
         with MessyWorkbook(file_path) as mwb:
             df = mwb.to_dataframe()
-            assert df is not None
+            # Empty/blank text values may be cleaned by missing-value normalization,
+            # resulting in 0 rows. Non-empty values must produce exactly 1 row.
+            # Some text values can legitimately produce 0 rows:
+            # - Missing value patterns (na, null, none, etc.) get cleaned
+            # - Footer-like words (sum, total, subtotal) get skipped by structure detection
+            # - Empty/whitespace-only values get dropped
+            # For all other values, we should get exactly 1 row.
+            footer_words = {"sum", "total", "subtotal", "grand total"}
+            missing_words = {"na", "n/a", "null", "none", "-", "--", "nan", "missing"}
+            stripped = text_value.strip().lower()
+            if stripped and stripped not in missing_words and stripped not in footer_words:
+                assert len(df) == 1
+            else:
+                assert len(df) <= 1
 
     @given(st.floats(allow_nan=False, allow_infinity=False))
     @settings(
@@ -102,7 +116,8 @@ class TestPropertyBased:
 
         with MessyWorkbook(file_path) as mwb:
             df = mwb.to_dataframe()
-            assert df is not None
+            # Must produce exactly 1 row
+            assert len(df) == 1
 
 
 class TestFuzzTesting:
@@ -142,11 +157,14 @@ class TestFuzzTesting:
         wb.save(file_path)
         wb.close()
 
+        from messy_xlsx.exceptions import MessyXlsxError
+
         try:
             with MessyWorkbook(file_path) as mwb:
                 df = mwb.to_dataframe()
-                # Should not crash
-                assert df is not None
-        except Exception:
-            # Some random data might be unparseable, that's ok
+                # Must produce a valid DataFrame with consistent shape
+                assert isinstance(df, pd.DataFrame)
+                assert all(isinstance(c, str) for c in df.columns)
+        except MessyXlsxError:
+            # Known library errors on unparseable data are acceptable
             pass

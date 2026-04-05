@@ -44,12 +44,12 @@ class TestStructureAnalyzer:
             assert structure.data_end_col >= structure.data_start_col
 
     def test_detect_formulas(self, messy_xlsx):
-        """Test formula detection."""
+        """Test formula detection on a workbook known to contain formulas."""
         with MessyWorkbook(messy_xlsx) as wb:
             structure = wb.get_structure("Report")
 
-            # messy_xlsx has formulas
-            assert isinstance(structure.has_formulas, bool)
+            # messy_xlsx fixture has formulas (=B5+C5, =SUM(...), etc.)
+            assert structure.has_formulas is True
 
     def test_merged_cell_detection(self, merged_cells_xlsx):
         """Test merged cell detection."""
@@ -64,7 +64,9 @@ class TestStructureAnalyzer:
             structure = wb.get_structure("Data")
 
             # Should detect 2 tables separated by blank rows
-            assert structure.num_tables >= 1
+            assert structure.num_tables == 2, (
+                f"Expected 2 tables, detected {structure.num_tables}"
+            )
 
     def test_locale_detection(self, european_xlsx):
         """Test locale detection."""

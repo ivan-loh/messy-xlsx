@@ -31,9 +31,10 @@ class TypeCoercionNormalizer:
         """
         df = df.copy()
 
-        for col in df.columns:
-            if df[col].dtype == object:
-                df[col] = self._coerce_object_column(df[col])
+        for idx, _col in enumerate(df.columns):
+            series = df.iloc[:, idx]
+            if series.dtype == object:
+                df.isetitem(idx, self._coerce_object_column(series))
 
         return df
 

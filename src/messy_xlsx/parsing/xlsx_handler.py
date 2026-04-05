@@ -136,7 +136,7 @@ class XLSXHandler(FormatHandler):
         options: ParseOptions,
     ) -> pd.DataFrame:
         """Fallback path using openpyxl for advanced features."""
-        read_only = options.merge_strategy == "skip"
+        read_only = options.merge_strategy == "skip" and not options.ignore_hidden
         is_stream = is_fileobj(file_source)
         file_desc = get_file_desc(file_source)
 
@@ -210,7 +210,8 @@ class XLSXHandler(FormatHandler):
             raise FormatError(f"Invalid cell range: {cell_range}", detected_format="xlsx") from e
 
     def _read_full_sheet(self, ws: Any, ignore_hidden: bool) -> list[list[Any]]:
-        hidden_rows, hidden_cols = set(), set()
+        hidden_rows: set[int] = set()
+        hidden_cols: set[str] = set()
 
         if ignore_hidden:
             hidden_rows = {r for r, d in ws.row_dimensions.items() if d.hidden}
@@ -221,7 +222,16 @@ class XLSXHandler(FormatHandler):
             if row_idx in hidden_rows:
                 continue
 
-            row_values = [cell.value for cell in row if cell.column_letter not in hidden_cols]
+            if hidden_cols:
+                from openpyxl.utils import get_column_letter
+
+                row_values = [
+                    cell.value
+                    for cell in row
+                    if get_column_letter(cell.column) not in hidden_cols
+                ]
+            else:
+                row_values = [cell.value for cell in row]
             data.append(row_values)
 
         return data

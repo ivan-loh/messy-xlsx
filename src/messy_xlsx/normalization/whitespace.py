@@ -7,6 +7,7 @@
 import re
 
 import pandas as pd
+from pandas.api.types import is_object_dtype, is_string_dtype
 
 # ============================================================================
 # Compiled patterns (avoid recompiling on each call)
@@ -34,8 +35,13 @@ class WhitespaceNormalizer:
         """Normalize whitespace in all string columns."""
         df = df.copy()
 
-        for col in df.select_dtypes(include=["object"]).columns:
-            df[col] = self._normalize_column(df[col], preserve_linebreaks)
+        string_positions = [
+            idx
+            for idx, dtype in enumerate(df.dtypes)
+            if is_object_dtype(dtype) or is_string_dtype(dtype)
+        ]
+        for idx in string_positions:
+            df.isetitem(idx, self._normalize_column(df.iloc[:, idx], preserve_linebreaks))
 
         return df
 

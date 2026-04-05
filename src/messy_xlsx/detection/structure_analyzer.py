@@ -97,43 +97,50 @@ class StructureAnalyzer:
             tables = self._detect_multiple_tables(ws, data_region, header_info)
             locale_info = self.locale_detector.detect(ws, data_region)
             blank_rows = self._detect_blank_rows(ws, data_region)
-            has_formulas = self._detect_formulas(ws, data_region)
             sparse_columns = self._detect_sparse_columns(ws, data_region)
 
-            result = StructureInfo(
-                data_start_row=data_region["start_row"],
-                data_end_row=data_region["end_row"],
-                data_start_col=data_region["start_col"],
-                data_end_col=data_region["end_col"],
-                header_row=header_info.get("header_row"),
-                header_rows_count=header_info.get("header_rows_count", 1),
-                header_confidence=header_info.get("confidence", 0.0),
-                metadata_rows=metadata,
-                merged_ranges=merged,
-                merged_in_headers=self._check_merged_in_headers(merged, header_info),
-                merged_in_data=self._check_merged_in_data(merged, header_info),
-                hidden_rows=hidden_rows,
-                hidden_columns=hidden_cols,
-                detected_locale=locale_info.locale,
-                decimal_separator=locale_info.decimal_separator,
-                thousands_separator=locale_info.thousands_separator,
-                num_tables=len(tables),
-                table_ranges=[self._table_to_dict(t) for t in tables],
-                blank_rows=blank_rows,
-                has_formulas=has_formulas,
-                sparse_columns=sparse_columns,
-                suggested_skip_rows=self._suggest_skip_rows(metadata, header_info),
-                suggested_skip_footer=self._suggest_skip_footer(ws, data_region),
-            )
-
-            # Only cache for file paths
-            if file_path:
-                self.cache.put(file_path, sheet, result)
-
-            return result
+            # Collect all results that depend on the open workbook
+            suggested_skip_rows = self._suggest_skip_rows(metadata, header_info)
+            suggested_skip_footer = self._suggest_skip_footer(ws, data_region)
 
         finally:
             wb.close()
+
+        # Formula detection needs a separate data_only=False pass.
+        # Must run AFTER the first workbook is closed to avoid stream corruption.
+        has_formulas = self._detect_formulas_from_source(file_source, sheet, data_region)
+
+        result = StructureInfo(
+            data_start_row=data_region["start_row"],
+            data_end_row=data_region["end_row"],
+            data_start_col=data_region["start_col"],
+            data_end_col=data_region["end_col"],
+            header_row=header_info.get("header_row"),
+            header_rows_count=header_info.get("header_rows_count", 1),
+            header_confidence=header_info.get("confidence", 0.0),
+            metadata_rows=metadata,
+            merged_ranges=merged,
+            merged_in_headers=self._check_merged_in_headers(merged, header_info),
+            merged_in_data=self._check_merged_in_data(merged, header_info),
+            hidden_rows=hidden_rows,
+            hidden_columns=hidden_cols,
+            detected_locale=locale_info.locale,
+            decimal_separator=locale_info.decimal_separator,
+            thousands_separator=locale_info.thousands_separator,
+            num_tables=len(tables),
+            table_ranges=[self._table_to_dict(t) for t in tables],
+            blank_rows=blank_rows,
+            has_formulas=has_formulas,
+            sparse_columns=sparse_columns,
+            suggested_skip_rows=suggested_skip_rows,
+            suggested_skip_footer=suggested_skip_footer,
+        )
+
+        # Only cache for file paths
+        if file_path:
+            self.cache.put(file_path, sheet, result)
+
+        return result
 
     def _detect_data_region(self, ws: Any) -> dict[str, int]:
         """Find the boundaries of actual data."""
@@ -235,6 +242,7 @@ class StructureAnalyzer:
 
         best_header_row = None
         best_confidence = 0.0
+        best_underscore_count = 0
 
         for row_idx in range(start_row, end_row + 1):
             row_values = []
@@ -327,9 +335,17 @@ class StructureAnalyzer:
                 if pattern_matches > 0:
                     confidence += min(0.15, 0.05 * pattern_matches)
 
-            if confidence > best_confidence:
+            # Tiebreaker for multi-row headers: actual column-name rows
+            # typically contain underscores (snake_case) while sub-category
+            # rows ("Timing", "Identifiers") don't.
+            underscore_count = sum(1 for v in non_empty if "_" in str(v))
+
+            if confidence > best_confidence or (
+                confidence == best_confidence and underscore_count > best_underscore_count
+            ):
                 best_confidence = confidence
                 best_header_row = row_idx
+                best_underscore_count = underscore_count
 
         if best_header_row is not None:
             return {
@@ -483,8 +499,23 @@ class StructureAnalyzer:
         end = data_region["end_row"]
 
         sample_rows: list[int] = []
+        # Sample first and last 300 rows
         sample_rows.extend(range(start, min(start + 300, end + 1)))
         sample_rows.extend(range(max(start, end - 300), end + 1))
+        # Also sample evenly throughout the middle to catch separators
+        total = end - start + 1
+        if total > 600:
+            step = max(1, (total - 600) // 20)
+            sample_rows.extend(range(start + 300, end - 300, step))
+            # For each sampled point, also check a few rows around it
+            # to detect multi-row blank separators
+            extra = []
+            for r in range(start + 300, end - 300, step):
+                for offset in range(-2, 3):
+                    candidate = r + offset
+                    if start <= candidate <= end:
+                        extra.append(candidate)
+            sample_rows.extend(extra)
 
         blank_rows = []
         for row_idx in sorted(set(sample_rows)):
@@ -503,23 +534,42 @@ class StructureAnalyzer:
 
         return blank_rows
 
-    def _detect_formulas(self, ws: Any, data_region: dict[str, int]) -> bool:
-        """Check if sheet contains formulas."""
-        total_rows = data_region["end_row"] - data_region["start_row"] + 1
+    def _detect_formulas_from_source(
+        self,
+        file_source: FileSource,
+        sheet: str,
+        data_region: dict[str, int],
+    ) -> bool:
+        """Check if sheet contains formulas using a data_only=False pass."""
+        try:
+            is_fileobj = hasattr(file_source, "read")
+            if is_fileobj and hasattr(file_source, "seek"):
+                file_source.seek(0)
 
-        sample_rows = min(50, total_rows)
-        sample_cols = min(10, data_region["end_col"] - data_region["start_col"] + 1)
+            wb2 = openpyxl.load_workbook(file_source, read_only=True, data_only=False)
+            try:
+                ws2 = wb2[sheet]
+                total_rows = data_region["end_row"] - data_region["start_row"] + 1
+                sample_rows = min(50, total_rows)
+                sample_cols = min(10, data_region["end_col"] - data_region["start_col"] + 1)
 
-        for row_idx in range(data_region["start_row"], data_region["start_row"] + sample_rows):
-            for col_idx in range(data_region["start_col"], data_region["start_col"] + sample_cols):
-                try:
-                    cell = ws.cell(row_idx, col_idx)
-                    if cell.data_type == "f":
-                        return True
-                except Exception:
-                    pass
-
-        return False
+                for row_idx in range(
+                    data_region["start_row"], data_region["start_row"] + sample_rows
+                ):
+                    for col_idx in range(
+                        data_region["start_col"], data_region["start_col"] + sample_cols
+                    ):
+                        try:
+                            cell = ws2.cell(row_idx, col_idx)
+                            if cell.data_type == "f":
+                                return True
+                        except Exception:
+                            pass
+                return False
+            finally:
+                wb2.close()
+        except Exception:
+            return False
 
     def _detect_sparse_columns(self, ws: Any, data_region: dict[str, int]) -> list[int]:
         """Identify columns that are >90% empty within the data region."""
@@ -609,21 +659,50 @@ class StructureAnalyzer:
         return 0
 
     def _suggest_skip_footer(self, ws: Any, data_region: dict[str, int]) -> int:
-        """Suggest number of footer rows to skip."""
+        """Suggest number of footer rows to skip.
+
+        Only strips rows that are clearly footer metadata (attribution, notes,
+        generation info). Does NOT strip "Total" or "Grand Total" rows since
+        those often contain legitimate summary data that users expect to see.
+        Scans past blank rows to catch footers separated by gaps.
+        """
+        import re
+
+        footer_patterns = [
+            re.compile(r"\bprepared\s+by\b", re.I),
+            re.compile(r"\bnotes?\s*:", re.I),
+            re.compile(r"\bgenerated\s+(on|at|by)\b", re.I),
+            re.compile(r"\breport\s+generated\b", re.I),
+            re.compile(r"\bsource\s*:", re.I),
+            re.compile(r"\bdisclaimer\b", re.I),
+            re.compile(r"\bconfidential\b", re.I),
+            re.compile(r"\bvalues\s+subject\s+to\b", re.I),
+        ]
+
         skip = 0
-        for row_idx in range(data_region["end_row"], max(1, data_region["end_row"] - 5), -1):
+        blank_streak = 0
+
+        for row_idx in range(data_region["end_row"], max(1, data_region["end_row"] - 10), -1):
             row_values = []
             for col_idx in range(data_region["start_col"], data_region["end_col"] + 1):
                 try:
                     cell = ws.cell(row_idx, col_idx)
                     if cell.value is not None:
-                        row_values.append(str(cell.value).lower())
+                        row_values.append(str(cell.value))
                 except Exception:
                     pass
 
+            if not row_values:
+                blank_streak += 1
+                if blank_streak <= 3:
+                    skip += 1
+                    continue
+                break
+
             row_text = " ".join(row_values)
-            if any(kw in row_text for kw in ["total", "sum", "subtotal", "grand total"]):
+            if any(p.search(row_text) for p in footer_patterns):
                 skip += 1
+                blank_streak = 0
             else:
                 break
 

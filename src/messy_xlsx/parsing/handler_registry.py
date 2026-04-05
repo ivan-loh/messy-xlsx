@@ -89,8 +89,13 @@ class HandlerRegistry:
         except Exception as e:
             errors.append(f"{handler.__class__.__name__}: {e}")
 
+        # Only fall back to compatible handlers — don't try CSV for Excel files
+        excel_formats = {"xlsx", "xlsm", "xls", "xltx", "xltm"}
         for fallback_handler in self.handlers:
             if fallback_handler == handler:
+                continue
+            # CSV handler will parse raw ZIP binary as text — never use for Excel
+            if isinstance(fallback_handler, CSVHandler) and format_type in excel_formats:
                 continue
 
             try:

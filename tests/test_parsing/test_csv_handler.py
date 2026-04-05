@@ -64,3 +64,41 @@ class TestCSVHandler:
 
         assert len(sheet_names) == 1
         assert sheet_names[0] == "Sheet1"
+
+
+class TestCSVMetadataDetectionIntegration:
+    """Test CSV metadata/header detection through MessyWorkbook."""
+
+    def test_messy_csv_metadata_skipped(self, temp_dir):
+        """Messy CSV with title/metadata rows should auto-detect the real header."""
+        from messy_xlsx import MessyWorkbook
+
+        csv_file = temp_dir / "messy_report.csv"
+        # Metadata rows must have same delimiter so parser reads all columns
+        csv_file.write_text(
+            "Report: Sales,\n"
+            "Generated: 2024-01-01,\n"
+            "Name,Amount\n"
+            "Alice,10\n"
+            "Bob,20\n"
+        )
+
+        with MessyWorkbook(csv_file) as wb:
+            df = wb.to_dataframe()
+
+            # auto_detect_header is now wired through — metadata rows should be skipped
+            assert len(df.columns) == 2
+            assert len(df) == 2
+
+    def test_auto_detect_header_passed_to_csv(self, temp_dir):
+        """Verify auto_detect_header flag reaches CSVHandler from MessyWorkbook."""
+        from messy_xlsx import MessyWorkbook, SheetConfig
+
+        csv_file = temp_dir / "simple.csv"
+        csv_file.write_text("Name,Amount\nAlice,10\nBob,20\n")
+
+        # With auto_detect enabled, CSVHandler should receive auto_detect_header=True
+        with MessyWorkbook(csv_file, sheet_config=SheetConfig(auto_detect=True)) as wb:
+            df = wb.to_dataframe()
+            assert len(df) == 2
+            assert "Name" in df.columns or "name" in df.columns

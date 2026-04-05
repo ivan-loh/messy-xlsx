@@ -61,6 +61,7 @@ def csv_1000_rows(temp_dir):
 # ============================================================================
 
 
+@pytest.mark.slow
 class TestParseBenchmarks:
     """Benchmark core parsing operations."""
 
@@ -123,6 +124,7 @@ class TestParseBenchmarks:
 # ============================================================================
 
 
+@pytest.mark.slow
 class TestStructureDetectionBenchmarks:
     """Benchmark structure analysis operations."""
 

@@ -111,19 +111,18 @@ class TestConfigurationChaining:
     """Test chaining configuration options."""
 
     def test_combined_config_options(self, messy_xlsx):
-        """Test multiple config options together."""
+        """Test multiple config options together produce valid output."""
         config = SheetConfig(
             auto_detect=True,
             header_detection_mode="smart",
             merge_strategy="fill",
-            locale="auto",
-            evaluate_formulas=True,
             include_hidden=False,
         )
 
         with MessyWorkbook(messy_xlsx, sheet_config=config) as wb:
             df = wb.to_dataframe()
-            assert df is not None
+            assert len(df) > 0
+            assert len(df.columns) > 0
 
     def test_type_hints_and_renames(self, temp_dir):
         """Test type hints with column renames."""

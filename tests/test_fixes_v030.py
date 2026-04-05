@@ -81,6 +81,33 @@ class TestDateParsingFix:
             assert pd.api.types.is_datetime64_any_dtype(df["order_date"])
             assert pd.api.types.is_datetime64_any_dtype(df["created_timestamp"])
 
+    def test_year_column_not_converted_to_date(self, temp_dir):
+        """Regression: numeric 'year' column must stay numeric, not become serial dates."""
+        file_path = temp_dir / "year_column.xlsx"
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["year", "month", "day", "value"])
+        ws.append([2024, 1, 15, 100])
+        ws.append([2025, 2, 20, 200])
+        ws.append([2022, 12, 25, 300])
+        wb.save(file_path)
+        wb.close()
+
+        with MessyWorkbook(file_path) as mwb:
+            df = mwb.to_dataframe()
+
+            # year, month, day must remain numeric — never datetime
+            for col in ["year", "month", "day"]:
+                assert not pd.api.types.is_datetime64_any_dtype(df[col]), (
+                    f"Column '{col}' was incorrectly converted to datetime"
+                )
+
+            # Values must be preserved exactly
+            assert df["year"].iloc[0] == 2024
+            assert df["month"].iloc[0] == 1
+            assert df["day"].iloc[0] == 15
+
     def test_explicit_timestamp_hint_converts_numeric(self, temp_dir):
         """Explicit TIMESTAMP hint should convert numeric values to dates."""
         file_path = temp_dir / "explicit_dates.xlsx"
@@ -376,6 +403,11 @@ class TestColumnNamePatternMatching:
             ("birth_date", True),
             ("start_date", True),
             ("end_date", True),
+            # Standalone temporal component names (numeric, not dates)
+            ("year", False),
+            ("month", False),
+            ("day", False),
+            ("fiscal_year", False),
             # Non-date names (should NOT be converted even if values are in range)
             ("count", False),
             ("total", False),

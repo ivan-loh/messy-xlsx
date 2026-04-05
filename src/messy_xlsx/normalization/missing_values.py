@@ -137,8 +137,9 @@ class MissingValueHandler:
         # Pre-compute missing values set for O(1) lookups
         missing_set = set(self.missing_values)
 
-        for col in df.columns:
-            col_dtype = df[col].dtype
+        for idx, _col in enumerate(df.columns):
+            series = df.iloc[:, idx].copy()
+            col_dtype = series.dtype
 
             # Determine appropriate null value
             if col_dtype == "object":
@@ -164,17 +165,19 @@ class MissingValueHandler:
                 null_value = pd.NA
 
             # Vectorized replacement using isin() - single pass instead of N passes
-            mask = df[col].isin(missing_set)
+            mask = series.isin(missing_set)
             if mask.any():
-                df.loc[mask, col] = null_value
+                series.loc[mask] = null_value
 
             # Handle empty strings (for object dtype and StringDtype)
             is_string_type = col_dtype == "object" or isinstance(col_dtype, pd.StringDtype)
             if self.empty_string_as_na and is_string_type:
                 # Empty string and whitespace-only in single mask operation
-                str_series = df[col].astype(str)
-                empty_mask = (df[col] == "") | str_series.str.fullmatch(r"\s*", na=False)
+                str_series = series.astype(str)
+                empty_mask = (series == "") | str_series.str.fullmatch(r"\s*", na=False)
                 if empty_mask.any():
-                    df.loc[empty_mask, col] = null_value
+                    series.loc[empty_mask] = null_value
+
+            df.isetitem(idx, series)
 
         return df

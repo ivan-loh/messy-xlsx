@@ -41,6 +41,10 @@ _DATE_COLUMN_PATTERNS = [
 _NON_DATE_COLUMN_PATTERNS = [
     re.compile(p)
     for p in [
+        r"(?i)^year$",
+        r"(?i)^month$",
+        r"(?i)^day$",
+        r"(?i)^fiscal.?year$",
         r"(?i)count",
         r"(?i)total",
         r"(?i)sum",
@@ -115,7 +119,9 @@ class DateNormalizer:
         df = df.copy()
         semantic_hints = semantic_hints or {}
 
-        for col in df.columns:
+        for idx, col in enumerate(df.columns):
+            series = df.iloc[:, idx]
+            col_name = str(col)
             # Skip if semantic hint says not a date
             if col in semantic_hints:
                 hint = semantic_hints[col].upper()
@@ -125,19 +131,19 @@ class DateNormalizer:
                     continue
                 # Explicitly marked as timestamp - always convert
                 if "TIMESTAMP" in hint or "DATE" in hint:
-                    if self._is_numeric_date_candidate(df[col]):
-                        df[col] = self._convert_excel_dates(df[col])
-                    elif self._looks_like_text_dates(df[col]):
-                        df[col] = self._convert_text_dates(df[col])
+                    if self._is_numeric_date_candidate(series):
+                        df.isetitem(idx, self._convert_excel_dates(series))
+                    elif self._looks_like_text_dates(series, col_name):
+                        df.isetitem(idx, self._convert_text_dates(series))
                     continue
 
             # For numeric columns, only convert if column name suggests it's a date
-            if self._is_numeric_date_candidate(df[col]):
-                if self._column_name_suggests_date(str(col)):
-                    df[col] = self._convert_excel_dates(df[col])
-            # For text columns, be more permissive
-            elif self._looks_like_text_dates(df[col]):
-                df[col] = self._convert_text_dates(df[col])
+            if self._is_numeric_date_candidate(series):
+                if self._column_name_suggests_date(col_name):
+                    df.isetitem(idx, self._convert_excel_dates(series))
+            # For text columns, check column name for ambiguous cases
+            elif self._looks_like_text_dates(series, col_name):
+                df.isetitem(idx, self._convert_text_dates(series))
 
         return df
 
@@ -165,28 +171,58 @@ class DateNormalizer:
 
         return bool((in_range & is_integer).mean() > 0.8)
 
-    def _looks_like_text_dates(self, series: pd.Series) -> bool:
+    def _looks_like_text_dates(self, series: pd.Series, col_name: str = "") -> bool:
         """Check if column contains text dates."""
         # Accept both object dtype and StringDtype
         is_string_type = series.dtype == object or isinstance(series.dtype, pd.StringDtype)
         if not is_string_type:
             return False
 
-        sample = series.dropna().head(20).astype(str)
+        sample = series.dropna().head(20)
         if len(sample) == 0:
             return False
 
-        # Try to detect format from sample first
-        detected_format = self._detect_date_format(sample)
+        # Reject columns where most values are purely numeric (int/float in object dtype)
+        # These are NOT dates — they're numbers that happen to be in an object column
+        numeric_count = sum(
+            1 for v in sample
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        )
+        if numeric_count > len(sample) * 0.5:
+            return False
+
+        str_sample = sample.astype(str)
+
+        # Reject columns where most string values look purely numeric
+        # (e.g., "1000", "2100", "850000.0") — pd.to_datetime parses these as years
+        _NUMERIC_LIKE = re.compile(r"^[+-]?[\d,.\s]+%?$")
+        numeric_str_count = sum(
+            1 for v in str_sample if _NUMERIC_LIKE.match(v.strip())
+        )
+        if numeric_str_count > len(str_sample) * 0.5:
+            return False
+
+        # Try to detect a specific date format from sample first.
+        # If values clearly match a known format (e.g., %Y-%m-%d), trust the format
+        # regardless of column name.
+        detected_format = self._detect_date_format(str_sample)
         if detected_format:
             return True
 
-        # Fallback to mixed format detection (slower)
+        # Fallback to mixed format detection — only if column name suggests dates.
+        # This prevents bare strings from being aggressively parsed as dates.
+        if not self._column_name_suggests_date(col_name):
+            return False
+
         try:
-            parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
-            return bool(parsed.notna().sum() > len(sample) * 0.5)
+            parsed = pd.to_datetime(str_sample, errors="coerce", format="mixed")
+            return bool(parsed.notna().sum() > len(str_sample) * 0.5)
         except Exception:
             return False
+
+    def _column_name_suggests_non_date(self, col_name: str) -> bool:
+        """Check if column name suggests it does NOT contain dates."""
+        return any(pattern.search(col_name) for pattern in _NON_DATE_COLUMN_PATTERNS)
 
     def _detect_date_format(self, sample: pd.Series) -> str | None:
         """Try to detect a consistent date format from sample."""
