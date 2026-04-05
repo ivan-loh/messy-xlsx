@@ -583,8 +583,7 @@ class MessyWorkbook:
             return
         self._formula_loaded = True
 
-        if self._formula_config.mode != FormulaEvaluationMode.DISABLED:
-            if self._formula_engine.is_available:
+        if self._formula_config.mode != FormulaEvaluationMode.DISABLED and self._formula_engine.is_available:
                 try:
                     formula_source = self._file_path or self._file_buffer
                     if formula_source is not None:

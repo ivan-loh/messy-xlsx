@@ -159,42 +159,7 @@ class NumberNormalizer:
         For each value, determine the decimal separator by looking at
         which separator appears last and is followed by exactly 1-2 digits.
         """
-
-        def _per_value(val: object) -> object:
-            if pd.isna(val):
-                return np.nan
-            s = str(val).strip()
-            s = _currency_pattern.sub("", s).strip()
-            # Accounting format
-            m = ACCOUNTING_PATTERN.match(s)
-            if m:
-                s = "-" + m.group(1).strip()
-            s = s.replace(" ", "")
-
-            has_comma_2 = bool(COMMA_DECIMAL_PATTERN.search(s))
-            has_dot_2 = bool(DOT_DECIMAL_PATTERN.search(s))
-
-            if has_comma_2 and has_dot_2:
-                # Both present — last separator is the decimal
-                if s.rfind(",") > s.rfind("."):
-                    s = s.replace(".", "").replace(",", ".")
-                else:
-                    s = s.replace(",", "")
-            elif has_comma_2:
-                s = s.replace(".", "").replace(",", ".")
-            elif has_dot_2:
-                s = s.replace(",", "")
-            else:
-                s = s.replace(",", "")
-
-            if not s or s in ("-", "+"):
-                return np.nan
-            try:
-                return float(s)
-            except ValueError:
-                return np.nan
-
-        result = series.apply(_per_value)
+        result = series.apply(self._normalize_mixed_value)
         result = pd.to_numeric(result, errors="coerce")
 
         original_nulls = series.isna()
@@ -202,6 +167,38 @@ class NumberNormalizer:
         if new_nulls.any():
             return series
         return result
+
+    @staticmethod
+    def _normalize_mixed_value(val: object) -> object:
+        """Normalize a single value with per-value locale detection."""
+        if pd.isna(val):
+            return np.nan
+        s = str(val).strip()
+        s = _currency_pattern.sub("", s).strip()
+        m = ACCOUNTING_PATTERN.match(s)
+        if m:
+            s = "-" + m.group(1).strip()
+        s = s.replace(" ", "")
+
+        comma_is_decimal = bool(COMMA_DECIMAL_PATTERN.search(s))
+        dot_is_decimal = bool(DOT_DECIMAL_PATTERN.search(s))
+
+        # When both separators present, the last one is the decimal
+        if comma_is_decimal and dot_is_decimal:
+            comma_is_decimal = s.rfind(",") > s.rfind(".")
+            dot_is_decimal = not comma_is_decimal
+
+        if comma_is_decimal:
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+
+        if not s or s in ("-", "+"):
+            return np.nan
+        try:
+            return float(s)
+        except ValueError:
+            return np.nan
 
     def _normalize_string_series(self, series: pd.Series) -> pd.Series:
         """Normalize a series of string values to numeric."""
