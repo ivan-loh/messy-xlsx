@@ -226,9 +226,7 @@ class XLSXHandler(FormatHandler):
                 from openpyxl.utils import get_column_letter
 
                 row_values = [
-                    cell.value
-                    for cell in row
-                    if get_column_letter(cell.column) not in hidden_cols
+                    cell.value for cell in row if get_column_letter(cell.column) not in hidden_cols
                 ]
             else:
                 row_values = [cell.value for cell in row]

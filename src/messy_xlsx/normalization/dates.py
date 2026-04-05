@@ -185,8 +185,7 @@ class DateNormalizer:
         # Reject columns where most values are purely numeric (int/float in object dtype)
         # These are NOT dates — they're numbers that happen to be in an object column
         numeric_count = sum(
-            1 for v in sample
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            1 for v in sample if isinstance(v, (int, float)) and not isinstance(v, bool)
         )
         if numeric_count > len(sample) * 0.5:
             return False
@@ -196,9 +195,7 @@ class DateNormalizer:
         # Reject columns where most string values look purely numeric
         # (e.g., "1000", "2100", "850000.0") — pd.to_datetime parses these as years
         _NUMERIC_LIKE = re.compile(r"^[+-]?[\d,.\s]+%?$")
-        numeric_str_count = sum(
-            1 for v in str_sample if _NUMERIC_LIKE.match(v.strip())
-        )
+        numeric_str_count = sum(1 for v in str_sample if _NUMERIC_LIKE.match(v.strip()))
         if numeric_str_count > len(str_sample) * 0.5:
             return False
 

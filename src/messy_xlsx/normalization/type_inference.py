@@ -90,9 +90,7 @@ DATE_PATTERNS = [
 # Standalone temporal component names should be treated as numeric, not dates.
 # "year", "month", "day" by themselves are typically numeric columns (e.g., year=2024).
 # Only compound names like "birth_date" or "start_day" should be treated as dates.
-_STANDALONE_TEMPORAL_COMPONENTS = re.compile(
-    r"^(year|month|day|fiscal.?year)$", re.IGNORECASE
-)
+_STANDALONE_TEMPORAL_COMPONENTS = re.compile(r"^(year|month|day|fiscal.?year)$", re.IGNORECASE)
 
 
 # ============================================================================

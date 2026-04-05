@@ -312,9 +312,7 @@ class MessyWorkbook:
             effective_config = config
 
         # Enable CSV metadata/header auto-detection when auto_detect is on
-        auto_detect_header = (
-            config.auto_detect and self.format_type in ("csv", "tsv", "txt")
-        )
+        auto_detect_header = config.auto_detect and self.format_type in ("csv", "tsv", "txt")
 
         parse_options = ParseOptions(
             skip_rows=effective_config.skip_rows,
@@ -490,9 +488,7 @@ class MessyWorkbook:
             rows_after_first_table = structure.data_end_row - first_table_end
             # Adjust for hidden rows that will be removed from after the first table
             if structure.hidden_rows and not config.include_hidden:
-                hidden_after = sum(
-                    1 for r in structure.hidden_rows if r > first_table_end
-                )
+                hidden_after = sum(1 for r in structure.hidden_rows if r > first_table_end)
                 rows_after_first_table -= hidden_after
             if rows_after_first_table > 0:
                 skip_footer = max(skip_footer, rows_after_first_table)
@@ -541,12 +537,34 @@ class MessyWorkbook:
 
         # Comma-decimal with period thousands (DE, NL, IT, ES, PT, etc.)
         comma_decimal_dot_thousands = {
-            "de", "nl", "it", "es", "pt", "el", "tr", "id",
+            "de",
+            "nl",
+            "it",
+            "es",
+            "pt",
+            "el",
+            "tr",
+            "id",
         }
         # Comma-decimal with space thousands (FR, SE, NO, FI, PL, RU, etc.)
         comma_decimal_space_thousands = {
-            "fr", "sv", "nb", "nn", "fi", "pl", "cs", "sk", "hu",
-            "ro", "bg", "hr", "sl", "sr", "da", "ru", "uk",
+            "fr",
+            "sv",
+            "nb",
+            "nn",
+            "fi",
+            "pl",
+            "cs",
+            "sk",
+            "hu",
+            "ro",
+            "bg",
+            "hr",
+            "sl",
+            "sr",
+            "da",
+            "ru",
+            "uk",
         }
 
         if lang in comma_decimal_dot_thousands:
@@ -583,13 +601,16 @@ class MessyWorkbook:
             return
         self._formula_loaded = True
 
-        if self._formula_config.mode != FormulaEvaluationMode.DISABLED and self._formula_engine.is_available:
-                try:
-                    formula_source = self._file_path or self._file_buffer
-                    if formula_source is not None:
-                        self._formula_engine.load_workbook(formula_source)  # type: ignore[arg-type]
-                except (OSError, ValueError, TypeError) as e:
-                    logger.debug("Formula engine load failed: %s", e)
+        if (
+            self._formula_config.mode != FormulaEvaluationMode.DISABLED
+            and self._formula_engine.is_available
+        ):
+            try:
+                formula_source = self._file_path or self._file_buffer
+                if formula_source is not None:
+                    self._formula_engine.load_workbook(formula_source)  # type: ignore[arg-type]
+            except (OSError, ValueError, TypeError) as e:
+                logger.debug("Formula engine load failed: %s", e)
 
     def _ensure_workbook(self) -> None:
         """Ensure openpyxl workbook is loaded."""

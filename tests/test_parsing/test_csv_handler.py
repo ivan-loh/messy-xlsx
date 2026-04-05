@@ -76,11 +76,7 @@ class TestCSVMetadataDetectionIntegration:
         csv_file = temp_dir / "messy_report.csv"
         # Metadata rows must have same delimiter so parser reads all columns
         csv_file.write_text(
-            "Report: Sales,\n"
-            "Generated: 2024-01-01,\n"
-            "Name,Amount\n"
-            "Alice,10\n"
-            "Bob,20\n"
+            "Report: Sales,\nGenerated: 2024-01-01,\nName,Amount\nAlice,10\nBob,20\n"
         )
 
         with MessyWorkbook(csv_file) as wb:

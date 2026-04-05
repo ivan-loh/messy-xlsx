@@ -64,9 +64,7 @@ class TestStructureAnalyzer:
             structure = wb.get_structure("Data")
 
             # Should detect 2 tables separated by blank rows
-            assert structure.num_tables == 2, (
-                f"Expected 2 tables, detected {structure.num_tables}"
-            )
+            assert structure.num_tables == 2, f"Expected 2 tables, detected {structure.num_tables}"
 
     def test_locale_detection(self, european_xlsx):
         """Test locale detection."""
