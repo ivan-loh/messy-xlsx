@@ -62,8 +62,22 @@ class TestNumberNormalizer:
 
         result = normalizer.normalize(df)
 
-        # Should detect and normalize correctly
+        # Should detect and normalize each numeric column correctly
         assert pd.api.types.is_numeric_dtype(result["us_format"])
+        assert pd.api.types.is_numeric_dtype(result["eu_format"])
+        assert result["us_format"].iloc[0] == pytest.approx(1234.56)
+        assert result["eu_format"].iloc[0] == pytest.approx(1234.56)
+
+    def test_auto_locale_detection_with_one_decimal_comma(self):
+        """Auto-detection should handle common one-decimal comma values."""
+        normalizer = NumberNormalizer()
+
+        df = pd.DataFrame({"amount": ["1,2", "3,4"]})
+
+        result = normalizer.normalize(df)
+
+        assert pd.api.types.is_numeric_dtype(result["amount"])
+        assert result["amount"].iloc[0] == pytest.approx(1.2)
 
     def test_preserve_integers(self):
         """Test that integer values are preserved."""

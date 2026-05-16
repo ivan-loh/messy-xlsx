@@ -46,20 +46,22 @@ class NormalizationPipeline:
         """Apply full normalization pipeline."""
         skip_steps = skip_steps or []
 
-        if semantic_hints is None:
-            semantic_hints = self.type_inference.infer_types(df)
+        inferred_hints = self.type_inference.infer_types(df)
+        if semantic_hints:
+            inferred_hints.update(semantic_hints)
+        semantic_hints = inferred_hints
 
         if "whitespace" not in skip_steps:
             df = self.whitespace.normalize(df, self.preserve_linebreaks)
+
+        if "missing" not in skip_steps:
+            df = self.missing.normalize(df)
 
         if "numbers" not in skip_steps:
             df = self.numbers.normalize(df, semantic_hints)
 
         if "dates" not in skip_steps:
             df = self.dates.normalize(df, semantic_hints)
-
-        if "missing" not in skip_steps:
-            df = self.missing.normalize(df)
 
         # Type coercion should be last - ensures BQ/Arrow compatibility
         if "type_coercion" not in skip_steps:

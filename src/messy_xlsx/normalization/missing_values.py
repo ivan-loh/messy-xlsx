@@ -28,12 +28,12 @@ DEFAULT_MISSING_VALUES = [
     "#NA",
     "missing",
     "MISSING",
-    "nil",
-    "NIL",
 ]
 
 # Aggressive list - includes ambiguous values (opt-in)
 EXTENDED_MISSING_VALUES = [
+    "nil",
+    "NIL",
     "-",
     "--",
     "---",

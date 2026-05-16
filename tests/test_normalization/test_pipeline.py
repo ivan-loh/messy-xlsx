@@ -30,11 +30,27 @@ class TestNormalizationPipeline:
 
         result = pipeline.normalize(df)
 
-        # Should handle whitespace, then numbers, then missing values
+        # Should handle whitespace, then missing values, then numbers
         # Note: Rows with only missing values after conversion are dropped
         assert len(result) == 2  # NA row was dropped
         assert not pd.isna(result["messy"].iloc[0])
         assert not pd.isna(result["messy"].iloc[1])
+        assert pd.api.types.is_numeric_dtype(result["messy"])
+        assert result["messy"].iloc[0] == 1234.56
+        assert result["messy"].iloc[1] == 2345.67
+
+    def test_missing_tokens_do_not_block_numeric_coercion(self):
+        """Known missing tokens should not force otherwise numeric columns to stay text."""
+        pipeline = NormalizationPipeline(decimal_separator=".", thousands_separator=",")
+
+        df = pd.DataFrame({"amount": ["$1,234.56", "N/A", "$2,345.67"], "name": ["A", "B", "C"]})
+
+        result = pipeline.normalize(df)
+
+        assert pd.api.types.is_numeric_dtype(result["amount"])
+        assert result["amount"].iloc[0] == 1234.56
+        assert pd.isna(result["amount"].iloc[1])
+        assert result["amount"].iloc[2] == 2345.67
 
     def test_empty_dataframe(self):
         """Test handling empty DataFrame."""

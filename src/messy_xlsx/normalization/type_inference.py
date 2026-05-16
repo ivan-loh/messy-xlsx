@@ -44,7 +44,7 @@ NUMERIC_PATTERNS = [
 TEXT_ID_PATTERNS = [
     r"^id$",
     r".*_id$",
-    r".*id$",
+    r".*[\s_-]id$",
     r".*number$",
     r".*code$",
     r".*ref$",

@@ -27,14 +27,15 @@ class TestMissingValueHandler:
         """Test extended list with ambiguous values like dash."""
         handler = MissingValueHandler(use_extended_list=True)
 
-        df = pd.DataFrame({"col": ["-", ".", "?", "value"]})
+        df = pd.DataFrame({"col": ["nil", "-", ".", "?", "value"]})
 
         result = handler.normalize(df, drop_empty_rows=False)
 
-        assert pd.isna(result["col"].iloc[0])  # dash
-        assert pd.isna(result["col"].iloc[1])  # dot
-        assert pd.isna(result["col"].iloc[2])  # question mark
-        assert result["col"].iloc[3] == "value"
+        assert pd.isna(result["col"].iloc[0])  # nil
+        assert pd.isna(result["col"].iloc[1])  # dash
+        assert pd.isna(result["col"].iloc[2])  # dot
+        assert pd.isna(result["col"].iloc[3])  # question mark
+        assert result["col"].iloc[4] == "value"
 
     def test_dash_not_converted_by_default(self):
         """Test that dash is NOT converted by default (conservative behavior)."""
@@ -46,6 +47,17 @@ class TestMissingValueHandler:
 
         # Dash should remain as-is with default settings
         assert result["col"].iloc[0] == "-"
+        assert result["col"].iloc[1] == "value"
+
+    def test_nil_not_converted_by_default(self):
+        """Test that nil is NOT converted by default (conservative behavior)."""
+        handler = MissingValueHandler()
+
+        df = pd.DataFrame({"col": ["NIL", "value"]})
+
+        result = handler.normalize(df, drop_empty_rows=False)
+
+        assert result["col"].iloc[0] == "NIL"
         assert result["col"].iloc[1] == "value"
 
     def test_empty_string_handling(self):
