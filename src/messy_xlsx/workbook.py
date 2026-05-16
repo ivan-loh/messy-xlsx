@@ -359,7 +359,7 @@ class MessyWorkbook:
             thousands_separator=thousands_sep,
         )
 
-        type_hints = effective_config.type_hints.copy()
+        type_hints = self._resolve_type_hints(df, effective_config.type_hints)
 
         # Build skip_steps based on config
         skip_steps = []
@@ -572,6 +572,34 @@ class MessyWorkbook:
         if lang in comma_decimal_space_thousands:
             return ",", " "
         return ".", ","
+
+    def _resolve_type_hints(
+        self, df: pd.DataFrame, configured_hints: dict[str, str]
+    ) -> dict[str, str]:
+        """Map configured type hints to the parsed column names.
+
+        Users often provide hints using the sanitized output name (for example
+        ``customer_id``) even though normalization runs before sanitization.
+        Keep exact matches and add aliases for sanitized column names.
+        """
+        if not configured_hints:
+            return {}
+
+        from .utils import sanitize_column_name
+
+        resolved = configured_hints.copy()
+        for col in df.columns:
+            if col in resolved:
+                continue
+
+            col_str = str(col)
+            clean = sanitize_column_name(col)
+            if col_str in configured_hints:
+                resolved[col] = configured_hints[col_str]
+            elif clean in configured_hints:
+                resolved[col] = configured_hints[clean]
+
+        return resolved
 
     def _sanitize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """Sanitize column names for BigQuery compatibility."""

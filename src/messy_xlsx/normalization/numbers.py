@@ -18,8 +18,8 @@ CURRENCY_SYMBOLS = ["$", "€", "£", "¥", "₹", "CHF", "kr", "zł"]
 # Pre-compile patterns
 ACCOUNTING_PATTERN = re.compile(r"^\s*\(([^)]+)\)\s*$")
 NUMBER_PATTERN = re.compile(r"^[+-]?[\d,.\s]+$|^\([0-9,.\s]+\)$|^[$€£¥₹][0-9,.\s]+$")
-COMMA_DECIMAL_PATTERN = re.compile(r"\d,\d{2}$")
-DOT_DECIMAL_PATTERN = re.compile(r"\d\.\d{2}$")
+COMMA_DECIMAL_PATTERN = re.compile(r"\d,\d{1,2}$")
+DOT_DECIMAL_PATTERN = re.compile(r"\d\.\d{1,2}$")
 DOT_THOUSANDS_PATTERN = re.compile(r"\d\.\d{3}")
 COMMA_THOUSANDS_PATTERN = re.compile(r"\d,\d{3}")
 NUMERIC_CHARS_PATTERN = re.compile(r"[\d.,\s]+")
@@ -44,6 +44,7 @@ class NumberNormalizer:
         """Initialize normalizer."""
         self.decimal_separator = decimal_separator
         self.thousands_separator = thousands_separator
+        self._auto_detect_locale = decimal_separator is None
 
     def normalize(
         self,
@@ -54,8 +55,13 @@ class NumberNormalizer:
         df = df.copy()
         semantic_hints = semantic_hints or {}
 
-        if self.decimal_separator is None:
-            self.decimal_separator, self.thousands_separator = self._detect_locale(df)
+        explicit_locale = not self._auto_detect_locale
+        default_decimal = self.decimal_separator
+        default_thousands = self.thousands_separator
+        if default_decimal is None:
+            default_decimal, default_thousands = self._detect_locale(df)
+            self.decimal_separator = default_decimal
+            self.thousands_separator = default_thousands
 
         for idx in self._string_positions(df):
             col = df.columns[idx]
@@ -66,7 +72,17 @@ class NumberNormalizer:
                     continue
 
             if self._looks_like_numbers(series):
-                df.isetitem(idx, self._normalize_column(series))
+                decimal_separator = default_decimal
+                thousands_separator = default_thousands
+                if not explicit_locale:
+                    decimal_separator, thousands_separator = self._detect_locale_for_series(
+                        series,
+                        default_decimal,
+                        default_thousands,
+                    )
+                df.isetitem(
+                    idx, self._normalize_column(series, decimal_separator, thousands_separator)
+                )
 
         return df
 
@@ -97,8 +113,43 @@ class NumberNormalizer:
         # Weaker evidence: only decimal pattern, no contradicting thousands pattern
         if comma_decimal > dot_decimal and comma_thousands == 0:
             return ",", "."
+        if dot_decimal > comma_decimal and dot_thousands == 0:
+            return ".", ","
 
         return ".", ","
+
+    def _detect_locale_for_series(
+        self,
+        series: pd.Series,
+        default_decimal: str,
+        default_thousands: str | None,
+    ) -> tuple[str, str | None]:
+        """Detect decimal/thousands separators for one column.
+
+        Global sheet-level detection is useful as a fallback, but mixed-locale
+        workbooks commonly have one US-format and one EU-format numeric column.
+        Per-column detection prevents silently changing the magnitude of those
+        values.
+        """
+        sample = series.dropna().head(50).astype(str)
+        if len(sample) == 0:
+            return default_decimal, default_thousands
+
+        comma_decimal = sum(1 for s in sample if COMMA_DECIMAL_PATTERN.search(s.strip()))
+        dot_decimal = sum(1 for s in sample if DOT_DECIMAL_PATTERN.search(s.strip()))
+        dot_thousands = sum(1 for s in sample if DOT_THOUSANDS_PATTERN.search(s.strip()))
+        comma_thousands = sum(1 for s in sample if COMMA_THOUSANDS_PATTERN.search(s.strip()))
+
+        if comma_decimal > dot_decimal and dot_thousands >= comma_thousands:
+            return ",", "."
+        if dot_decimal > comma_decimal and comma_thousands >= dot_thousands:
+            return ".", ","
+        if comma_decimal > dot_decimal and comma_thousands == 0:
+            return ",", "."
+        if dot_decimal > comma_decimal and dot_thousands == 0:
+            return ".", ","
+
+        return default_decimal, default_thousands
 
     def _looks_like_numbers(self, series: pd.Series) -> bool:
         """Check if column looks numeric."""
@@ -110,7 +161,12 @@ class NumberNormalizer:
         matches = sum(1 for val in sample if NUMBER_PATTERN.match(val.strip()))
         return matches > len(sample) * 0.5
 
-    def _normalize_column(self, series: pd.Series) -> pd.Series:
+    def _normalize_column(
+        self,
+        series: pd.Series,
+        decimal_separator: str | None = None,
+        thousands_separator: str | None = None,
+    ) -> pd.Series:
         """
         Normalize numbers in a column using vectorized operations.
 
@@ -126,7 +182,11 @@ class NumberNormalizer:
             if already_numeric.any():
                 str_mask = ~already_numeric & series.notna()
                 if str_mask.any():
-                    str_part = self._normalize_str_part(series[str_mask])
+                    str_part = self._normalize_str_part(
+                        series[str_mask],
+                        decimal_separator,
+                        thousands_separator,
+                    )
                     # If string values couldn't be converted to numeric,
                     # the column is truly mixed — return original unchanged
                     if not pd.api.types.is_numeric_dtype(str_part):
@@ -139,9 +199,14 @@ class NumberNormalizer:
                 return pd.to_numeric(series, errors="coerce")
 
         # Work with string representation
-        return self._normalize_str_part(series)
+        return self._normalize_str_part(series, decimal_separator, thousands_separator)
 
-    def _normalize_str_part(self, series: pd.Series) -> pd.Series:
+    def _normalize_str_part(
+        self,
+        series: pd.Series,
+        decimal_separator: str | None = None,
+        thousands_separator: str | None = None,
+    ) -> pd.Series:
         """Normalize string values, detecting per-column mixed locale."""
         str_vals = series.dropna().astype(str)
         has_comma_dec = str_vals.str.contains(COMMA_DECIMAL_PATTERN, regex=True).any()
@@ -151,7 +216,7 @@ class NumberNormalizer:
             # Mixed separators in the same column — normalize per-value
             return self._normalize_mixed_locale_series(series)
 
-        return self._normalize_string_series(series)
+        return self._normalize_string_series(series, decimal_separator, thousands_separator)
 
     def _normalize_mixed_locale_series(self, series: pd.Series) -> pd.Series:
         """Normalize values when the same column has mixed decimal separators.
@@ -200,8 +265,15 @@ class NumberNormalizer:
         except ValueError:
             return np.nan
 
-    def _normalize_string_series(self, series: pd.Series) -> pd.Series:
+    def _normalize_string_series(
+        self,
+        series: pd.Series,
+        decimal_separator: str | None = None,
+        thousands_separator: str | None = None,
+    ) -> pd.Series:
         """Normalize a series of string values to numeric."""
+        decimal_separator = decimal_separator or self.decimal_separator
+        thousands_separator = thousands_separator or self.thousands_separator
         str_series = series.astype(str)
 
         # Vectorized: remove currency symbols
@@ -217,12 +289,12 @@ class NumberNormalizer:
             )
 
         # Vectorized: remove thousands separator
-        if self.thousands_separator:
-            str_series = str_series.str.replace(self.thousands_separator, "", regex=False)
+        if thousands_separator:
+            str_series = str_series.str.replace(thousands_separator, "", regex=False)
 
         # Vectorized: convert decimal separator to dot
-        if self.decimal_separator and self.decimal_separator != ".":
-            str_series = str_series.str.replace(self.decimal_separator, ".", regex=False)
+        if decimal_separator and decimal_separator != ".":
+            str_series = str_series.str.replace(decimal_separator, ".", regex=False)
 
         # Vectorized: remove spaces
         str_series = str_series.str.replace(" ", "", regex=False)

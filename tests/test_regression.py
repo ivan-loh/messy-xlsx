@@ -80,6 +80,30 @@ class TestRegressionBugs:
             assert df.iloc[0]["amount"] == pytest.approx(1.23)
             assert df.iloc[1]["amount"] == pytest.approx(4.56)
 
+    def test_default_normalization_preserves_identifier_like_strings(self, temp_dir):
+        """Regression: default parsing should not strip leading zeros from identifiers."""
+        file_path = temp_dir / "identifier_strings.xlsx"
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["ID", "Order Number", "ZIP", "SKU", "Amount"])
+        ws.append(["00123", "000045", "02110", "000SKU", "$1,234.56"])
+        ws.append(["00456", "000078", "94105", "00222", "$2,345.67"])
+        wb.save(file_path)
+        wb.close()
+
+        with MessyWorkbook(file_path) as mwb:
+            df = mwb.to_dataframe()
+
+        import pandas as pd
+
+        assert list(df["id"]) == ["00123", "00456"]
+        assert list(df["order_number"]) == ["000045", "000078"]
+        assert list(df["zip"]) == ["02110", "94105"]
+        assert list(df["sku"]) == ["000SKU", "00222"]
+        assert pd.api.types.is_numeric_dtype(df["amount"])
+        assert df["amount"].iloc[0] == pytest.approx(1234.56)
+
     def test_merged_cells_dont_crash(self, temp_dir):
         """Regression: Merged cells should not crash parser."""
         file_path = temp_dir / "merged_regression.xlsx"
