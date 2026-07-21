@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Added `xlwt` to development dependencies so legacy `.xls` tests run instead of skip.
+- Reused the core `MessyWorkbook` pipeline for multi-sheet parsing, removing duplicate
+  header detection, normalization, type coercion, and column cleaning code.
+- Enabled the `fastexcel` path when structure analysis confirms that merged/hidden-cell
+  handling is unnecessary.
+- `SheetConfig.evaluate_formulas=False` now preserves formula expressions in DataFrames;
+  the default reads cached results.
+- Compiled sheet configuration, structure evidence, backend hints, and normalization
+  choices into one private frozen parse plan before parsing.
+- Centralized path, seekable-buffer, and read-once-stream access behind one internal source
+  boundary shared by detection, analysis, validation, and format handlers.
+- Preserved legacy custom detectors, handlers, and registry subclasses through fresh raw
+  source borrows unless an extension explicitly opts into the internal handle contract.
+
+### Fixed
+
+- Exported `read_excel`, `read_excel_tables`, and `analyze_structure` through `__all__`.
+- Added `SheetInfo.column_count` as a descriptive alias for `col_count`.
+- Prevented `MessyTable.to_dataframe()` from mutating caller-owned configuration.
+- Closed convenience-function workbooks and transient XLS/XLSX/CSV resources
+  deterministically on both success and failure without closing caller-owned buffers.
+- Made sheet structure access honor workbook header patterns and made table parsing inherit
+  workbook configuration when no table-specific configuration is supplied.
+- Prevented hidden rows outside the data region and sheet-global footer evidence from
+  truncating detected table ranges.
+- Restored caller-owned seekable streams to their exact entry position after success or
+  failure, snapshotted non-seekable streams once, and retained caller ownership throughout.
+- Normalized `bytearray` and `memoryview` streams only for backends that require true bytes,
+  avoiding unconditional copies for ordinary seekable sources.
+- Kept cached-value structure analysis separate from formula-expression detection so an
+  uncached formula cannot change data bounds, header scoring, tables, or locale evidence.
+- Limited CSV stream validation to the same bounded 1 KiB probe used for path inputs.
+- Synchronized documented runtime dependencies with `pyproject.toml`.
+- Corrected the property-test missing-value contract for `nil`/`NIL`.
+
 ## [0.8.0] - 2026-02-25
 
 ### Added

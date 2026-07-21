@@ -6,22 +6,27 @@
 
 import logging
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO
 
 import openpyxl
 import pandas as pd
 
+from messy_xlsx._source import BackendSource, SourceHandle, describe_source
 from messy_xlsx.cache import get_structure_cache
-from messy_xlsx.detection.format_detector import FormatDetector
 from messy_xlsx.detection.structure_analyzer import StructureAnalyzer
 from messy_xlsx.exceptions import FileError, FormatError
 from messy_xlsx.formulas.config import FormulaConfig, FormulaEvaluationMode
 from messy_xlsx.formulas.engine import FormulaEngine
 from messy_xlsx.models import CellValue, SheetConfig, SheetError, StructureInfo
 from messy_xlsx.normalization.pipeline import NormalizationPipeline
-from messy_xlsx.parsing.base_handler import ParseOptions
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
+from messy_xlsx.parsing.parse_plan import (
+    compile_parse_plan,
+    requires_structure_analysis,
+)
 from messy_xlsx.sheet import MessySheet
 
 # ============================================================================
@@ -40,6 +45,7 @@ class MessyWorkbook:
         sheet_config: SheetConfig | None = None,
         formula_config: FormulaConfig | None = None,
         filename: str | None = None,
+        registry: HandlerRegistry | None = None,
     ):
         """Open an Excel file for parsing.
 
@@ -48,55 +54,70 @@ class MessyWorkbook:
             sheet_config: Configuration for parsing sheets
             formula_config: Configuration for formula evaluation
             filename: Optional filename hint when using file-like objects (for format detection)
+            registry: Optional format-handler registry for custom parsing behavior
         """
         self._sheet_config = sheet_config or SheetConfig()
         self._formula_config = formula_config or FormulaConfig()
 
-        self._detector = FormatDetector()
-        self._registry = HandlerRegistry()
+        self._registry = registry if registry is not None else HandlerRegistry()
         self._analyzer = StructureAnalyzer(get_structure_cache())
         self._formula_engine = FormulaEngine(self._formula_config)
 
-        # Determine if input is file path or file-like object
-        self._is_fileobj = hasattr(file_path_or_buffer, "read")
+        try:
+            self._source_handle = SourceHandle(file_path_or_buffer, filename=filename)
+        except Exception as e:
+            file_desc = describe_source(file_path_or_buffer, filename)
+            raise FormatError(
+                f"Cannot read from file object: {e}",
+                file_path=file_desc,
+            ) from e
+        self._sheets: dict[str, MessySheet] = {}
+        self._formula_loaded = False
+        self._wb: openpyxl.Workbook | None = None
+        self._cached_wb: openpyxl.Workbook | None = None
+        self._wb_source: BinaryIO | None = None
+        self._cached_wb_source: BinaryIO | None = None
 
-        self._file_path: Path | None
-        self._file_buffer: BinaryIO | None
-        self._filename_hint: str | None
+        try:
+            self._initialize_source()
+        except BaseException:
+            self.close()
+            raise
 
-        if self._is_fileobj:
-            self._file_path = None
-            self._file_buffer = file_path_or_buffer  # type: ignore[assignment]
-            self._filename_hint = filename
+    @contextmanager
+    def _registry_source(self) -> Iterator[SourceHandle | BackendSource]:
+        """Adapt the internal handle for legacy registry subclasses."""
+        accepts_handle = bool(type(self._registry).__dict__.get("_accepts_source_handle", False))
+        if accepts_handle:
+            yield self._source_handle
+            return
+        with self._source_handle.open_legacy() as source:
+            yield source
 
-            # Detect format from file object
-            self._format_info = self._detector.detect(file_path_or_buffer, filename=filename)
+    def _initialize_source(self) -> None:
+        """Detect, inspect, and validate the source without taking ownership."""
 
-            # Reset buffer position after detection
-            if hasattr(file_path_or_buffer, "seek"):
-                file_path_or_buffer.seek(0)
-        else:
-            self._file_path = Path(file_path_or_buffer)  # type: ignore[arg-type]
-            self._file_buffer = None
-            self._filename_hint = None
+        if self._source_handle.path is not None and not self._source_handle.path.exists():
+            raise FileError(
+                f"File not found: {self._source_handle.path}",
+                file_path=str(self._source_handle.path),
+            )
 
-            if not self._file_path.exists():
-                raise FileError(
-                    f"File not found: {self._file_path}",
-                    file_path=str(self._file_path),
-                )
-
-            self._format_info = self._detector.detect(self._file_path)
+        with self._registry_source() as source:
+            self._format_info = self._registry.detect_format(
+                source,
+                filename=self._source_handle.filename_hint,
+            )
 
         if self._format_info.format_type == "unknown":
-            file_desc: str | Path = self._filename_hint or self._file_path or "<stream>"
+            file_desc = self._source_handle.description
             raise FormatError(
                 f"Unknown file format: {file_desc}",
                 file_path=str(file_desc),
             )
 
         if self._format_info.format_type == "xlsb":
-            file_desc = self._filename_hint or self._file_path or "<stream>"
+            file_desc = self._source_handle.description
             raise FormatError(
                 "XLSB (Excel Binary) format is not supported. "
                 "Please convert the file to XLSX format.",
@@ -106,8 +127,8 @@ class MessyWorkbook:
 
         # Validate extension matches detected format for Excel files
         # This catches files with .xlsx extension but different content
-        if not self._is_fileobj and self._file_path is not None:
-            file_ext = self._file_path.suffix.lower()
+        if self._source_handle.path is not None:
+            file_ext = self._source_handle.path.suffix.lower()
             excel_extensions = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"}
             if file_ext in excel_extensions and self._format_info.format_type not in (
                 "xlsx",
@@ -118,43 +139,41 @@ class MessyWorkbook:
             ):
                 raise FormatError(
                     f"File extension {file_ext} suggests Excel format, but content is {self._format_info.format_type}",
-                    file_path=str(self._file_path),
+                    file_path=str(self._source_handle.path),
                     detected_format=self._format_info.format_type,
                 )
 
         # Get sheet names and validate file is readable
-        self._sheet_names = self._registry.get_sheet_names(self.source)
+        with self._registry_source() as source:
+            self._sheet_names = self._registry.get_sheet_names(
+                source,
+            )
 
         # Validate that the file is actually readable (not just format-detected)
         # This catches corrupted files that pass format detection but can't be opened
         if self._format_info.format_type in ("xlsx", "xlsm", "xltx", "xltm", "xls"):
-            is_valid, error = self._registry.validate(self.source, self._format_info.format_type)
+            with self._registry_source() as source:
+                is_valid, error = self._registry.validate(
+                    source,
+                    self._format_info.format_type,
+                )
             if not is_valid:
-                file_desc = self._filename_hint or self._file_path or "<stream>"
+                file_desc = self._source_handle.description
                 raise FormatError(
                     f"File appears corrupted or invalid: {error}",
                     file_path=str(file_desc),
                     detected_format=self._format_info.format_type,
                 )
 
-        self._sheets: dict[str, MessySheet] = {}
-        self._formula_loaded = False
-
-        self._wb: openpyxl.Workbook | None = None
-
     @property
     def file_path(self) -> Path | None:
         """Path to the Excel file, or None if reading from buffer."""
-        return self._file_path
+        return self._source_handle.path
 
     @property
     def source(self) -> Path | BinaryIO:
         """The source file path or buffer."""
-        if self._is_fileobj and self._file_buffer is not None:
-            return self._file_buffer
-        if self._file_path is not None:
-            return self._file_path
-        raise FileError("No file source available")
+        return self._source_handle.original
 
     @property
     def sheet_names(self) -> list[str]:
@@ -172,7 +191,7 @@ class MessyWorkbook:
             name = self._sheet_names[0]
 
         if name not in self._sheet_names:
-            file_desc = self._file_path or self._filename_hint or "<stream>"
+            file_desc = self._source_handle.description
             raise FormatError(
                 f"Sheet '{name}' not found",
                 file_path=str(file_desc),
@@ -235,7 +254,7 @@ class MessyWorkbook:
     def get_structure(self, sheet: str | None = None) -> StructureInfo:
         """Get detected structure for a sheet."""
         sheet_name = sheet or self._sheet_names[0]
-        return self._analyze_structure(sheet_name)
+        return self._analyze_structure(sheet_name, self._sheet_config)
 
     def get_cell(
         self,
@@ -245,14 +264,13 @@ class MessyWorkbook:
     ) -> CellValue:
         """Get a single cell value."""
         self._ensure_workbook()
-        self._ensure_formula_engine()
 
         if self._wb is None:
             raise FileError("Workbook not loaded — call _ensure_workbook() first")
         ws = self._wb[sheet]
         cell = ws.cell(row, col)
 
-        cached_value = cell.value
+        resolved_value = cell.value
 
         formula = None
         is_formula = False
@@ -266,21 +284,24 @@ class MessyWorkbook:
                 formula = cell.value
 
         if is_formula and self._formula_config.mode != FormulaEvaluationMode.DISABLED:
+            cached_value = self._get_cached_cell_value(sheet, row, col)
+            resolved_value = cached_value
+            self._ensure_formula_engine()
             try:
-                cached_value = self._formula_engine.evaluate(sheet, row, col, cached_value)
+                resolved_value = self._formula_engine.evaluate(sheet, row, col, cached_value)
             except (ValueError, TypeError, KeyError) as e:
                 logger.debug(
                     "Formula evaluation failed for cell (%s, %d, %d): %s", sheet, row, col, e
                 )
 
-        data_type = self._get_data_type(cached_value)
+        data_type = self._get_data_type(resolved_value)
 
         is_merged = self._is_cell_merged(ws, row, col)
 
         is_hidden = self._is_cell_hidden(ws, row, col)
 
         return CellValue(
-            value=cached_value,
+            value=resolved_value,
             formula=formula,
             is_merged=is_merged,
             is_hidden=is_hidden,
@@ -303,86 +324,51 @@ class MessyWorkbook:
     ) -> pd.DataFrame:
         """Parse a sheet to DataFrame with normalization."""
         config = config or self._sheet_config
+        format_type = self.format_type
 
-        # Skip structure analysis for CSV/TSV/TXT - these formats don't support openpyxl
-        if config.auto_detect and self.format_type not in ("csv", "tsv", "txt"):
+        structure = None
+        if requires_structure_analysis(config, format_type):
             structure = self._analyze_structure(sheet, config)
-            effective_config = self._apply_structure_detection(config, structure)
-        else:
-            effective_config = config
+        plan = compile_parse_plan(config, structure, format_type)
 
-        # Enable CSV metadata/header auto-detection when auto_detect is on
-        auto_detect_header = config.auto_detect and self.format_type in ("csv", "tsv", "txt")
+        with self._registry_source() as source:
+            df = self._registry.parse(
+                source,
+                sheet=sheet,
+                options=plan.to_parse_options(),
+                format_type=format_type,
+            )
 
-        parse_options = ParseOptions(
-            skip_rows=effective_config.skip_rows,
-            header_rows=effective_config.header_rows,
-            skip_footer=effective_config.skip_footer,
-            merge_strategy=effective_config.merge_strategy,
-            ignore_hidden=not effective_config.include_hidden,
-            cell_range=effective_config.cell_range,
-            data_only=True,
-            auto_detect_header=auto_detect_header,
-        )
+        if plan.normalize:
+            pipeline = NormalizationPipeline(
+                decimal_separator=plan.decimal_separator,
+                thousands_separator=plan.thousands_separator,
+                use_extended_missing_list=plan.use_extended_missing_list,
+                preserve_types=plan.preserve_types,
+            )
 
-        # Reset buffer position before parsing
-        if (
-            self._is_fileobj
-            and self._file_buffer is not None
-            and hasattr(self._file_buffer, "seek")
-        ):
-            self._file_buffer.seek(0)
-
-        df = self._registry.parse(
-            self.source,
-            sheet=sheet,
-            options=parse_options,
-        )
-
-        # Skip normalization if disabled
-        if not effective_config.normalize:
-            # Still apply sanitization if enabled
-            if effective_config.sanitize_column_names:
-                df = self._sanitize_columns(df)
-            if effective_config.column_renames:
-                df = df.rename(columns=effective_config.column_renames)
-            return df
-
-        # Derive decimal/thousands separators from locale if provided
-        decimal_sep = None
-        thousands_sep = None
-        if effective_config.locale and effective_config.locale != "auto":
-            decimal_sep, thousands_sep = self._locale_to_separators(effective_config.locale)
-
-        pipeline = NormalizationPipeline(
-            decimal_separator=decimal_sep,
-            thousands_separator=thousands_sep,
-        )
-
-        type_hints = effective_config.type_hints.copy()
-
-        # Build skip_steps based on config
-        skip_steps = []
-        if not effective_config.normalize_whitespace:
-            skip_steps.append("whitespace")
-        if not effective_config.normalize_numbers:
-            skip_steps.append("numbers")
-        if not effective_config.normalize_dates:
-            skip_steps.append("dates")
-
-        df = pipeline.normalize(df, semantic_hints=type_hints, skip_steps=skip_steps)
+            df = pipeline.normalize(
+                df,
+                semantic_hints=dict(plan.type_hints),
+                skip_steps=list(plan.skip_normalization_steps),
+            )
 
         # Sanitize column names if requested
-        if effective_config.sanitize_column_names:
+        if plan.sanitize_column_names:
             df = self._sanitize_columns(df)
 
         # Apply user renames (user overrides take precedence)
-        if effective_config.column_renames:
-            df = df.rename(columns=effective_config.column_renames)
+        if plan.column_renames:
+            df = df.rename(columns=dict(plan.column_renames))
+
+        # Preserve the legacy behavior where disabling normalization also
+        # bypasses row filters. S15 owns any change to that public contract.
+        if not plan.normalize:
+            return df
 
         # Drop rows matching regex pattern
-        if effective_config.drop_regex and not df.empty:
-            pattern = re.compile(effective_config.drop_regex)
+        if plan.drop_regex and not df.empty:
+            pattern = re.compile(plan.drop_regex)
             mask = df.apply(
                 lambda row: any(
                     bool(pattern.search(str(v)))
@@ -394,10 +380,8 @@ class MessyWorkbook:
             df = df[~mask].reset_index(drop=True)
 
         # Drop rows matching column-value conditions
-        if effective_config.drop_conditions and not df.empty:
-            for condition in effective_config.drop_conditions:
-                col = condition.get("column")
-                value = condition.get("value")
+        if plan.drop_conditions and not df.empty:
+            for col, value in plan.drop_conditions:
                 if col is not None and col in df.columns:
                     df = df[df[col] != value].reset_index(drop=True)
 
@@ -406,172 +390,11 @@ class MessyWorkbook:
     def _analyze_structure(self, sheet: str, config: SheetConfig | None = None) -> StructureInfo:
         """Analyze sheet structure."""
         header_patterns = config.header_patterns if config else None
-        # Reset buffer position before analysis
-        if (
-            self._is_fileobj
-            and self._file_buffer is not None
-            and hasattr(self._file_buffer, "seek")
-        ):
-            self._file_buffer.seek(0)
-        return self._analyzer.analyze(self.source, sheet, header_patterns=header_patterns)
-
-    def _apply_structure_detection(
-        self,
-        config: SheetConfig,
-        structure: StructureInfo,
-    ) -> SheetConfig:
-        """Merge user config with detected structure."""
-        from .exceptions import StructureError
-
-        # Determine skip_rows and header_rows based on detection mode
-        skip_rows = config.skip_rows
-        header_rows = config.header_rows
-
-        if config.header_detection_mode == "auto":
-            # Trust detection if confidence >= threshold
-            if (
-                structure.header_row is not None
-                and structure.header_confidence >= config.header_confidence_threshold
-            ):
-                skip_rows = max(0, structure.header_row - 1)
-                # Adjust for hidden rows: skip_rows is based on raw row numbers,
-                # but the handler removes hidden rows before applying the offset.
-                # Subtract hidden rows that appear before the header row.
-                if structure.hidden_rows and not config.include_hidden:
-                    hidden_before_header = sum(
-                        1 for r in structure.hidden_rows if r < structure.header_row
-                    )
-                    skip_rows = max(0, skip_rows - hidden_before_header)
-                header_rows = structure.header_rows_count
-            else:
-                # Fallback logic
-                if config.header_fallback == "first_row":
-                    skip_rows = 0
-                    header_rows = 1
-                elif config.header_fallback == "none":
-                    header_rows = 0
-                elif config.header_fallback == "error":
-                    raise StructureError(
-                        f"No header detected with sufficient confidence "
-                        f"(found: {structure.header_confidence:.2f}, "
-                        f"required: {config.header_confidence_threshold:.2f})"
-                    )
-
-        elif config.header_detection_mode == "smart":
-            # Use detection unless user explicitly overrode
-            if (
-                config.skip_rows == 0
-                and structure.header_row is not None
-                and structure.header_confidence >= config.header_confidence_threshold
-            ):
-                skip_rows = max(0, structure.header_row - 1)
-                # Adjust for hidden rows (same as auto mode)
-                if structure.hidden_rows and not config.include_hidden:
-                    hidden_before_header = sum(
-                        1 for r in structure.hidden_rows if r < structure.header_row
-                    )
-                    skip_rows = max(0, skip_rows - hidden_before_header)
-                header_rows = structure.header_rows_count
-            else:
-                skip_rows = config.skip_rows
-                header_rows = config.header_rows
-
-        # "manual" mode: just use config values (no changes)
-
-        # Determine skip_footer: user override > multi-table constraint > detected footer
-        skip_footer = structure.suggested_skip_footer
-        if config.skip_footer > 0:
-            skip_footer = config.skip_footer
-        # When multiple tables detected, constrain to the first table
-        elif structure.num_tables > 1 and structure.table_ranges:
-            first_table_end = structure.table_ranges[0]["end_row"]
-            rows_after_first_table = structure.data_end_row - first_table_end
-            # Adjust for hidden rows that will be removed from after the first table
-            if structure.hidden_rows and not config.include_hidden:
-                hidden_after = sum(1 for r in structure.hidden_rows if r > first_table_end)
-                rows_after_first_table -= hidden_after
-            if rows_after_first_table > 0:
-                skip_footer = max(skip_footer, rows_after_first_table)
-
-        return SheetConfig(
-            skip_rows=skip_rows,
-            header_rows=header_rows,
-            skip_footer=skip_footer,
-            cell_range=config.cell_range,
-            column_renames=config.column_renames,
-            type_hints=config.type_hints,
-            auto_detect=False,
-            include_hidden=config.include_hidden,
-            merge_strategy=config.merge_strategy,
-            locale=config.locale or structure.detected_locale,
-            evaluate_formulas=config.evaluate_formulas,
-            drop_regex=config.drop_regex,
-            drop_conditions=config.drop_conditions,
-            header_detection_mode=config.header_detection_mode,
-            header_confidence_threshold=config.header_confidence_threshold,
-            header_fallback=config.header_fallback,
-            multi_row_headers=config.multi_row_headers,
-            header_patterns=config.header_patterns,
-            # Normalization options
-            normalize=config.normalize,
-            normalize_dates=config.normalize_dates,
-            normalize_numbers=config.normalize_numbers,
-            normalize_whitespace=config.normalize_whitespace,
-            sanitize_column_names=config.sanitize_column_names,
+        return self._analyzer.analyze(
+            self._source_handle,
+            sheet,
+            header_patterns=header_patterns,
         )
-
-    @staticmethod
-    def _locale_to_separators(locale_str: str) -> tuple[str | None, str | None]:
-        """Convert locale string to (decimal_separator, thousands_separator).
-
-        Returns (decimal_sep, thousands_sep). For locales where the thousands
-        separator is a space (FR, SE, RU, etc.), we return " " so the number
-        normalizer strips spaces before parsing.
-        """
-        lang = locale_str.split("_")[0].lower()
-        country = locale_str.split("_")[1].upper() if "_" in locale_str else ""
-
-        # Swiss German uses period as decimal (unlike other German)
-        if lang == "de" and country == "CH":
-            return ".", "'"
-
-        # Comma-decimal with period thousands (DE, NL, IT, ES, PT, etc.)
-        comma_decimal_dot_thousands = {
-            "de",
-            "nl",
-            "it",
-            "es",
-            "pt",
-            "el",
-            "tr",
-            "id",
-        }
-        # Comma-decimal with space thousands (FR, SE, NO, FI, PL, RU, etc.)
-        comma_decimal_space_thousands = {
-            "fr",
-            "sv",
-            "nb",
-            "nn",
-            "fi",
-            "pl",
-            "cs",
-            "sk",
-            "hu",
-            "ro",
-            "bg",
-            "hr",
-            "sl",
-            "sr",
-            "da",
-            "ru",
-            "uk",
-        }
-
-        if lang in comma_decimal_dot_thousands:
-            return ",", "."
-        if lang in comma_decimal_space_thousands:
-            return ",", " "
-        return ".", ","
 
     def _sanitize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """Sanitize column names for BigQuery compatibility."""
@@ -606,30 +429,58 @@ class MessyWorkbook:
             and self._formula_engine.is_available
         ):
             try:
-                formula_source = self._file_path or self._file_buffer
-                if formula_source is not None:
-                    self._formula_engine.load_workbook(formula_source)  # type: ignore[arg-type]
+                if self._source_handle.path is not None:
+                    self._formula_engine.load_workbook(self._source_handle.path)
             except (OSError, ValueError, TypeError) as e:
                 logger.debug("Formula engine load failed: %s", e)
 
     def _ensure_workbook(self) -> None:
         """Ensure openpyxl workbook is loaded."""
         if self._wb is None:
-            # Reset buffer position before loading
-            if (
-                self._is_fileobj
-                and self._file_buffer is not None
-                and hasattr(self._file_buffer, "seek")
-            ):
-                self._file_buffer.seek(0)
+            source: Path | BinaryIO
+            owned_source: BinaryIO | None
+            if self._source_handle.path is None:
+                owned_source = self._source_handle.detached_binary()
+                source = owned_source
+            else:
+                owned_source = None
+                source = self._source_handle.path
+            try:
+                self._wb = openpyxl.load_workbook(
+                    source,
+                    read_only=False,
+                    data_only=False,
+                )
+            except BaseException:
+                if owned_source is not None:
+                    owned_source.close()
+                raise
+            self._wb_source = owned_source
 
-            # Load with data_only=False to preserve formula information
-            # Note: read_only=True is incompatible with some features (merged_cells)
-            self._wb = openpyxl.load_workbook(
-                self.source,
-                read_only=False,
-                data_only=False,
-            )
+    def _get_cached_cell_value(self, sheet: str, row: int, col: int) -> Any:
+        """Read a formula's cached result from a data-only workbook view."""
+        if self._cached_wb is None:
+            source: Path | BinaryIO
+            owned_source: BinaryIO | None
+            if self._source_handle.path is None:
+                owned_source = self._source_handle.detached_binary()
+                source = owned_source
+            else:
+                owned_source = None
+                source = self._source_handle.path
+            try:
+                self._cached_wb = openpyxl.load_workbook(
+                    source,
+                    read_only=False,
+                    data_only=True,
+                )
+            except BaseException:
+                if owned_source is not None:
+                    owned_source.close()
+                raise
+            self._cached_wb_source = owned_source
+
+        return self._cached_wb[sheet].cell(row, col).value
 
     def _get_data_type(self, value: Any) -> str:
         """Determine data type string for a value."""
@@ -676,9 +527,60 @@ class MessyWorkbook:
 
     def close(self) -> None:
         """Close the workbook and release resources."""
-        if self._wb is not None:
-            self._wb.close()
-            self._wb = None
+        workbook = self._wb
+        cached_workbook = self._cached_wb
+        workbook_source = getattr(self, "_wb_source", None)
+        cached_workbook_source = getattr(self, "_cached_wb_source", None)
+        source_handle = getattr(self, "_source_handle", None)
+        self._wb = None
+        self._cached_wb = None
+        self._wb_source = None
+        self._cached_wb_source = None
+
+        close_error: BaseException | None = None
+        if workbook is not None:
+            try:
+                workbook.close()
+            except BaseException as error:
+                close_error = error
+
+        if cached_workbook is not None:
+            try:
+                cached_workbook.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+                else:
+                    logger.debug(
+                        "Cached workbook also failed to close",
+                        exc_info=True,
+                    )
+
+        for label, owned_source in (
+            ("Workbook source", workbook_source),
+            ("Cached workbook source", cached_workbook_source),
+        ):
+            if owned_source is None:
+                continue
+            try:
+                owned_source.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+                else:
+                    logger.debug("%s also failed to close", label, exc_info=True)
+
+        if source_handle is not None:
+            try:
+                source_handle.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+                else:
+                    logger.debug("Source handle also failed to close", exc_info=True)
+
+        if close_error is not None:
+            raise close_error
 
     def __enter__(self) -> "MessyWorkbook":
         return self
@@ -687,10 +589,9 @@ class MessyWorkbook:
         self.close()
 
     def __repr__(self) -> str:
-        if self._file_path:
-            name = self._file_path.name
-        elif self._filename_hint:
-            name = self._filename_hint
-        else:
-            name = "<stream>"
+        name = (
+            self._source_handle.path.name
+            if self._source_handle.path is not None
+            else self._source_handle.description
+        )
         return f"MessyWorkbook({name!r}, sheets={self._sheet_names})"

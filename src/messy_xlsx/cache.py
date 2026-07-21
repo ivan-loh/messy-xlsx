@@ -93,33 +93,50 @@ class StructureCache:
     def __init__(self, maxsize: int = 128):
         self._cache: LRUCache[StructureInfo] = LRUCache(maxsize)
 
-    def _make_key(self, file_path: Path, sheet: str, mtime: float | None = None) -> str:
-        """Create cache key from file path, sheet, and mtime."""
+    def _make_key(
+        self,
+        file_path: Path,
+        sheet: str,
+        mtime: float | None = None,
+        variant: str | None = None,
+    ) -> str:
+        """Create cache key from file path, sheet, mtime, and analysis variant."""
         if mtime is None:
             try:
                 mtime = file_path.stat().st_mtime
             except OSError:
                 mtime = 0.0
-        return f"{file_path.resolve()}:{sheet}:{mtime}"
+        return f"{file_path.resolve()}:{sheet}:{mtime}:{variant or ''}"
 
-    def get(self, file_path: Path, sheet: str) -> StructureInfo | None:
+    def get(
+        self,
+        file_path: Path,
+        sheet: str,
+        variant: str | None = None,
+    ) -> StructureInfo | None:
         """Get cached structure info for a sheet."""
         try:
             mtime = file_path.stat().st_mtime
         except OSError:
             return None
 
-        key = self._make_key(file_path, sheet, mtime)
+        key = self._make_key(file_path, sheet, mtime, variant)
         return self._cache.get(key)
 
-    def put(self, file_path: Path, sheet: str, info: StructureInfo) -> None:
+    def put(
+        self,
+        file_path: Path,
+        sheet: str,
+        info: StructureInfo,
+        variant: str | None = None,
+    ) -> None:
         """Cache structure info for a sheet."""
         try:
             mtime = file_path.stat().st_mtime
         except OSError:
             return
 
-        key = self._make_key(file_path, sheet, mtime)
+        key = self._make_key(file_path, sheet, mtime, variant)
         self._cache.put(key, info)
 
     def invalidate(self, file_path: Path) -> int:

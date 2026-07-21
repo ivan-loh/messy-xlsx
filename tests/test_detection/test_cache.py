@@ -205,6 +205,23 @@ class TestStructureCache:
         assert r1 is not None and r1.data_end_row == 10
         assert r2 is not None and r2.data_end_row == 20
 
+    def test_analysis_variants_cached_separately(self, temp_dir):
+        """Configuration-dependent analysis must not reuse another result."""
+        cache = StructureCache(maxsize=10)
+        file_path = temp_dir / "test.xlsx"
+
+        wb = openpyxl.Workbook()
+        wb.save(file_path)
+        wb.close()
+
+        plain = _make_structure_info(header_confidence=0.8)
+        patterned = _make_structure_info(header_confidence=0.95)
+        cache.put(file_path, "Sheet1", plain, variant="")
+        cache.put(file_path, "Sheet1", patterned, variant="first field")
+
+        assert cache.get(file_path, "Sheet1", variant="") == plain
+        assert cache.get(file_path, "Sheet1", variant="first field") == patterned
+
     def test_invalidate_file(self, temp_dir):
         """Invalidate should remove all entries for a file."""
         cache = StructureCache(maxsize=10)

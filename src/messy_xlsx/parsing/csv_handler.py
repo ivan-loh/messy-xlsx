@@ -14,14 +14,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from messy_xlsx._source import SourceHandle
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.parsing.base_handler import (
     FileSource,
     FormatHandler,
     ParseOptions,
-    get_file_desc,
-    is_fileobj,
-    reset_buffer,
 )
 
 logger = logging.getLogger(__name__)
@@ -195,14 +193,15 @@ class MetadataRowDetector:
     ) -> int:
         """Detect skip rows from text content (for file-like objects)."""
         try:
-            df = pd.read_csv(
-                io.StringIO(text_data),
-                header=None,
-                nrows=max_check,
-                delimiter=delimiter,
-                on_bad_lines="warn",
-                skip_blank_lines=False,
-            )
+            with io.StringIO(text_data) as text_stream:
+                df = pd.read_csv(
+                    text_stream,
+                    header=None,
+                    nrows=max_check,
+                    delimiter=delimiter,
+                    on_bad_lines="warn",
+                    skip_blank_lines=False,
+                )
         except (
             pd.errors.ParserError,
             pd.errors.EmptyDataError,
@@ -250,6 +249,8 @@ class MetadataRowDetector:
 class CSVHandler(FormatHandler):
     """Handler for CSV and TSV files."""
 
+    _accepts_source_handle = True
+
     def can_handle(self, format_type: str) -> bool:
         """Check if this handler can process the format."""
         return format_type in ("csv", "tsv", "txt")
@@ -260,41 +261,53 @@ class CSVHandler(FormatHandler):
 
     def parse(
         self,
-        file_source: FileSource,
+        file_source: FileSource | SourceHandle,
         sheet: str | None,
         options: ParseOptions,
     ) -> pd.DataFrame:
         """Parse CSV/TSV file to DataFrame."""
-        is_stream = is_fileobj(file_source)
-        file_desc = get_file_desc(file_source)
+        source = SourceHandle.coerce(file_source)
+        try:
+            return self._parse_source(source, options)
+        finally:
+            if source is not file_source:
+                source.close()
+
+    def _parse_source(
+        self,
+        source: SourceHandle,
+        options: ParseOptions,
+    ) -> pd.DataFrame:
+        """Parse from one repeatable source handle."""
+        is_stream = source.is_stream
+        file_desc = source.description
+        text_data = ""
+        file_path = source.path
 
         if is_stream:
-            # For file-like objects, read content and detect from bytes
-            reset_buffer(file_source)
-            raw_data = file_source.read()  # type: ignore[union-attr]
-            reset_buffer(file_source)
+            # Buffer-backed CSV work shares the handle's single immutable byte
+            # view across validation, detection, and parsing passes.
+            raw_data = source.read_bytes()
 
             encoding = self._detect_encoding_from_bytes(raw_data, options.encoding)
             delimiter = self._detect_delimiter_from_bytes(raw_data, encoding)
 
-            # Create a new StringIO for pandas
             text_data = raw_data.decode(encoding, errors="ignore")
-            source_for_pandas = io.StringIO(text_data)
         else:
-            encoding = self._detect_encoding(file_source, options.encoding)  # type: ignore[arg-type]
-            delimiter = self._detect_delimiter(file_source, encoding)  # type: ignore[arg-type]
-            source_for_pandas = file_source  # type: ignore[assignment]
+            if file_path is None:
+                raise ValueError("Path-backed CSV source is missing its path")
+            encoding = self._detect_encoding(file_path, options.encoding)
+            delimiter = self._detect_delimiter(file_path, encoding)
 
         # Auto-detect metadata rows to skip
         skip_rows = options.skip_rows
         if options.auto_detect_header and skip_rows == 0:
             if is_stream:
                 skip_rows = self._detector.detect_skip_rows_from_text(text_data, delimiter)
-                # Reset StringIO after detection
-                source_for_pandas = io.StringIO(text_data)
             else:
+                assert file_path is not None
                 skip_rows = self._detector.detect_skip_rows(
-                    file_source,  # type: ignore[arg-type]
+                    file_path,
                     encoding,
                     delimiter,
                 )
@@ -304,6 +317,8 @@ class CSVHandler(FormatHandler):
         header = 0 if options.header_rows > 0 else None
 
         engine = "python" if options.skip_footer > 0 else "c"
+        text_stream = io.StringIO(text_data) if is_stream else None
+        source_for_pandas = text_stream if text_stream is not None else file_path
 
         try:
             df = pd.read_csv(
@@ -325,8 +340,9 @@ class CSVHandler(FormatHandler):
                     file_path=file_desc,
                     detected_format="csv",
                 ) from err
+            assert file_path is not None
             df = self._read_with_encoding_fallback(
-                file_source,  # type: ignore[arg-type]
+                file_path,
                 delimiter,
                 options,
                 na_values,
@@ -337,6 +353,9 @@ class CSVHandler(FormatHandler):
                 file_path=file_desc,
                 detected_format="csv",
             ) from e
+        finally:
+            if text_stream is not None:
+                text_stream.close()
 
         if options.header_rows > 1:
             if options.skip_rows > 0:
@@ -478,25 +497,37 @@ class CSVHandler(FormatHandler):
             attempted_formats=[f"csv[{enc}]" for enc in ENCODING_FALLBACKS],
         )
 
-    def get_sheet_names(self, file_source: FileSource) -> list[str]:
+    def get_sheet_names(self, file_source: FileSource | SourceHandle) -> list[str]:
         """Get sheet names (always returns single element for CSV)."""
         return ["Sheet1"]
 
-    def validate(self, file_source: FileSource) -> tuple[bool, str | None]:
+    def validate(self, file_source: FileSource | SourceHandle) -> tuple[bool, str | None]:
         """Validate that file can be parsed."""
-        if is_fileobj(file_source):
+        source = SourceHandle.coerce(file_source)
+        try:
+            if source.is_stream:
+                try:
+                    with source.open_binary() as stream:
+                        probe = stream.read(1024)
+                    if not isinstance(probe, (bytes, bytearray, memoryview)):
+                        raise TypeError(
+                            "Binary source read() must return bytes, bytearray, or "
+                            f"memoryview; got {type(probe).__name__}"
+                        )
+                    return True, None
+                except Exception as e:
+                    return False, str(e)
+
+            file_path = source.path
+            if file_path is None:
+                return False, "Path-backed CSV source is missing its path"
             try:
-                reset_buffer(file_source)
-                file_source.read(1024)  # type: ignore[union-attr]
-                reset_buffer(file_source)
+                encoding = self._detect_encoding(file_path, "utf-8")
+                with open(file_path, encoding=encoding, errors="ignore") as stream:
+                    stream.read(1024)
                 return True, None
             except Exception as e:
                 return False, str(e)
-        else:
-            try:
-                encoding = self._detect_encoding(file_source, "utf-8")  # type: ignore[arg-type]
-                with open(file_source, encoding=encoding, errors="ignore") as f:  # type: ignore[arg-type]
-                    f.read(1024)
-                return True, None
-            except Exception as e:
-                return False, str(e)
+        finally:
+            if source is not file_source:
+                source.close()

@@ -4,7 +4,6 @@
 # Imports
 # ============================================================================
 
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,22 +11,12 @@ from typing import Any
 
 import pandas as pd
 
-from messy_xlsx.normalization import MissingValueHandler, NumberNormalizer
-from messy_xlsx.parsing import FormatHandler, ParseOptions, XLSHandler, XLSXHandler
-from messy_xlsx.utils import sanitize_column_name
+from messy_xlsx.detection.header_detector import detect_header_row
+from messy_xlsx.models import SheetConfig
 
 # ============================================================================
 # Config
 # ============================================================================
-
-# Patterns that indicate a metadata row (not actual data)
-METADATA_PATTERNS = [
-    re.compile(r"printed\s*(date|on|by)", re.I),
-    re.compile(r"page\s*[-:]?\s*\d+\s*(of|/)\s*\d+", re.I),
-    re.compile(r"generated\s*(on|by|at)", re.I),
-    re.compile(r"report\s*(date|name|title)", re.I),
-    re.compile(r"^(as\s+of|date|run\s+date)\s*:", re.I),
-]
 
 # Patterns that indicate a pivot table (summary, not raw data)
 PIVOT_INDICATORS = [
@@ -56,6 +45,11 @@ class SheetInfo:
     is_empty: bool = False
     is_pivot: bool = False
     skip_reason: str | None = None
+
+    @property
+    def column_count(self) -> int:
+        """Number of columns (descriptive alias for ``col_count``)."""
+        return self.col_count
 
 
 @dataclass
@@ -127,14 +121,9 @@ class MultiSheetParser:
         self.file_path = Path(file_path)
         self.options = options or MultiSheetOptions()
 
-        # Select handler based on extension
-        self._handler: FormatHandler
+        # Multi-sheet parsing is intentionally limited to Excel workbooks.
         ext = self.file_path.suffix.lower()
-        if ext in (".xlsx", ".xlsm"):
-            self._handler = XLSXHandler()
-        elif ext == ".xls":
-            self._handler = XLSHandler()
-        else:
+        if ext not in (".xlsx", ".xlsm", ".xls"):
             raise ValueError(f"Unsupported file type: {ext}")
 
     def analyze_sheets(self) -> list[SheetInfo]:
@@ -144,14 +133,10 @@ class MultiSheetParser:
         Returns:
             List of SheetInfo objects describing each sheet
         """
-        sheet_names = self._handler.get_sheet_names(self.file_path)
-        results = []
+        from messy_xlsx.workbook import MessyWorkbook
 
-        for name in sheet_names:
-            info = self._analyze_sheet(name)
-            results.append(info)
-
-        return results
+        with MessyWorkbook(self.file_path) as workbook:
+            return [self._analyze_sheet(workbook, name) for name in workbook.sheet_names]
 
     def parse_all(self) -> dict[str, pd.DataFrame]:
         """
@@ -160,25 +145,23 @@ class MultiSheetParser:
         Returns:
             Dict mapping sheet name to cleaned DataFrame
         """
-        sheet_infos = self.analyze_sheets()
+        from messy_xlsx.workbook import MessyWorkbook
+
         results = {}
+        with MessyWorkbook(self.file_path) as workbook:
+            sheet_infos = [self._analyze_sheet(workbook, name) for name in workbook.sheet_names]
 
-        for info in sheet_infos:
-            # Skip based on analysis
-            if info.skip_reason:
-                continue
+            for info in sheet_infos:
+                if info.skip_reason:
+                    continue
+                if self.options.sheet_filter and not self.options.sheet_filter(info):
+                    continue
+                if self.options.sheets and info.name not in self.options.sheets:
+                    continue
 
-            # Apply custom filter if provided
-            if self.options.sheet_filter and not self.options.sheet_filter(info):
-                continue
-
-            # Only parse sheets in explicit list if provided
-            if self.options.sheets and info.name not in self.options.sheets:
-                continue
-
-            df = self._parse_sheet(info)
-            if df is not None and not df.empty:
-                results[info.name] = df
+                df = self._parse_sheet(workbook, info)
+                if not df.empty:
+                    results[info.name] = df
 
         return results
 
@@ -192,19 +175,25 @@ class MultiSheetParser:
         Returns:
             Cleaned DataFrame
         """
-        info = self._analyze_sheet(sheet_name)
-        return self._parse_sheet(info)
+        from messy_xlsx.workbook import MessyWorkbook
 
-    def _analyze_sheet(self, sheet_name: str) -> SheetInfo:
+        with MessyWorkbook(self.file_path) as workbook:
+            info = self._analyze_sheet(workbook, sheet_name)
+            return self._parse_sheet(workbook, info)
+
+    def _analyze_sheet(self, workbook: Any, sheet_name: str) -> SheetInfo:
         """Analyze a single sheet's structure."""
-        # Read first few rows to analyze
-        parse_options = ParseOptions(
-            header_rows=0,  # Read raw data
-            skip_rows=0,
+        raw_config = SheetConfig(
+            auto_detect=False,
+            header_rows=0,
+            include_hidden=True,
+            merge_strategy="skip",
+            normalize=False,
+            sanitize_column_names=False,
         )
 
         try:
-            df = self._handler.parse(self.file_path, sheet_name, parse_options)
+            df = workbook.to_dataframe(sheet_name, config=raw_config)
         except Exception as e:
             return SheetInfo(
                 name=sheet_name,
@@ -249,8 +238,15 @@ class MultiSheetParser:
                 skip_reason="Pivot table",
             )
 
-        # Detect header row
-        header_row = self._detect_header_row(df)
+        # Reuse the core analyzer so every public parsing path agrees about
+        # header placement.
+        if workbook.format_type == "xls":
+            header_row = detect_header_row(df, self.options.header_scan_rows)
+        else:
+            structure = workbook.get_structure(sheet_name)
+            header_row = max(0, (structure.header_row or 1) - 1)
+        if header_row >= self.options.header_scan_rows:
+            header_row = 0
 
         return SheetInfo(
             name=sheet_name,
@@ -273,145 +269,22 @@ class MultiSheetParser:
 
         return False
 
-    def _detect_header_row(self, df: pd.DataFrame) -> int:
-        """
-        Detect which row contains the actual headers.
-
-        Skips metadata rows like "Printed Date: ...", "Page 1 of 5", etc.
-
-        Returns:
-            0-indexed row number where headers are
-        """
-        max_scan = min(self.options.header_scan_rows, len(df))
-
-        for row_idx in range(max_scan):
-            row_values = df.iloc[row_idx].dropna().astype(str).tolist()
-
-            # Skip completely empty rows
-            if not row_values:
-                continue
-
-            # Check if this row looks like metadata
-            is_metadata = False
-            for val in row_values:
-                for pattern in METADATA_PATTERNS:
-                    if pattern.search(val):
-                        is_metadata = True
-                        break
-                if is_metadata:
-                    break
-
-            if is_metadata:
-                continue
-
-            # Check if this row looks like headers
-            # Headers typically have multiple non-empty string values
-            non_empty_count = len(row_values)
-            if non_empty_count >= 2:
-                # Check if values look like headers (short strings, no dates)
-                looks_like_header = True
-                for val in row_values:
-                    # If value is a datetime string, probably not headers
-                    if re.match(r"^\d{4}-\d{2}-\d{2}", val):
-                        looks_like_header = False
-                        break
-                    # If value is a pure number, probably not headers
-                    if re.match(r"^[\d,.]+$", val) and len(val) > 0:
-                        looks_like_header = False
-                        break
-
-                if looks_like_header:
-                    return row_idx
-
-        # Default to first row
-        return 0
-
-    def _parse_sheet(self, info: SheetInfo) -> pd.DataFrame:
+    def _parse_sheet(self, workbook: Any, info: SheetInfo) -> pd.DataFrame:
         """Parse and clean a single sheet."""
-        parse_options = ParseOptions(
+        config = SheetConfig(
+            auto_detect=False,
             skip_rows=info.header_row,
             header_rows=1,
-        )
-
-        df = self._handler.parse(self.file_path, info.name, parse_options)
-
-        if df.empty:
-            return df
-
-        # Clean column names
-        if self.options.clean_column_names:
-            df = self._clean_column_names(df)
-
-        # Ensure type consistency
-        if self.options.ensure_type_consistency:
-            df = self._ensure_type_consistency(df)
-
-        # Handle missing values
-        handler = MissingValueHandler(
-            use_extended_list=self.options.use_extended_missing_list,
+            include_hidden=True,
+            sanitize_column_names=self.options.clean_column_names,
+            normalize_numbers=self.options.normalize_numbers,
+            use_extended_missing_list=self.options.use_extended_missing_list,
             preserve_types=self.options.preserve_types,
+            ensure_type_consistency=self.options.ensure_type_consistency,
+            decimal_separator=self.options.decimal_separator,
+            thousands_separator=self.options.thousands_separator,
         )
-        df = handler.normalize(df, drop_empty_rows=True, drop_empty_cols=True)
-
-        # Normalize numbers
-        if self.options.normalize_numbers:
-            normalizer = NumberNormalizer(
-                decimal_separator=self.options.decimal_separator,
-                thousands_separator=self.options.thousands_separator,
-            )
-            df = normalizer.normalize(df)
-
-        return df
-
-    def _clean_column_names(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Clean column names for database compatibility."""
-        new_columns = []
-        seen: dict[str, int] = {}
-
-        for col in df.columns:
-            clean = sanitize_column_name(col)
-
-            # Handle duplicates
-            if clean in seen:
-                seen[clean] += 1
-                clean = f"{clean}_{seen[clean]}"
-            else:
-                seen[clean] = 0
-
-            new_columns.append(clean)
-
-        df.columns = new_columns
-        return df
-
-    def _ensure_type_consistency(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Ensure each column has consistent types.
-
-        If a column has mixed types (e.g., strings and numbers),
-        convert all values to strings to prevent PyArrow errors.
-        """
-        for col in df.columns:
-            if df[col].dtype == object:
-                # Check for mixed numeric/string types
-                # Sample up to 1000 values - sufficient to detect mixed types
-                non_null = df[col].dropna()
-                sample = non_null.iloc[:1000]
-                types = set()
-                for val in sample:
-                    if isinstance(val, (int, float)):
-                        types.add("numeric")
-                    elif isinstance(val, str):
-                        types.add("string")
-                    else:
-                        types.add(type(val).__name__)
-
-                # If mixed, convert all to string
-                if len(types) > 1:
-                    df[col] = df[col].apply(
-                        lambda x: str(x) if pd.notna(x) and not isinstance(x, str) else x
-                    )
-
-        return df
+        return workbook.to_dataframe(info.name, config=config)
 
 
 # ============================================================================

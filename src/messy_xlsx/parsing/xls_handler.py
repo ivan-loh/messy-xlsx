@@ -4,15 +4,16 @@
 # Imports
 # ============================================================================
 
+from contextlib import closing
+
 import pandas as pd
 
+from messy_xlsx._source import SourceHandle
 from messy_xlsx.exceptions import FileError, FormatError
 from messy_xlsx.parsing.base_handler import (
     FileSource,
     FormatHandler,
     ParseOptions,
-    get_file_desc,
-    reset_buffer,
 )
 
 # ============================================================================
@@ -23,42 +24,58 @@ from messy_xlsx.parsing.base_handler import (
 class XLSHandler(FormatHandler):
     """Handler for legacy XLS files (Excel 97-2003)."""
 
+    _accepts_source_handle = True
+
     def can_handle(self, format_type: str) -> bool:
         """Check if this handler can process the format."""
         return format_type == "xls"
 
     def parse(
         self,
-        file_source: FileSource,
+        file_source: FileSource | SourceHandle,
         sheet: str | None,
         options: ParseOptions,
     ) -> pd.DataFrame:
         """Parse XLS file to DataFrame."""
-        reset_buffer(file_source)
-        file_desc = get_file_desc(file_source)
+        source = SourceHandle.coerce(file_source)
+        try:
+            return self._parse_source(source, sheet, options)
+        finally:
+            if source is not file_source:
+                source.close()
+
+    def _parse_source(
+        self,
+        source: SourceHandle,
+        sheet: str | None,
+        options: ParseOptions,
+    ) -> pd.DataFrame:
+        """Parse one replayable source view, borrowing afresh for retries."""
+        file_desc = source.description
         header = 0 if options.header_rows == 1 else None
 
         try:
-            df = pd.read_excel(
-                file_source,
-                sheet_name=sheet if sheet else 0,
-                skiprows=options.skip_rows if options.header_rows <= 1 else 0,
-                skipfooter=options.skip_footer,
-                na_values=options.na_values,
-                header=header,
-                engine="xlrd",
-            )
-        except ImportError:
-            try:
-                reset_buffer(file_source)
+            with source.open_backend() as backend_source:
                 df = pd.read_excel(
-                    file_source,
+                    backend_source,
                     sheet_name=sheet if sheet else 0,
                     skiprows=options.skip_rows if options.header_rows <= 1 else 0,
                     skipfooter=options.skip_footer,
                     na_values=options.na_values,
                     header=header,
+                    engine="xlrd",
                 )
+        except ImportError:
+            try:
+                with source.open_backend() as backend_source:
+                    df = pd.read_excel(
+                        backend_source,
+                        sheet_name=sheet if sheet else 0,
+                        skiprows=options.skip_rows if options.header_rows <= 1 else 0,
+                        skipfooter=options.skip_footer,
+                        na_values=options.na_values,
+                        header=header,
+                    )
             except Exception as e:
                 raise FormatError(
                     f"Cannot parse XLS file (xlrd may be required): {e}",
@@ -93,49 +110,61 @@ class XLSHandler(FormatHandler):
 
         return df
 
-    def get_sheet_names(self, file_source: FileSource) -> list[str]:
+    def get_sheet_names(self, file_source: FileSource | SourceHandle) -> list[str]:
         """Get list of sheet names."""
-        reset_buffer(file_source)
-        file_desc = get_file_desc(file_source)
-
+        source = SourceHandle.coerce(file_source)
         try:
-            xl_file = pd.ExcelFile(file_source, engine="xlrd")
-            sheets = list(xl_file.sheet_names)
-            xl_file.close()
-            return sheets
-        except ImportError:
+            file_desc = source.description
             try:
-                reset_buffer(file_source)
-                xl_file = pd.ExcelFile(file_source)
-                sheets = list(xl_file.sheet_names)
-                xl_file.close()
-                return sheets
+                with (
+                    source.open_backend() as backend_source,
+                    closing(pd.ExcelFile(backend_source, engine="xlrd")) as xl_file,
+                ):
+                    return list(xl_file.sheet_names)
+            except ImportError:
+                try:
+                    with (
+                        source.open_backend() as backend_source,
+                        closing(pd.ExcelFile(backend_source)) as xl_file,
+                    ):
+                        return list(xl_file.sheet_names)
+                except Exception:
+                    return ["Sheet1"]
+            except PermissionError as e:
+                raise FileError(
+                    f"Permission denied: {file_desc}",
+                    file_path=file_desc,
+                    operation="get_sheets",
+                ) from e
             except Exception:
                 return ["Sheet1"]
-        except PermissionError as e:
-            raise FileError(
-                f"Permission denied: {file_desc}",
-                file_path=file_desc,
-                operation="get_sheets",
-            ) from e
-        except Exception:
-            return ["Sheet1"]
+        finally:
+            if source is not file_source:
+                source.close()
 
-    def validate(self, file_source: FileSource) -> tuple[bool, str | None]:
+    def validate(self, file_source: FileSource | SourceHandle) -> tuple[bool, str | None]:
         """Validate that file can be parsed."""
-        reset_buffer(file_source)
-
+        source = SourceHandle.coerce(file_source)
         try:
-            xl_file = pd.ExcelFile(file_source, engine="xlrd")
-            xl_file.close()
-            return True, None
-        except ImportError:
             try:
-                reset_buffer(file_source)
-                xl_file = pd.ExcelFile(file_source)
-                xl_file.close()
+                with (
+                    source.open_backend() as backend_source,
+                    closing(pd.ExcelFile(backend_source, engine="xlrd")),
+                ):
+                    pass
                 return True, None
+            except ImportError:
+                try:
+                    with (
+                        source.open_backend() as backend_source,
+                        closing(pd.ExcelFile(backend_source)),
+                    ):
+                        pass
+                    return True, None
+                except Exception as e:
+                    return False, str(e)
             except Exception as e:
                 return False, str(e)
-        except Exception as e:
-            return False, str(e)
+        finally:
+            if source is not file_source:
+                source.close()

@@ -60,7 +60,7 @@ with MessyWorkbook(test_file, sheet_config=config2) as wb:
     structure = wb.get_structure()
     print(f"Detected header row: {structure.header_row}")
     print(f"Header confidence: {structure.header_confidence:.2f}")
-    print(f"Threshold: 0.8")
+    print("Threshold: 0.8")
 
     df = wb.to_dataframe()
     print(f"DataFrame shape: {df.shape}")
@@ -103,7 +103,7 @@ config4 = SheetConfig(
 
 with MessyWorkbook(test_file, sheet_config=config4) as wb:
     df = wb.to_dataframe()
-    print(f"Manual skip_rows: 2")
+    print("Manual skip_rows: 2")
     print(f"DataFrame shape: {df.shape}")
     print(f"Columns: {list(df.columns)[:5]}")
 

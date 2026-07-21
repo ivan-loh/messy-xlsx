@@ -4,22 +4,16 @@
 # Imports
 # ============================================================================
 
-from pathlib import Path
-from typing import Any, BinaryIO
+from contextlib import ExitStack
+from typing import Any
 
 import openpyxl
 
+from messy_xlsx._source import SourceHandle, SourceInput
 from messy_xlsx.cache import StructureCache, get_structure_cache
 from messy_xlsx.detection.locale_detector import LocaleDetector
 from messy_xlsx.exceptions import StructureError
 from messy_xlsx.models import StructureInfo, TableInfo
-
-# ============================================================================
-# Type Aliases
-# ============================================================================
-
-FileSource = Path | BinaryIO
-
 
 # ============================================================================
 # Config
@@ -37,6 +31,8 @@ MAX_SAMPLE_ROWS = 1_000
 class StructureAnalyzer:
     """Analyze Excel sheet structure."""
 
+    _accepts_source_handle = True
+
     def __init__(self, cache: StructureCache | None = None):
         """Initialize analyzer."""
         self.cache = cache or get_structure_cache()
@@ -44,34 +40,15 @@ class StructureAnalyzer:
 
     def analyze(
         self,
-        file_source: FileSource,
+        file_source: SourceInput | SourceHandle,
         sheet: str,
         force: bool = False,
         header_patterns: list[str] | None = None,
     ) -> StructureInfo:
         """Analyze sheet structure."""
-        is_fileobj = hasattr(file_source, "read")
-
-        # Only use cache for file paths (not file-like objects)
-        if not is_fileobj:
-            file_path = Path(file_source)  # type: ignore[arg-type]
-            if not force:
-                cached = self.cache.get(file_path, sheet)
-                if cached:
-                    return cached
-        else:
-            file_path = None
-            # Reset buffer position
-            if hasattr(file_source, "seek"):
-                file_source.seek(0)
-
+        owns_handle = not isinstance(file_source, SourceHandle)
         try:
-            # Note: Cannot use read_only=True as ReadOnlyWorksheet doesn't have merged_cells
-            wb = openpyxl.load_workbook(
-                file_source,
-                read_only=False,
-                data_only=True,
-            )
+            handle = SourceHandle.coerce(file_source)
         except Exception as e:
             raise StructureError(
                 f"Cannot open file for analysis: {e}",
@@ -80,6 +57,48 @@ class StructureAnalyzer:
             ) from e
 
         try:
+            return self._analyze_handle(handle, sheet, force, header_patterns)
+        finally:
+            if owns_handle:
+                handle.close()
+
+    def _analyze_handle(
+        self,
+        handle: SourceHandle,
+        sheet: str,
+        force: bool,
+        header_patterns: list[str] | None,
+    ) -> StructureInfo:
+        """Analyze one sheet through a repeatable source handle."""
+        cache_variant = "\x1f".join(header_patterns or [])
+        file_path = handle.path
+
+        # Only use cache for file paths (not file-like objects)
+        if file_path is not None and not force:
+            cached = self.cache.get(file_path, sheet, variant=cache_variant)
+            if cached:
+                return cached
+
+        with ExitStack() as resources:
+            try:
+                backend_source = resources.enter_context(handle.open_backend())
+                # Note: Cannot use read_only=True as ReadOnlyWorksheet doesn't have merged_cells
+                wb = openpyxl.load_workbook(
+                    backend_source,
+                    read_only=False,
+                    data_only=True,
+                )
+            except Exception as e:
+                raise StructureError(
+                    f"Cannot open file for analysis: {e}",
+                    sheet=sheet,
+                    detection_phase="open",
+                ) from e
+
+            # Register after the source so LIFO cleanup closes the workbook
+            # before restoring or releasing the borrowed source.
+            resources.callback(wb.close)
+
             if sheet not in wb.sheetnames:
                 raise StructureError(
                     f"Sheet '{sheet}' not found",
@@ -103,12 +122,10 @@ class StructureAnalyzer:
             suggested_skip_rows = self._suggest_skip_rows(metadata, header_info)
             suggested_skip_footer = self._suggest_skip_footer(ws, data_region)
 
-        finally:
-            wb.close()
-
-        # Formula detection needs a separate data_only=False pass.
-        # Must run AFTER the first workbook is closed to avoid stream corruption.
-        has_formulas = self._detect_formulas_from_source(file_source, sheet, data_region)
+        # Formula expressions are unavailable from the cached-value view used
+        # for structural analysis. Keep the views separate so uncached formulas
+        # cannot change data bounds, header scoring, tables, or locale evidence.
+        has_formulas = self._detect_formulas_from_source(handle, sheet, data_region)
 
         result = StructureInfo(
             data_start_row=data_region["start_row"],
@@ -138,7 +155,7 @@ class StructureAnalyzer:
 
         # Only cache for file paths
         if file_path:
-            self.cache.put(file_path, sheet, result)
+            self.cache.put(file_path, sheet, result, variant=cache_variant)
 
         return result
 
@@ -310,7 +327,7 @@ class StructureAnalyzer:
             for val in non_empty:
                 val_str = str(val).lower()
                 # Check for snake_case or common header patterns
-                if re.match(r"^[a-z][a-z0-9_]*$", val_str) or re.search(
+                if re.match(r"^(?:[a-z]|\d+[a-z])[a-z0-9_]*$", val_str) or re.search(
                     r"\b(id|name|date|time|code|type|status|number|amount|qty|count|total)\b",
                     val_str,
                     re.I,
@@ -536,40 +553,55 @@ class StructureAnalyzer:
 
     def _detect_formulas_from_source(
         self,
-        file_source: FileSource,
+        source: SourceHandle,
         sheet: str,
         data_region: dict[str, int],
     ) -> bool:
-        """Check if sheet contains formulas using a data_only=False pass."""
-        try:
-            is_fileobj = hasattr(file_source, "read")
-            if is_fileobj and hasattr(file_source, "seek"):
-                file_source.seek(0)
-
-            wb2 = openpyxl.load_workbook(file_source, read_only=True, data_only=False)
+        """Check formulas in a separate expression-preserving workbook view."""
+        # Keep the source context outside the best-effort parser boundary:
+        # parser failures mean "formula evidence unavailable", while a cursor
+        # restoration failure is an ownership-contract error and must escape.
+        with source.open_backend() as backend_source:
             try:
-                ws2 = wb2[sheet]
+                workbook = openpyxl.load_workbook(
+                    backend_source,
+                    read_only=True,
+                    data_only=False,
+                )
+            except Exception:
+                return False
+
+            try:
+                worksheet = workbook[sheet]
+
                 total_rows = data_region["end_row"] - data_region["start_row"] + 1
                 sample_rows = min(50, total_rows)
-                sample_cols = min(10, data_region["end_col"] - data_region["start_col"] + 1)
+                sample_cols = min(
+                    10,
+                    data_region["end_col"] - data_region["start_col"] + 1,
+                )
 
-                for row_idx in range(
-                    data_region["start_row"], data_region["start_row"] + sample_rows
+                for row in worksheet.iter_rows(
+                    min_row=data_region["start_row"],
+                    max_row=data_region["start_row"] + sample_rows - 1,
+                    min_col=data_region["start_col"],
+                    max_col=data_region["start_col"] + sample_cols - 1,
+                    values_only=False,
                 ):
-                    for col_idx in range(
-                        data_region["start_col"], data_region["start_col"] + sample_cols
-                    ):
+                    for cell in row:
                         try:
-                            cell = ws2.cell(row_idx, col_idx)
                             if cell.data_type == "f":
                                 return True
-                        except Exception:
-                            pass
+                        except (AttributeError, IndexError, TypeError, ValueError):
+                            continue
+                return False
+            except Exception:
                 return False
             finally:
-                wb2.close()
-        except Exception:
-            return False
+                try:
+                    workbook.close()
+                except Exception:
+                    pass
 
     def _detect_sparse_columns(self, ws: Any, data_region: dict[str, int]) -> list[int]:
         """Identify columns that are >90% empty within the data region."""

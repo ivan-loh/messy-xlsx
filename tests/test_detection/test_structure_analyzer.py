@@ -1,7 +1,10 @@
 """Unit tests for StructureAnalyzer."""
 
+import openpyxl
+
 from messy_xlsx import MessyWorkbook
 from messy_xlsx.cache import StructureCache
+from messy_xlsx.detection import StructureAnalyzer
 
 
 class TestStructureAnalyzer:
@@ -50,6 +53,24 @@ class TestStructureAnalyzer:
 
             # messy_xlsx fixture has formulas (=B5+C5, =SUM(...), etc.)
             assert structure.has_formulas is True
+
+    def test_uncached_formula_outside_data_does_not_expand_structure(self, tmp_path):
+        """Formula expressions must not replace cached-value structure evidence."""
+        file_path = tmp_path / "formula-only-tail.xlsx"
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Data"
+        worksheet["A100"] = "=1+1"
+        workbook.save(file_path)
+        workbook.close()
+
+        structure = StructureAnalyzer().analyze(file_path, "Data", force=True)
+
+        assert structure.data_start_row == 1
+        assert structure.data_end_row == 1
+        assert structure.data_start_col == 1
+        assert structure.data_end_col == 1
+        assert structure.has_formulas is False
 
     def test_merged_cell_detection(self, merged_cells_xlsx):
         """Test merged cell detection."""

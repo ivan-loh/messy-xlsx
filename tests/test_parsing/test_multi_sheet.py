@@ -238,6 +238,7 @@ class TestSheetAnalysis:
             assert isinstance(info.name, str)
             assert isinstance(info.row_count, int)
             assert isinstance(info.col_count, int)
+            assert info.column_count == info.col_count
 
 
 class TestMetadataDetection:

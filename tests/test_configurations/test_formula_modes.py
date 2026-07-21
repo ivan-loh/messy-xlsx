@@ -3,7 +3,7 @@
 import openpyxl
 import pytest
 
-from messy_xlsx import MessyWorkbook
+from messy_xlsx import MessyWorkbook, SheetConfig
 from messy_xlsx.formulas import CircularRefStrategy, FormulaConfig, FormulaEvaluationMode
 
 
@@ -44,6 +44,22 @@ class TestFormulaEvaluationModes:
             assert len(df) == 1
             assert df.iloc[0]["a"] == 10
             assert df.iloc[0]["b"] == 20
+
+    def test_dataframe_can_preserve_formula_expressions(self, temp_dir):
+        """SheetConfig.evaluate_formulas=False returns formula expressions."""
+        file_path = temp_dir / "formula_expression.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["A", "B", "Sum"])
+        ws.append([10, 20, "=A2+B2"])
+        wb.save(file_path)
+        wb.close()
+
+        config = SheetConfig(evaluate_formulas=False)
+        with MessyWorkbook(file_path, sheet_config=config) as mwb:
+            df = mwb.to_dataframe()
+
+        assert df.iloc[0]["sum"] == "=A2+B2"
 
 
 class TestCircularReferenceStrategies:

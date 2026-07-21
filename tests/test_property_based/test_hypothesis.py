@@ -11,6 +11,7 @@ from hypothesis import strategies as st
 from openpyxl.utils.exceptions import IllegalCharacterError
 
 from messy_xlsx import MessyWorkbook
+from messy_xlsx.normalization import MissingValueHandler
 
 
 class TestPropertyBased:
@@ -74,7 +75,11 @@ class TestPropertyBased:
 
         # Skip illegal characters that openpyxl can't handle
         try:
-            ws.append([text_value])
+            cell = ws.cell(row=2, column=1, value=text_value)
+            # A leading "=" makes openpyxl serialize the value as a formula.
+            # This property is specifically about arbitrary text, so preserve
+            # the generated value's intended Excel cell type.
+            cell.data_type = "s"
         except IllegalCharacterError:
             assume(False)  # Skip this example
             return
@@ -92,7 +97,9 @@ class TestPropertyBased:
             # - Empty/whitespace-only values get dropped
             # For all other values, we should get exactly 1 row.
             footer_words = {"sum", "total", "subtotal", "grand total"}
-            missing_words = {"na", "n/a", "null", "none", "-", "--", "nan", "missing"}
+            missing_words = {
+                str(value).strip().lower() for value in MissingValueHandler().missing_values
+            }
             stripped = text_value.strip().lower()
             if stripped and stripped not in missing_words and stripped not in footer_words:
                 assert len(df) == 1

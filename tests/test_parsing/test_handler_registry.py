@@ -1,6 +1,11 @@
 """Unit tests for HandlerRegistry."""
 
+import pandas as pd
+import pytest
+
+from messy_xlsx.exceptions import FormatError
 from messy_xlsx.parsing import CSVHandler, HandlerRegistry, XLSXHandler
+from messy_xlsx.parsing.base_handler import FormatHandler, ParseOptions
 
 
 class TestHandlerRegistry:
@@ -52,3 +57,78 @@ class TestHandlerRegistry:
         )
 
         assert df is not None
+
+    def test_fallback_only_uses_handlers_for_detected_format(self, sample_xlsx):
+        """An incompatible handler must never be used as a recovery path."""
+
+        class FailingXlsxHandler(FormatHandler):
+            def can_handle(self, format_type):
+                return format_type == "xlsx"
+
+            def parse(self, file_source, sheet, options):
+                raise ValueError("primary failed")
+
+            def get_sheet_names(self, file_source):
+                return ["Data"]
+
+            def validate(self, file_source):
+                return True, None
+
+        class IncompatibleHandler(FormatHandler):
+            called = False
+
+            def can_handle(self, format_type):
+                return format_type == "unrelated"
+
+            def parse(self, file_source, sheet, options):
+                self.called = True
+                return pd.DataFrame({"wrong": [1]})
+
+            def get_sheet_names(self, file_source):
+                return ["Wrong"]
+
+            def validate(self, file_source):
+                return True, None
+
+        incompatible = IncompatibleHandler()
+        registry = HandlerRegistry(handlers=[FailingXlsxHandler(), incompatible])
+
+        with pytest.raises(FormatError, match="All handlers failed"):
+            registry.parse(sample_xlsx, "Data", ParseOptions(), format_type="xlsx")
+
+        assert incompatible.called is False
+
+    def test_fallback_preserves_compatible_custom_handlers(self, sample_xlsx):
+        """A second handler for the same format remains a valid fallback."""
+
+        class FailingXlsxHandler(FormatHandler):
+            def can_handle(self, format_type):
+                return format_type == "xlsx"
+
+            def parse(self, file_source, sheet, options):
+                raise ValueError("primary failed")
+
+            def get_sheet_names(self, file_source):
+                return ["Data"]
+
+            def validate(self, file_source):
+                return True, None
+
+        class BackupXlsxHandler(FormatHandler):
+            def can_handle(self, format_type):
+                return format_type == "xlsx"
+
+            def parse(self, file_source, sheet, options):
+                return pd.DataFrame({"recovered": [True]})
+
+            def get_sheet_names(self, file_source):
+                return ["Data"]
+
+            def validate(self, file_source):
+                return True, None
+
+        registry = HandlerRegistry(handlers=[FailingXlsxHandler(), BackupXlsxHandler()])
+
+        result = registry.parse(sample_xlsx, "Data", ParseOptions(), format_type="xlsx")
+
+        assert result.to_dict(orient="list") == {"recovered": [True]}

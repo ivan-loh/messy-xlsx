@@ -80,7 +80,10 @@ __all__ = [
     "StructureInfo",
     "UnsupportedFunctionError",
     "analyze_excel",
+    "analyze_structure",
     "read_all_sheets",
+    "read_excel",
+    "read_excel_tables",
     "sanitize_column_name",
 ]
 
@@ -93,18 +96,18 @@ __all__ = [
 def read_excel(file_path: str, sheet: str | None = None, **config_kwargs: Any) -> pd.DataFrame:
     """Quick function to read an Excel file to a pandas DataFrame."""
     config = SheetConfig(**config_kwargs) if config_kwargs else None
-    wb = MessyWorkbook(file_path, sheet_config=config)
-    return wb.to_dataframe(sheet=sheet)
+    with MessyWorkbook(file_path, sheet_config=config) as wb:
+        return wb.to_dataframe(sheet=sheet)
 
 
 def read_excel_tables(file_path: str, sheet: str | None = None) -> list[pd.DataFrame]:
     """Read all detected tables from a sheet."""
-    wb = MessyWorkbook(file_path)
-    sheet_obj = wb.get_sheet(sheet or wb.sheet_names[0])
-    return [table.to_dataframe() for table in sheet_obj.tables]
+    with MessyWorkbook(file_path) as wb:
+        sheet_obj = wb.get_sheet(sheet or wb.sheet_names[0])
+        return [table.to_dataframe() for table in sheet_obj.tables]
 
 
 def analyze_structure(file_path: str, sheet: str | None = None) -> StructureInfo:
     """Analyze and return structure info without loading data."""
-    wb = MessyWorkbook(file_path)
-    return wb.get_structure(sheet or wb.sheet_names[0])
+    with MessyWorkbook(file_path) as wb:
+        return wb.get_structure(sheet or wb.sheet_names[0])

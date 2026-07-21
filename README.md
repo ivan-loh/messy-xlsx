@@ -40,8 +40,16 @@ with MessyWorkbook("data.xlsx") as wb:
 
 # From bytes (S3, cloud storage)
 import io
-wb = MessyWorkbook(io.BytesIO(content), filename="data.xlsx")
+with MessyWorkbook(io.BytesIO(content), filename="data.xlsx") as wb:
+    df = wb.to_dataframe()
 ```
+
+`messy-xlsx` does not close caller-owned binary streams. For each library
+operation, a seekable stream is borrowed from byte zero and restored to the
+cursor position that operation received, including when parsing fails. Supply a
+non-seekable stream before any bytes have been consumed; it is read once into an
+internal snapshot, remains open, and leaves the original exhausted. `filename=`
+supplies or overrides `.name` for diagnostics and extension fallback.
 
 ## Configuration
 
@@ -71,11 +79,12 @@ config = SheetConfig(
     normalize_whitespace=True,
     sanitize_column_names=True,            # BigQuery-compatible names
 
-    # Formulas
+    # DataFrame formula cells: cached results (True) or expressions (False)
     evaluate_formulas=True,
 )
 
-wb = MessyWorkbook("data.xlsx", sheet_config=config)
+with MessyWorkbook("data.xlsx", sheet_config=config) as wb:
+    df = wb.to_dataframe()
 ```
 
 All string-based config values accept both raw strings and enum types:
@@ -121,14 +130,14 @@ and mixed-type columns are coerced to strings.
 
 ## Dependencies
 
-- Python >= 3.10
-- fastexcel >= 0.11
-- openpyxl >= 3.1
-- pandas >= 2.0
-- numpy >= 1.24
+- Python >= 3.11
+- fastexcel >= 0.19
+- openpyxl >= 3.1.5
+- pandas >= 3.0
+- numpy >= 2.4
 
 Optional:
-- formulas, xlcalculator (formula evaluation)
+- formulas (formula evaluation fallback for cell access)
 - xlrd (XLS support)
 
 ## Development

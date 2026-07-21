@@ -69,5 +69,5 @@ class TestFormatDetector:
         # But MessyWorkbook should reject it with a clear error
         from messy_xlsx import MessyWorkbook
 
-        with pytest.raises(FormatError, match="XLSB.*not supported"):
+        with pytest.raises(FormatError, match=r"XLSB.*not supported"):
             MessyWorkbook(xlsb_path)

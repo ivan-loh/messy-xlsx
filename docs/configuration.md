@@ -30,6 +30,11 @@ config = SheetConfig(
     normalize_numbers=True,
     normalize_whitespace=True,
     sanitize_column_names=True,
+    use_extended_missing_list=False,
+    preserve_types=True,
+    ensure_type_consistency=True,
+    decimal_separator=None,
+    thousands_separator=None,
 
     # Post-processing
     column_renames={},
@@ -39,7 +44,7 @@ config = SheetConfig(
 
     # Locale & formulas
     locale=None,
-    evaluate_formulas=True,
+    evaluate_formulas=True,  # Cached results; False preserves expressions
 )
 ```
 
@@ -94,6 +99,19 @@ config = SheetConfig(
 | `normalize_numbers` | `bool` | `True` | Convert number-like strings to numeric |
 | `normalize_whitespace` | `bool` | `True` | Strip and collapse whitespace |
 | `sanitize_column_names` | `bool` | `True` | BigQuery-compatible column names |
+| `use_extended_missing_list` | `bool` | `False` | Also treat ambiguous markers such as `-`, `.`, and `?` as missing |
+| `preserve_types` | `bool` | `True` | Use type-appropriate null representations |
+| `ensure_type_consistency` | `bool` | `True` | Coerce mixed columns for Arrow/BigQuery compatibility |
+| `decimal_separator` | `str \| None` | `None` | Explicit decimal separator override |
+| `thousands_separator` | `str \| None` | `None` | Explicit thousands separator override |
+
+### Formula cells in DataFrames
+
+`SheetConfig.evaluate_formulas=True` reads the cached result stored in the
+workbook. Set it to `False` to preserve formula expressions such as
+`"=A2+B2"` in the resulting DataFrame. `FormulaConfig` controls optional live
+evaluation for `MessyWorkbook.get_cell()`; it does not recalculate an entire
+DataFrame.
 
 ## Enum Types
 

@@ -5,6 +5,7 @@
 # ============================================================================
 
 from collections.abc import Iterator
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -60,8 +61,10 @@ class MessyTable:
         """Convert table to DataFrame."""
         range_str = self._info.to_range_string()
 
-        config = config or SheetConfig()
-        config.cell_range = range_str
+        # Inherit the workbook defaults when no table-specific config is given,
+        # while keeping both workbook- and caller-owned configs reusable.
+        base_config = config if config is not None else self._sheet._workbook._sheet_config
+        config = replace(base_config, cell_range=range_str)
 
         return self._sheet._workbook._parse_sheet(self._sheet.name, config)
 
@@ -93,7 +96,7 @@ class MessySheet:
     def structure(self) -> StructureInfo:
         """Get detected structure for this sheet."""
         if self._structure is None:
-            self._structure = self._workbook._analyze_structure(self._name)
+            self._structure = self._workbook.get_structure(self._name)
         return self._structure
 
     @property

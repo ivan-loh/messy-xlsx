@@ -7,6 +7,46 @@ from messy_xlsx.formulas import FormulaConfig, FormulaEngine, FormulaEvaluationM
 class TestFormulaEngine:
     """Test formula evaluation engine."""
 
+    def test_cached_only_returns_cached_value_without_evaluating(self):
+        """CACHED_ONLY must never invoke an evaluator."""
+        config = FormulaConfig(mode=FormulaEvaluationMode.CACHED_ONLY)
+        engine = FormulaEngine(config)
+
+        def should_not_evaluate(cell_ref):
+            raise AssertionError(f"unexpected evaluation of {cell_ref}")
+
+        engine._evaluate_formula = should_not_evaluate
+
+        assert engine.evaluate("Sheet", 1, 1, cached_value=12) == 12
+
+    def test_fallback_prefers_cached_value(self):
+        """Fallback mode uses a real cached result when one exists."""
+        config = FormulaConfig(mode=FormulaEvaluationMode.CACHED_WITH_FALLBACK)
+        engine = FormulaEngine(config)
+
+        def should_not_evaluate(cell_ref):
+            raise AssertionError(f"unexpected evaluation of {cell_ref}")
+
+        engine._evaluate_formula = should_not_evaluate
+
+        assert engine.evaluate("Sheet", 1, 1, cached_value=12) == 12
+
+    def test_fallback_evaluates_when_cached_value_is_missing(self):
+        """Fallback mode evaluates only when no cached result is available."""
+        config = FormulaConfig(mode=FormulaEvaluationMode.CACHED_WITH_FALLBACK)
+        engine = FormulaEngine(config)
+        engine._evaluate_formula = lambda cell_ref: 24
+
+        assert engine.evaluate("Sheet", 1, 1, cached_value=None) == 24
+
+    def test_always_evaluate_ignores_cached_value(self):
+        """ALWAYS_EVALUATE replaces even a populated cached result."""
+        config = FormulaConfig(mode=FormulaEvaluationMode.ALWAYS_EVALUATE)
+        engine = FormulaEngine(config)
+        engine._evaluate_formula = lambda cell_ref: 24
+
+        assert engine.evaluate("Sheet", 1, 1, cached_value=12) == 24
+
     def test_cached_value_mode(self, messy_xlsx):
         """Test that CACHED_ONLY mode parses without errors."""
         config = FormulaConfig(mode=FormulaEvaluationMode.CACHED_ONLY)

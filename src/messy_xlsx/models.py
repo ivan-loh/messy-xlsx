@@ -161,6 +161,11 @@ class SheetConfig:
     normalize_dates: bool = True  # Convert date-like columns to datetime
     normalize_numbers: bool = True  # Convert number-like strings to numeric
     normalize_whitespace: bool = True  # Clean whitespace in text columns
+    use_extended_missing_list: bool = False
+    preserve_types: bool = True
+    ensure_type_consistency: bool = True
+    decimal_separator: str | None = None
+    thousands_separator: str | None = None
 
     # Column name sanitization (ON by default for BigQuery compatibility)
     sanitize_column_names: bool = True

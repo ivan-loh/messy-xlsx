@@ -13,7 +13,7 @@ class TestMissingValueHandler:
         """Test standardizing various NA patterns."""
         handler = MissingValueHandler()
 
-        df = pd.DataFrame({"col": ["NA", "N/A", "null", "NULL", "value"]})
+        df = pd.DataFrame({"col": ["NA", "N/A", "null", "NULL", "nil", "NIL", "value"]})
 
         result = handler.normalize(df, drop_empty_rows=False)
 
@@ -21,7 +21,9 @@ class TestMissingValueHandler:
         assert pd.isna(result["col"].iloc[1])
         assert pd.isna(result["col"].iloc[2])
         assert pd.isna(result["col"].iloc[3])
-        assert result["col"].iloc[4] == "value"
+        assert pd.isna(result["col"].iloc[4])
+        assert pd.isna(result["col"].iloc[5])
+        assert result["col"].iloc[6] == "value"
 
     def test_extended_missing_values(self):
         """Test extended list with ambiguous values like dash."""

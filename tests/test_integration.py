@@ -14,6 +14,13 @@ class TestImports:
         assert hasattr(messy_xlsx, "SheetConfig")
         assert hasattr(messy_xlsx, "FormulaConfig")
 
+    def test_public_convenience_functions_are_exported(self):
+        """Convenience functions belong to the declared public API."""
+        import messy_xlsx
+
+        expected = {"read_excel", "read_excel_tables", "analyze_structure"}
+        assert expected <= set(messy_xlsx.__all__)
+
     def test_import_models(self):
         """Test models module import."""
         from messy_xlsx.models import (
@@ -107,6 +114,17 @@ class TestBasicParsing:
 
             df = sheet.to_dataframe()
             assert len(df) == 3
+
+    def test_table_parse_does_not_mutate_config(self, sample_xlsx):
+        """Table-scoped reads must not retain their range on caller config."""
+        from messy_xlsx import MessyWorkbook, SheetConfig
+
+        config = SheetConfig()
+        with MessyWorkbook(sample_xlsx) as workbook:
+            table = workbook.get_sheet("Data").tables[0]
+            table.to_dataframe(config)
+
+        assert config.cell_range is None
 
     def test_cell_access(self, sample_xlsx):
         """Test accessing individual cells."""

@@ -24,6 +24,10 @@
 
 ::: messy_xlsx.analyze_excel
 
+::: messy_xlsx.read_excel_tables
+
+::: messy_xlsx.analyze_structure
+
 ## Configuration
 
 ::: messy_xlsx.models.SheetConfig

@@ -57,9 +57,16 @@ import io
 from messy_xlsx import MessyWorkbook
 
 content = download_from_s3("bucket", "data.xlsx")
-wb = MessyWorkbook(io.BytesIO(content), filename="data.xlsx")
-df = wb.to_dataframe()
+with MessyWorkbook(io.BytesIO(content), filename="data.xlsx") as wb:
+    df = wb.to_dataframe()
 ```
+
+`messy-xlsx` does not close caller-owned binary streams. For each library
+operation, a seekable stream is borrowed from byte zero and restored to the
+cursor position that operation received, including when parsing fails. Supply a
+non-seekable stream before any bytes have been consumed; it is read once into an
+internal snapshot, remains open, and leaves the original exhausted. `filename=`
+supplies or overrides `.name` for diagnostics and extension fallback.
 
 ## Configuration
 

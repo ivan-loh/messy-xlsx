@@ -27,12 +27,18 @@ class NormalizationPipeline:
         thousands_separator: str | None = None,
         extra_missing_values: list[str] | None = None,
         preserve_linebreaks: bool = False,
+        use_extended_missing_list: bool = False,
+        preserve_types: bool = True,
     ):
         """Initialize pipeline."""
         self.whitespace = WhitespaceNormalizer()
         self.numbers = NumberNormalizer(decimal_separator, thousands_separator)
         self.dates = DateNormalizer()
-        self.missing = MissingValueHandler(extra_missing_values)
+        self.missing = MissingValueHandler(
+            extra_missing_values,
+            use_extended_list=use_extended_missing_list,
+            preserve_types=preserve_types,
+        )
         self.type_coercion = TypeCoercionNormalizer()
         self.type_inference = SemanticTypeInference()
         self.preserve_linebreaks = preserve_linebreaks

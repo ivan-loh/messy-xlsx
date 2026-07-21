@@ -42,6 +42,7 @@ nav:
   - Getting Started: getting-started.md
   - Configuration: configuration.md
   - API Reference: api.md
+  - Architecture Plan: architecture-refactor-plan.md
   - Changelog: changelog.md
 
 markdown_extensions:

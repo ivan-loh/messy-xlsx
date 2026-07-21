@@ -188,3 +188,30 @@ class TestXLSHandler:
         options = ParseOptions(header_rows=1)
         df = self.handler.parse(buf, None, options)
         assert len(df) == 2
+
+    def test_multi_sheet_public_api(self, temp_dir):
+        """Legacy XLS remains supported through the high-level multi-sheet API."""
+        pytest.importorskip("xlwt")
+        from messy_xlsx import read_all_sheets
+
+        path = temp_dir / "multi_sheet.xls"
+        _create_xls_file(path, [["Name", "Value"], ["A", 1], ["B", 2]])
+
+        sheets = read_all_sheets(path)
+
+        assert list(sheets) == ["Sheet1"]
+        assert len(sheets["Sheet1"]) == 2
+
+    def test_workbook_public_api(self, temp_dir):
+        """Legacy XLS parses through the primary workbook API."""
+        pytest.importorskip("xlwt")
+        from messy_xlsx import MessyWorkbook
+
+        path = temp_dir / "workbook.xls"
+        _create_xls_file(path, [["Name", "Value"], ["A", 1], ["B", 2]])
+
+        with MessyWorkbook(path) as workbook:
+            df = workbook.to_dataframe()
+
+        assert list(df.columns) == ["name", "value"]
+        assert len(df) == 2
