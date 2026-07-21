@@ -6,7 +6,7 @@
 # Core package
 pip install messy-xlsx
 
-# With formula evaluation support
+# With formula-evaluation fallback for individual cell access
 pip install messy-xlsx[formulas]
 
 # With legacy .xls support
@@ -20,12 +20,15 @@ pip install messy-xlsx[all]
 
 ### Quick Read
 
-The simplest way to read an Excel file:
+The simplest way to read an XLSX, XLSM, XLS, CSV, or TSV file:
 
 ```python
 from messy_xlsx import read_excel
 
 df = read_excel("data.xlsx")
+
+# SheetConfig fields can also be supplied as keyword arguments.
+sales = read_excel("data.xlsx", sheet="Sales", skip_rows=2, normalize=False)
 ```
 
 ### Workbook API
@@ -39,10 +42,13 @@ with MessyWorkbook("data.xlsx") as wb:
     # Parse a single sheet
     df = wb.to_dataframe(sheet="Sheet1")
 
-    # Parse all sheets
+    # Attempt every sheet; failed sheets are skipped by default
     all_dfs = wb.to_dataframes()
 
-    # Inspect structure without parsing
+    # Or retain structured details for any failed sheets
+    all_dfs, errors = wb.to_dataframes(include_errors=True)
+
+    # Inspect the detected structure
     structure = wb.get_structure()
     print(f"Header at row {structure.header_row}")
     print(f"Data rows: {structure.data_start_row}-{structure.data_end_row}")
@@ -61,12 +67,11 @@ with MessyWorkbook(io.BytesIO(content), filename="data.xlsx") as wb:
     df = wb.to_dataframe()
 ```
 
-`messy-xlsx` does not close caller-owned binary streams. For each library
-operation, a seekable stream is borrowed from byte zero and restored to the
-cursor position that operation received, including when parsing fails. Supply a
-non-seekable stream before any bytes have been consumed; it is read once into an
-internal snapshot, remains open, and leaves the original exhausted. `filename=`
-supplies or overrides `.name` for diagnostics and extension fallback.
+`messy-xlsx` never closes a caller-owned binary stream. It reads seekable streams
+from byte zero and restores their original cursor, including after a failure.
+Non-seekable streams must be supplied before any bytes are consumed; they are
+read once into an internal snapshot and remain open but exhausted. Use
+`filename=` to provide a useful name when the stream has no `.name` attribute.
 
 ## Configuration
 
@@ -94,16 +99,21 @@ See [Configuration](configuration.md) for all options.
 ```python
 from messy_xlsx import read_all_sheets, analyze_excel
 
-# Read all sheets at once
+# Select likely data sheets, skipping empty and pivot-like sheets by default
 results = read_all_sheets("data.xlsx")
 for name, df in results.items():
     print(f"{name}: {len(df)} rows")
 
-# Analyze without loading data
+# Inspect the selection metadata used by read_all_sheets()
 info = analyze_excel("data.xlsx")
 for sheet in info:
     print(f"{sheet.name}: {sheet.row_count} rows, {sheet.column_count} cols")
 ```
+
+`read_all_sheets()` and `analyze_excel()` accept filesystem paths to XLSX,
+XLSM, or XLS workbooks. Use `MessyWorkbook.to_dataframes()` when the input is a
+buffer, when every sheet should be attempted, or when structured per-sheet
+errors are needed.
 
 ## Error Handling
 
@@ -111,7 +121,12 @@ messy-xlsx uses a structured exception hierarchy:
 
 ```python
 from messy_xlsx import MessyWorkbook
-from messy_xlsx.exceptions import FileError, FormatError, StructureError
+from messy_xlsx.exceptions import (
+    FileError,
+    FormatError,
+    MessyXlsxError,
+    StructureError,
+)
 
 try:
     with MessyWorkbook("data.xlsx") as wb:
@@ -122,11 +137,8 @@ except FormatError as e:
     print(f"Format problem: {e}")
 except StructureError as e:
     print(f"Structure problem: {e}")
-```
-
-All exceptions have a `.to_dict()` method for structured logging:
-
-```python
 except MessyXlsxError as e:
-    log_structured(e.to_dict())
+    print(e.to_dict())  # Structured logging payload
 ```
+
+All library exceptions derive from `MessyXlsxError` and expose `.to_dict()`.
