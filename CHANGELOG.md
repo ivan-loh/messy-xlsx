@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-21
+
 ### Changed
 
 - Added `xlwt` to development dependencies so legacy `.xls` tests run instead of skip.
+- Declared `pyarrow` as a runtime dependency because the `fastexcel` DataFrame conversion
+  path requires it in clean installations.
 - Reused the core `MessyWorkbook` pipeline for multi-sheet parsing, removing duplicate
   header detection, normalization, type coercion, and column cleaning code.
 - Enabled the `fastexcel` path when structure analysis confirms that merged/hidden-cell
@@ -20,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   choices into one private frozen parse plan before parsing.
 - Centralized path, seekable-buffer, and read-once-stream access behind one internal source
   boundary shared by detection, analysis, validation, and format handlers.
+- Reduced the source distribution to the package source and public project metadata instead
+  of bundling test workbooks and internal development files.
+- Gated PyPI publishing on strict tag/version validation, the complete reusable CI workflow,
+  and the exact wheel and source distribution artifacts verified by that workflow.
+- Made documentation builds and dependency vulnerability scans blocking CI checks and pinned
+  release workflow actions to immutable commits.
 - Preserved legacy custom detectors, handlers, and registry subclasses through fresh raw
   source borrows unless an extension explicitly opts into the internal handle contract.
 
@@ -44,7 +54,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Synchronized documented runtime dependencies with `pyproject.toml`.
 - Corrected the property-test missing-value contract for `nil`/`NIL`.
 
-## [0.8.0] - 2026-02-25
+## [0.9.0] - 2026-04-05
+
+### Changed
+
+- Raised minimum dependency versions to fastexcel 0.19.0, openpyxl 3.1.5, pandas 3.0.0,
+  and NumPy 2.4.0.
+- Updated optional formula/XLS and development dependency floors for the supported
+  Python 3.11–3.14 matrix.
+- Added 31 messy-workbook regression fixtures covering generated, malformed, and
+  real-world-like inputs.
+
+### Fixed
+
+- Prevented numeric account codes and amounts from being misclassified as dates.
+- Normalized mixed-locale numeric columns per value, preserving decimal values such as
+  `0,22` as `0.22`.
+- Preserved already-numeric values instead of re-parsing them through locale separators.
+- Detected decimal separators without requiring thousands-separator evidence.
+- Accounted for hidden rows when applying `skip_rows` during header detection.
+- Restricted footer detection to specific footer phrases instead of matching bare `total`
+  or `sum` text.
+- Scanned across blank rows to detect separated footers.
+- Constrained parsing of multi-table sheets to the detected primary table.
+- Prevented the CSV fallback from decoding corrupted XLSX files as text.
+- Improved multi-row header selection with an underscore-based tie-breaker.
+
+## [0.8.0] - 2026-04-04
 
 ### Added
 

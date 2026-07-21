@@ -135,6 +135,7 @@ and mixed-type columns are coerced to strings.
 - openpyxl >= 3.1.5
 - pandas >= 3.0
 - numpy >= 2.4
+- pyarrow >= 23.0
 
 Optional:
 - formulas (formula evaluation fallback for cell access)

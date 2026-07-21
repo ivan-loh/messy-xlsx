@@ -5,31 +5,111 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    name: Build and Publish
+  validate:
+    name: Validate release
     runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-          cache: 'pip'
 
-      - name: Install build dependencies
+      - name: Validate release metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          python -m pip install --upgrade pip
-          pip install build
+          python - <<'PY'
+          import ast
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
 
-      - name: Build package
-        run: python -m build
+          tag = os.environ["RELEASE_TAG"]
+          match = re.fullmatch(
+              r"v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))",
+              tag,
+          )
+          if match is None:
+              raise SystemExit(f"Invalid release tag {tag!r}; expected vMAJOR.MINOR.PATCH")
+
+          tag_version = match.group(1)
+          project_version = tomllib.loads(
+              Path("pyproject.toml").read_text(encoding="utf-8")
+          )["project"]["version"]
+
+          tree = ast.parse(
+              Path("src/messy_xlsx/__init__.py").read_text(encoding="utf-8")
+          )
+          module_versions = [
+              ast.literal_eval(node.value)
+              for node in tree.body
+              if isinstance(node, ast.Assign)
+              and any(
+                  isinstance(target, ast.Name) and target.id == "__version__"
+                  for target in node.targets
+              )
+          ]
+
+          if project_version != tag_version or module_versions != [tag_version]:
+              raise SystemExit(
+                  "Version mismatch: "
+                  f"tag={tag_version}, project={project_version}, module={module_versions}"
+              )
+
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          if f"## [{tag_version}]" not in changelog:
+              raise SystemExit(f"CHANGELOG.md has no release section for {tag_version}")
+          PY
+
+      - name: Require the tagged commit to be the tip of main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
+
+  quality:
+    name: Verify release
+    needs: validate
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish verified artifacts
+    needs: quality
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/messy-xlsx
+    permissions:
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist
+          path: dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
+        with:
+          packages-dir: dist/
+          attestations: true
+          print-hash: true

@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   lint:
@@ -13,10 +17,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -47,10 +51,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
@@ -66,7 +70,7 @@ jobs:
 
       - name: Upload coverage reports
         if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
         with:
           fail_ci_if_error: false
           verbose: true
@@ -77,10 +81,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -89,24 +93,47 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install bandit pip-audit
-          pip install -e ".[dev]"
+          pip install -e ".[dev,all]"
 
       - name: Run bandit
-        run: bandit -r src/messy_xlsx/ -c pyproject.toml || true
+        run: bandit -r src/messy_xlsx/ -c pyproject.toml --severity-level medium
 
       - name: Run pip-audit
-        run: pip-audit || true
+        run: pip-audit
 
-  build:
-    name: Build Package
+  docs:
+    name: Documentation
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[docs]"
+
+      - name: Build documentation
+        run: mkdocs build --strict
+
+  build:
+    name: Build Package
+    needs: [lint, test, security, docs]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -122,8 +149,36 @@ jobs:
       - name: Check package with twine
         run: twine check dist/*
 
+      - name: Smoke test wheel and source distribution
+        run: |
+          python -m venv /tmp/messy-xlsx-wheel-smoke
+          /tmp/messy-xlsx-wheel-smoke/bin/python -m pip install --find-links dist "messy-xlsx[all]"
+          /tmp/messy-xlsx-wheel-smoke/bin/python - <<'PY'
+          from importlib.metadata import version
+
+          from messy_xlsx import __version__, read_excel
+
+          assert __version__ == version("messy-xlsx")
+          assert not read_excel("tests/samples/budget_vs_actuals.xlsx").empty
+          PY
+          /tmp/messy-xlsx-wheel-smoke/bin/python -m pip check
+
+          python -m venv /tmp/messy-xlsx-sdist-smoke
+          /tmp/messy-xlsx-sdist-smoke/bin/python -m pip install dist/*.tar.gz
+          /tmp/messy-xlsx-sdist-smoke/bin/python - <<'PY'
+          from importlib.metadata import version
+
+          from messy_xlsx import __version__, read_excel
+
+          assert __version__ == version("messy-xlsx")
+          assert not read_excel("tests/samples/budget_vs_actuals.xlsx").empty
+          PY
+          /tmp/messy-xlsx-sdist-smoke/bin/python -m pip check
+
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist
           path: dist/
+          if-no-files-found: error
+          retention-days: 7

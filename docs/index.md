@@ -34,8 +34,9 @@ See [Getting Started](getting-started.md) for more examples and
 
 ## Requirements
 
-- Python >= 3.10
-- pandas >= 2.0
-- openpyxl >= 3.1
-- fastexcel >= 0.11
-- numpy >= 1.24
+- Python >= 3.11
+- fastexcel >= 0.19
+- numpy >= 2.4
+- openpyxl >= 3.1.5
+- pandas >= 3.0
+- pyarrow >= 23.0

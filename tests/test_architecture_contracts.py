@@ -1,6 +1,7 @@
 """Characterization tests protecting public behavior during architectural refactors."""
 
 import io
+import xml.etree.ElementTree as ET
 import zipfile
 
 import openpyxl
@@ -15,8 +16,9 @@ from messy_xlsx.parsing import HandlerRegistry
 def _set_formula_cache(path, cell_ref, formula, value):
     """Inject an Excel-style cached value into an openpyxl-created workbook."""
     replacement_path = path.with_name(f"{path.stem}-cached{path.suffix}")
-    empty_cache = f'<c r="{cell_ref}"><f>{formula}</f><v></v></c>'.encode()
-    populated_cache = f'<c r="{cell_ref}"><f>{formula}</f><v>{value}</v></c>'.encode()
+    spreadsheet_namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    qualified = f"{{{spreadsheet_namespace}}}"
+    ET.register_namespace("", spreadsheet_namespace)
     replacement_made = False
 
     with (
@@ -26,8 +28,16 @@ def _set_formula_cache(path, cell_ref, formula, value):
         for entry in source.infolist():
             content = source.read(entry.filename)
             if entry.filename == "xl/worksheets/sheet1.xml":
-                replacement_made = empty_cache in content
-                content = content.replace(empty_cache, populated_cache)
+                root = ET.fromstring(content)
+                cell = root.find(f".//{qualified}c[@r='{cell_ref}']")
+                formula_node = None if cell is None else cell.find(f"{qualified}f")
+                if formula_node is not None and formula_node.text == formula:
+                    value_node = cell.find(f"{qualified}v")
+                    if value_node is None:
+                        value_node = ET.SubElement(cell, f"{qualified}v")
+                    value_node.text = str(value)
+                    content = ET.tostring(root, encoding="utf-8", xml_declaration=False)
+                    replacement_made = True
             target.writestr(entry, content)
 
     assert replacement_made, "formula cache placeholder was not found"

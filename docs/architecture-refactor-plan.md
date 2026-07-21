@@ -110,7 +110,7 @@ Status values: `DONE`, `IN PROGRESS`, `PLANNED`, `BLOCKED`, or `DEFERRED`.
 | S19 | Cache policy, identity, and concurrency hardening | PLANNED | S07, S10 | — |
 | S20 | Error taxonomy and diagnostics | PLANNED | S12, S13, S14, S16 | — |
 | S21 | Public API typing, deprecations, and lifecycle polish | PLANNED | S11, S18, S20 | — |
-| S22 | CI matrix, performance budgets, and release hardening | PLANNED | S21 | — |
+| S22 | CI matrix, performance budgets, and release hardening | IN PROGRESS | S21 | Release path now validates tags/versions, gates on full CI, smoke-tests clean artifacts, and publishes the verified build; benchmark/minimum-dependency gates remain |
 
 ## Dependency map
 
@@ -836,6 +836,7 @@ Append decisions here; do not rewrite history after a slice is complete.
 | 2026-07-21 | S07 | Keep paths as paths and create memoized, normalized, or detached byte views only when a backend requires them | Preserve native fast paths and avoid unconditional copies |
 | 2026-07-21 | S07 | Give legacy extensions fresh raw borrows unless they explicitly opt into `SourceHandle` | Preserve detector, handler, and registry-subclass compatibility |
 | 2026-07-21 | S07 | Use cached values for structure and a separate sequential expression scan for formulas | Formula-only cells must not change structural evidence, and read-only random cell access is prohibitively slow |
+| 2026-07-21 | S22 | Build once in unprivileged reusable CI and give only the artifact-download/publish job PyPI OIDC authority | The published wheel and sdist must be the exact artifacts that passed tests, metadata checks, and clean-install smoke tests |
 | 2026-07-21 | Plan | Resource lifecycle precedes session reuse | Optimization needs explicit ownership to remain safe |
 | 2026-07-21 | Plan | Public removals are outside this refactor program | Simplification must preserve current capability |
 
