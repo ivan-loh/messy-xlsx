@@ -9,7 +9,7 @@ be snapshotted without taking ownership.
 from __future__ import annotations
 
 import io
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import ClassVar, Literal
 
 import openpyxl
@@ -262,13 +262,20 @@ def test_explicit_filename_hint_supplies_stream_identity() -> None:
     assert source.closed is False
 
 
-def test_path_valued_stream_name_supplies_identity() -> None:
+@pytest.mark.parametrize(
+    "stream_name",
+    [Path("uploads/orders.xlsx"), PureWindowsPath("uploads/orders.xlsx")],
+    ids=["native", "windows"],
+)
+def test_path_valued_stream_name_supplies_identity(
+    stream_name: Path | PureWindowsPath,
+) -> None:
     source = NamedBytesIO(_xlsx_content(), "temporary.bin")
-    source.name = Path("uploads/orders.xlsx")
+    source.name = stream_name
 
     with MessyWorkbook(source) as workbook:
         assert workbook.format_type == "xlsx"
-        assert "uploads/orders.xlsx" in repr(workbook)
+        assert repr(str(source.name)) in repr(workbook)
 
     assert source.closed is False
 
