@@ -94,7 +94,7 @@
 | 5 | Lazy sheet metadata, interval indexes, and bounded structure sampling | 4 | [x] |
 | 6 | Immutable plans, reader contracts, and router | 2, 5 | [x] |
 | 7 | Fastexcel materialized Arrow reader | 6 | [x] |
-| 8 | Coordinate-aware Arrow transforms | 5, 7 | [ ] |
+| 8 | Coordinate-aware Arrow transforms | 5, 7 | [x] |
 | 9 | Closable stream lifecycle | 3, 6 | [ ] |
 | 10 | Openpyxl bounded-row OOXML reader | 8, 9 | [ ] |
 | 11 | Streaming normalization and schema enforcement | 9, 10 | [ ] |
@@ -1838,7 +1838,7 @@ git commit -m "perf: materialize OOXML through fastexcel Arrow"
   signal to transactional fallback; never classify generic Arrow, type, range,
   configuration, source, permission, memory, or process failures.
 
-- [ ] **Step 1: Write failing coordinate-precedence tests**
+- [x] **Step 1: Write failing coordinate-precedence tests**
 
 ```python
 # tests/test_coordinate_transforms.py
@@ -1888,7 +1888,7 @@ Run: `.venv/bin/pytest tests/test_coordinate_transforms.py -q`
 
 Expected: collection fails because coordinate types do not exist.
 
-- [ ] **Step 2: Define positional batch identity**
+- [x] **Step 2: Define positional batch identity**
 
 ```python
 @dataclass(frozen=True)
@@ -1915,7 +1915,7 @@ class CoordinateBatch:
 
 Every transform addresses columns by ordinal. Display names remain payload until final output, preserving duplicate and non-string labels.
 
-- [ ] **Step 3: Implement transform ordering and anchor projection expansion**
+- [x] **Step 3: Implement transform ordering and anchor projection expansion**
 
 Implement the design matrix in this exact order:
 
@@ -1948,13 +1948,13 @@ and finalizes footer/header state before attaching positional identities. The
 compiler has already resolved explicit versus detected values; do not reread
 `SheetConfig`. Tests enumerate the complete precedence matrix first.
 
-- [ ] **Step 4: Run transform, merge, header, and range regression tests**
+- [x] **Step 4: Run transform, merge, header, and range regression tests**
 
 Run: `.venv/bin/pytest tests/test_coordinate_transforms.py tests/test_configurations/test_merge_strategies.py tests/test_configurations/test_header_modes.py tests/test_parse_plan.py -q`
 
 Expected: all precedence cases and existing configuration tests pass.
 
-- [ ] **Step 5: Commit coordinate transforms**
+- [x] **Step 5: Commit coordinate transforms**
 
 ```bash
 git add src/messy_xlsx/parsing/coordinates.py src/messy_xlsx/parsing/xlsx_materialized.py src/messy_xlsx/parsing/legacy_adapter.py src/messy_xlsx/parsing/router.py src/messy_xlsx/parsing/xlsx_handler.py src/messy_xlsx/workbook.py tests/test_coordinate_transforms.py tests/test_xlsx_materialized.py
