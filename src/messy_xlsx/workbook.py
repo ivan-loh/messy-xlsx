@@ -18,6 +18,7 @@ import pandas as pd
 
 from messy_xlsx._fallback_signals import (
     _blocks_backend_retry,
+    _bounded_exception_graph,
     _contains_process_failure,
     _exception_traceback,
     _FallbackBlockReason,
@@ -68,6 +69,11 @@ def _operation_error(message: str) -> _ActiveOperationError:
         _FallbackBlockReason.CONFIGURATION,
     )
     return error
+
+
+def _contains_active_operation_error(error: BaseException) -> bool:
+    candidates, _complete = _bounded_exception_graph(error)
+    return any(isinstance(candidate, _ActiveOperationError) for candidate in candidates)
 
 
 _OwnedResourceT = TypeVar("_OwnedResourceT")
@@ -435,7 +441,7 @@ class MessyWorkbook:
                 except _ActiveOperationError:
                     raise
                 except Exception as e:
-                    if _contains_process_failure(e):
+                    if _contains_active_operation_error(e) or _contains_process_failure(e):
                         raise
                     logger.warning("Failed to parse sheet %r, skipping", name, exc_info=True)
                     if include_errors:

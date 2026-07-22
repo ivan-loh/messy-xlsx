@@ -467,6 +467,56 @@ def test_reentrant_custom_parse_error_is_not_swallowed_by_to_dataframes(
             workbook.to_dataframes(include_errors=True)
 
 
+def test_wrapped_reentrant_custom_parse_cause_is_not_swallowed_by_to_dataframes(
+    sample_xlsx: Any,
+) -> None:
+    class WrappedReentrantRegistry(HandlerRegistry):
+        workbook: MessyWorkbook
+        wrapped: ValueError | None = None
+
+        def parse(self, *_args: Any, **_kwargs: Any) -> pd.DataFrame:
+            try:
+                return self.workbook.to_dataframe()
+            except RuntimeError as error:
+                self.wrapped = ValueError("wrapped reentrant parse")
+                raise self.wrapped from error
+
+    registry = WrappedReentrantRegistry()
+    with MessyWorkbook(sample_xlsx, registry=registry) as workbook:
+        registry.workbook = workbook
+        with pytest.raises(ValueError, match="wrapped reentrant parse") as captured:
+            workbook.to_dataframes(include_errors=True)
+
+    assert captured.value is registry.wrapped
+    assert isinstance(captured.value.__cause__, RuntimeError)
+
+
+def test_grouped_reentrant_custom_parse_error_is_not_swallowed_by_to_dataframes(
+    sample_xlsx: Any,
+) -> None:
+    class GroupedReentrantRegistry(HandlerRegistry):
+        workbook: MessyWorkbook
+        wrapped: ExceptionGroup | None = None
+
+        def parse(self, *_args: Any, **_kwargs: Any) -> pd.DataFrame:
+            try:
+                return self.workbook.to_dataframe()
+            except RuntimeError as error:
+                self.wrapped = ExceptionGroup(
+                    "grouped reentrant parse",
+                    [ValueError("ordinary"), error],
+                )
+                raise self.wrapped from None
+
+    registry = GroupedReentrantRegistry()
+    with MessyWorkbook(sample_xlsx, registry=registry) as workbook:
+        registry.workbook = workbook
+        with pytest.raises(ExceptionGroup, match="grouped reentrant parse") as captured:
+            workbook.to_dataframes(include_errors=True)
+
+    assert captured.value is registry.wrapped
+
+
 def test_process_failure_is_not_swallowed_by_to_dataframes(sample_xlsx: Any) -> None:
     failure = MemoryError("parse process failure")
 
