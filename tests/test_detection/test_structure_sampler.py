@@ -264,18 +264,27 @@ def _workbook_bytes(tmp_path: Path, *, disk_spool: bool) -> bytes:
     return path.read_bytes()
 
 
-@pytest.mark.parametrize("source_kind", ["path", "memory_spool", "disk_spool"])
+@pytest.mark.parametrize(
+    "source_kind",
+    ["path", "seekable_buffer", "memory_spool", "disk_spool"],
+)
 def test_fresh_components_analyze_multiple_sheets_without_nested_borrows(
     tmp_path: Path,
     source_kind: str,
 ) -> None:
     content = _workbook_bytes(tmp_path, disk_spool=source_kind == "disk_spool")
-    raw_source = (
-        tmp_path / "composition.xlsx" if source_kind == "path" else NonSeekableBytes(content)
-    )
+    if source_kind == "path":
+        raw_source = tmp_path / "composition.xlsx"
+    elif source_kind == "seekable_buffer":
+        raw_source = io.BytesIO(content)
+        raw_source.seek(7)
+    else:
+        raw_source = NonSeekableBytes(content)
 
     with SourceHandle(raw_source) as source:
-        reader = ManifestReader(source)
+        opened: list[str] = []
+        reader = ManifestReader(source, on_member_open=opened.append)
+        assert not any(member.startswith("xl/worksheets/") for member in opened)
         with FastexcelSession(source) as session:
             sampler = StructureSampler(session, reader)
             first = sampler.analyze("First")
@@ -283,6 +292,18 @@ def test_fresh_components_analyze_multiple_sheets_without_nested_borrows(
 
         assert first.data_start_row == 1
         assert second.data_start_row == 1
+        assert sum(member.startswith("xl/worksheets/") for member in opened) == 2
+        with pytest.raises(RuntimeError, match="closed"):
+            session.sample_windows(
+                "First",
+                (SampleWindow(1, 1),),
+                min_column=1,
+                max_column=1,
+            )
+
+    if isinstance(raw_source, io.BytesIO):
+        assert raw_source.tell() == 7
+        assert raw_source.closed is False
 
 
 @pytest.mark.parametrize(
