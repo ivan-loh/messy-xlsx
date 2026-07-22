@@ -60,7 +60,14 @@ class FastexcelSession:
         values = pd.concat(frames, axis=0) if frames else pd.DataFrame()
         return StructureEvidence(tuple(rows), values)
 
-    def materialize(self, sheet: str, *, skip_rows: int) -> Any:
+    def materialize(
+        self,
+        sheet: str,
+        *,
+        skip_rows: int,
+        dtype_coercion: str = "coerce",
+        eager: bool = True,
+    ) -> Any:
         """Perform one whole-sheet fastexcel materialization for the caller."""
         self._ensure_open()
         return self._reader.load_sheet(
@@ -68,8 +75,8 @@ class FastexcelSession:
             header_row=None,
             skip_rows=skip_rows,
             schema_sample_rows=1_000,
-            dtype_coercion="coerce",
-            eager=True,
+            dtype_coercion=dtype_coercion,
+            eager=eager,
         )
 
     def close(self) -> None:

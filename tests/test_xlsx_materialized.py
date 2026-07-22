@@ -15,13 +15,20 @@ import pytest
 from pandas.testing import assert_frame_equal
 
 import messy_xlsx.parsing.xlsx_handler as xlsx_handler_module
+import messy_xlsx.parsing.xlsx_materialized as xlsx_materialized_module
 from messy_xlsx import MessyWorkbook, SheetConfig
 from messy_xlsx._source import SourceHandle
 from messy_xlsx._spool import DEFAULT_MEMORY_LIMIT
 from messy_xlsx.enums import MergeStrategy
 from messy_xlsx.exceptions import FileError, FormatError
+from messy_xlsx.ooxml.manifest import ManifestReader
+from messy_xlsx.ooxml.models import IntervalIndex
 from messy_xlsx.parsing.base_handler import ParseOptions
 from messy_xlsx.parsing.contracts import OutputMode, ParseMetrics
+from messy_xlsx.parsing.coordinates import (
+    CoordinateCompatibilityError,
+    CoordinateTransform,
+)
 from messy_xlsx.parsing.fallback import FallbackCoordinator
 from messy_xlsx.parsing.fastexcel_session import FastexcelSession
 from messy_xlsx.parsing.legacy_adapter import LegacyDataFrameAdapter
@@ -127,6 +134,25 @@ class _ArrowWrapper:
 
     def to_arrow(self) -> object:
         self.calls += 1
+        return self.value
+
+
+class _ColumnOrigin:
+    def __init__(self, absolute_index: object) -> None:
+        self.absolute_index = absolute_index
+
+
+class _OriginWrapper(_ArrowWrapper):
+    def __init__(self, value: object, origins: list[object]) -> None:
+        super().__init__(value)
+        self.selected_columns = [_ColumnOrigin(origin) for origin in origins]
+
+
+class _TransformSessionFake:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def materialize(self, *_args: object, **_kwargs: object) -> object:
         return self.value
 
 
@@ -544,21 +570,9 @@ def test_workbook_reuses_one_session_and_closes_it_before_owned_spill(
     assert stream.closed is False
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        _eligible_config(evaluate_formulas=False),
-        _eligible_config(merge_strategy=MergeStrategy.FILL),
-        _eligible_config(merge_strategy=MergeStrategy.FIRST_ONLY),
-        _eligible_config(include_hidden=False),
-        _eligible_config(cell_range="A1:B2"),
-    ],
-    ids=["formula-expression", "merge-fill", "merge-first-only", "hidden", "range"],
-)
-def test_task8_coordinate_and_formula_features_stay_on_openpyxl(
+def test_formula_expressions_remain_on_openpyxl(
     sample_xlsx: Path,
     monkeypatch: pytest.MonkeyPatch,
-    config: SheetConfig,
 ) -> None:
     real_load_workbook = openpyxl.load_workbook
     calls = 0
@@ -569,16 +583,861 @@ def test_task8_coordinate_and_formula_features_stay_on_openpyxl(
         return real_load_workbook(*args, **kwargs)
 
     def forbidden_reader(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("advanced compatibility features must not reach fastexcel")
+        raise AssertionError("formula expressions must not reach fastexcel")
+
+    def forbidden_manifest(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("formula expressions must not construct a manifest reader")
 
     monkeypatch.setattr(openpyxl, "load_workbook", recording_load)
     monkeypatch.setattr(FastexcelMaterializedReader, "read_table", forbidden_reader)
+    monkeypatch.setattr(ManifestReader, "__init__", forbidden_manifest)
 
-    with MessyWorkbook(sample_xlsx, sheet_config=config) as workbook:
+    with MessyWorkbook(
+        sample_xlsx,
+        sheet_config=_eligible_config(evaluate_formulas=False),
+    ) as workbook:
         frame = workbook._to_dataframe_compat("Data")
 
     assert isinstance(frame, pd.DataFrame)
     assert calls == 1
+
+
+def test_cached_merge_fill_materializes_without_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "merge-fill.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet["A1"] = "anchor"
+    sheet.merge_cells("A1:B1")
+    sheet.append(["left", "right"])
+    workbook.save(path)
+    workbook.close()
+
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("coordinate merge must avoid openpyxl"),
+    )
+    config = _eligible_config(
+        merge_strategy=MergeStrategy.FILL,
+        header_rows=0,
+    )
+    with MessyWorkbook(path, sheet_config=config) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.to_dict(orient="split")["data"] == [
+        ["anchor", "anchor"],
+        ["left", "right"],
+    ]
+
+
+def test_hidden_coordinates_materialize_without_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "hidden.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    for row in (("a1", "b1", "c1"), ("a2", "b2", "c2"), ("a3", "b3", "c3")):
+        sheet.append(row)
+    sheet.row_dimensions[2].hidden = True
+    sheet.column_dimensions["B"].hidden = True
+    workbook.save(path)
+    workbook.close()
+
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("coordinate hidden filter must avoid openpyxl"),
+    )
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(include_hidden=False, header_rows=0),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.to_dict(orient="split")["data"] == [["a1", "c1"], ["a3", "c3"]]
+
+
+def test_in_bounds_range_materializes_without_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "range.xlsx"
+    _save_rows(
+        path,
+        [["a1", "b1", "c1"], ["a2", "b2", "c2"], ["a3", "b3", "c3"]],
+    )
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("coordinate range must avoid openpyxl"),
+    )
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(cell_range="B2:C3", header_rows=0),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.to_dict(orient="split")["data"] == [["b2", "c2"], ["b3", "c3"]]
+
+
+def test_out_of_bounds_range_is_padded_or_routes_before_primary_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "padded-range.xlsx"
+    _save_rows(path, [["a1", "b1"], ["a2", "b2"]])
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("bounded range padding must avoid openpyxl"),
+    )
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(cell_range="A1:C3", header_rows=0),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.iloc[:2].to_dict(orient="split")["data"] == [
+        ["a1", "b1", None],
+        ["a2", "b2", None],
+    ]
+    assert frame.iloc[2].isna().all()
+
+
+def test_leading_blank_columns_use_selected_column_origins_without_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "leading-c.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet["C1"] = "c1"
+    sheet["C2"] = "c2"
+    workbook.save(path)
+    workbook.close()
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("column origins must avoid openpyxl"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(include_hidden=False, header_rows=0),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.to_dict(orient="split")["data"] == [
+        [None, None, "c1"],
+        [None, None, "c2"],
+    ]
+
+
+def test_internal_blank_column_gap_is_densified_without_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "internal-column-gap.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet["A1"] = "a"
+    sheet["C1"] = "c"
+    workbook.save(path)
+    workbook.close()
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("column gaps must stay coordinate-primary"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(
+            merge_strategy=MergeStrategy.FILL,
+            header_rows=0,
+        ),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.iloc[0].tolist() == ["a", None, "c"]
+
+
+def test_range_padding_surrounds_single_observed_cell_without_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "surrounded-range.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet["B2"] = "center"
+    workbook.save(path)
+    workbook.close()
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("range padding must stay coordinate-primary"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(cell_range="A1:C3", header_rows=0),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.shape == (3, 3)
+    assert frame.iloc[1, 1] == "center"
+    assert frame.drop(index=1).isna().all().all()
+    assert frame.iloc[1, [0, 2]].isna().all()
+
+
+def test_duplicate_headers_clean_excel_errors_by_position_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "duplicate-errors.xlsx"
+    _save_rows(
+        path,
+        [["Status", "Status"], ["#N/A", "#REF!"], ["left", "right"]],
+    )
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("duplicate text range must stay primary"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(cell_range="A1:B3", header_rows=1),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert list(frame.columns) == ["Status", "Status"]
+    assert frame.iloc[0].isna().all()
+    assert frame.iloc[1].tolist() == ["left", "right"]
+
+
+def test_grouped_hidden_column_span_stays_on_legacy_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "grouped-hidden.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet.append(["a", "b", "c", "d", "e"])
+    sheet.column_dimensions.group("B", "D", hidden=True)
+    workbook.save(path)
+    workbook.close()
+    monkeypatch.setattr(
+        FastexcelMaterializedReader,
+        "read_table",
+        lambda _self: pytest.fail("grouped hidden span must pre-route to openpyxl"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(include_hidden=False, header_rows=0),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.iloc[0].tolist() == ["a", "c", "d", "e"]
+
+
+def test_coordinate_path_converts_to_pandas_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "adapter-once.xlsx"
+    _save_rows(path, [["h1", "h2"], ["a", "b"], ["footer", "footer"]])
+    adapter_calls = 0
+    adapter_original = LegacyDataFrameAdapter.to_dataframe
+
+    def recording_adapter(
+        self: LegacyDataFrameAdapter,
+        table: object,
+        plan: ParsePlan,
+    ) -> pd.DataFrame:
+        nonlocal adapter_calls
+        adapter_calls += 1
+        return adapter_original(self, table, plan)
+
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("text coordinate path must stay primary"),
+    )
+    monkeypatch.setattr(LegacyDataFrameAdapter, "to_dataframe", recording_adapter)
+    config = _eligible_config(
+        cell_range="A1:B3",
+        header_rows=1,
+        skip_footer=1,
+    )
+    with MessyWorkbook(path, sheet_config=config) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.to_dict(orient="list") == {"h1": ["a"], "h2": ["b"]}
+    assert adapter_calls == 1
+
+
+def test_coordinate_path_does_not_apply_header_or_footer_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "framing-once.xlsx"
+    _save_rows(path, [["h1", "h2"], ["a", "b"], ["footer", "footer"]])
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("coordinate framing must stay primary"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(
+            cell_range="A1:B3",
+            header_rows=1,
+            skip_footer=1,
+        ),
+    ) as workbook:
+        frame = workbook._to_dataframe_compat("Data")
+
+    assert frame.to_dict(orient="split") == {
+        "index": [0],
+        "columns": ["h1", "h2"],
+        "data": [["a", "b"]],
+    }
+
+
+def test_mixed_type_merge_fill_retries_legacy_once_before_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "mixed-merge.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet["A1"] = "anchor"
+    sheet.merge_cells("A1:B1")
+    sheet["A2"] = "other"
+    sheet["B2"] = 1
+    workbook.save(path)
+    workbook.close()
+    materializations = 0
+    openpyxl_calls = 0
+    materialize_original = FastexcelSession.materialize
+    load_original = openpyxl.load_workbook
+
+    def recording_materialize(self: FastexcelSession, *args: object, **kwargs: object) -> object:
+        nonlocal materializations
+        materializations += 1
+        return materialize_original(self, *args, **kwargs)
+
+    def recording_load(*args: object, **kwargs: object) -> Any:
+        nonlocal openpyxl_calls
+        openpyxl_calls += 1
+        return load_original(*args, **kwargs)
+
+    monkeypatch.setattr(FastexcelSession, "materialize", recording_materialize)
+    monkeypatch.setattr(openpyxl, "load_workbook", recording_load)
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(
+            merge_strategy=MergeStrategy.FILL,
+            header_rows=0,
+        ),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.iloc[0].tolist() == ["anchor", "anchor"]
+    assert frame.iloc[1].tolist() == ["other", 1]
+    assert materializations == 1
+    assert openpyxl_calls == 1
+
+
+def test_coordinate_path_reuses_one_sheet_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "manifest-reuse.xlsx"
+    _save_rows(path, [["a", "b"], ["c", "d"]])
+    parses = 0
+    parse_original = ManifestReader._parse_sheet
+
+    def recording_parse(self: ManifestReader, descriptor: object) -> object:
+        nonlocal parses
+        parses += 1
+        return parse_original(self, descriptor)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ManifestReader, "_parse_sheet", recording_parse)
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(cell_range="A1:B2", header_rows=0),
+    ) as messy:
+        first = messy._to_dataframe_compat("Data")
+        second = messy._to_dataframe_compat("Data")
+
+    assert_frame_equal(first, second)
+    assert parses == 1
+
+
+def test_coordinate_compatibility_signal_is_the_only_new_retry_type() -> None:
+    assert is_fastexcel_compatibility_error(CoordinateCompatibilityError("coordinate"))
+    assert not is_fastexcel_compatibility_error(ValueError("coordinate"))
+
+
+def test_coordinate_missing_sheet_keeps_registry_error_boundary(
+    sample_xlsx: Path,
+) -> None:
+    with (
+        MessyWorkbook(
+            sample_xlsx,
+            sheet_config=_eligible_config(cell_range="A1:B2"),
+        ) as workbook,
+        pytest.raises(FormatError) as captured,
+    ):
+        workbook._to_dataframe_compat("Missing")
+
+    assert captured.value.message == "All handlers failed for sample.xlsx"
+    assert captured.value.context["attempted_formats"] == ["XLSXHandler"]
+
+
+def test_merge_extent_densifies_anchor_only_rectangle_without_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "anchor-only-merge.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet["A1"] = "anchor"
+    sheet.merge_cells("A1:C3")
+    workbook.save(path)
+    workbook.close()
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("merge envelope must avoid openpyxl"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(
+            merge_strategy=MergeStrategy.FILL,
+            header_rows=0,
+        ),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.to_dict(orient="split")["data"] == [["anchor"] * 3] * 3
+
+
+def test_all_columns_hidden_stays_on_legacy_zero_column_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "all-hidden.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet.append(["a", "b"])
+    sheet.append(["c", "d"])
+    sheet.column_dimensions["A"].hidden = True
+    sheet.column_dimensions["B"].hidden = True
+    workbook.save(path)
+    workbook.close()
+    monkeypatch.setattr(
+        FastexcelMaterializedReader,
+        "read_table",
+        lambda _self: pytest.fail("all-hidden columns must pre-route"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(include_hidden=False, header_rows=0),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.shape == (2, 0)
+
+
+@pytest.mark.parametrize(
+    ("origins", "column_count"),
+    [
+        ([True], 1),
+        ([0, 0], 2),
+        ([1, 0], 2),
+        ([16_384], 1),
+        ([0], 2),
+    ],
+)
+def test_invalid_selected_column_origins_raise_exact_compatibility_signal(
+    basic_parse_plan: ParsePlan,
+    origins: list[object],
+    column_count: int,
+) -> None:
+    wrapper = _OriginWrapper(
+        pa.record_batch(
+            [["value"] for _ in range(column_count)],
+            names=[str(index) for index in range(column_count)],
+        ),
+        origins,
+    )
+    transform = CoordinateTransform(IntervalIndex(()), IntervalIndex(()), ())
+
+    with pytest.raises(CoordinateCompatibilityError):
+        FastexcelMaterializedReader(
+            _TransformSessionFake(wrapper),  # type: ignore[arg-type]
+            "Data",
+            basic_parse_plan,
+            transform,
+        ).read_table()
+
+
+def test_tiny_range_does_not_densify_style_only_trailing_extent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = compile_parse_plan(
+        _eligible_config(cell_range="A1:A1", header_rows=0),
+        structure=None,
+        format_type="xlsx",
+        output_mode=OutputMode.MATERIALIZED,
+        batch_size=None,
+    )
+    transform = CoordinateTransform(IntervalIndex(()), IntervalIndex(()), ())
+    object.__setattr__(transform, "_observed_max_row", 1_048_576)
+    wrapper = _OriginWrapper(pa.table({"0": ["value"]}), [0])
+    original_envelope = xlsx_materialized_module._envelope_batch
+
+    def bounded_envelope(
+        arrays_by_column: dict[int, pa.Array],
+        envelope_columns: tuple[int, ...],
+        start_row: int,
+        row_count: int,
+    ) -> object:
+        assert row_count <= 1
+        return original_envelope(
+            arrays_by_column,
+            envelope_columns,
+            start_row,
+            row_count,
+        )
+
+    monkeypatch.setattr(
+        xlsx_materialized_module,
+        "_envelope_batch",
+        bounded_envelope,
+    )
+
+    table = FastexcelMaterializedReader(
+        _TransformSessionFake(wrapper),  # type: ignore[arg-type]
+        "Data",
+        plan,
+        transform,
+    ).read_table()
+
+    assert table.to_pydict() == {"col_0": ["value"]}
+
+
+def test_selected_column_origin_is_read_before_one_to_arrow_call() -> None:
+    plan = compile_parse_plan(
+        _eligible_config(cell_range="C1:C2", header_rows=0),
+        structure=None,
+        format_type="xlsx",
+        output_mode=OutputMode.MATERIALIZED,
+        batch_size=None,
+    )
+    transform = CoordinateTransform(IntervalIndex(()), IntervalIndex(()), ())
+    wrapper = _OriginWrapper(pa.table({"0": ["c1", "c2"]}), [2])
+
+    table = FastexcelMaterializedReader(
+        _TransformSessionFake(wrapper),  # type: ignore[arg-type]
+        "Data",
+        plan,
+        transform,
+    ).read_table()
+
+    assert wrapper.calls == 1
+    assert table.to_pydict() == {"col_0": ["c1", "c2"]}
+
+
+def test_multichunk_coordinate_reader_preserves_buffers_without_raw_concat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = compile_parse_plan(
+        _eligible_config(header_rows=0),
+        structure=None,
+        format_type="xlsx",
+        output_mode=OutputMode.MATERIALIZED,
+        batch_size=None,
+    )
+    transform = CoordinateTransform(IntervalIndex(()), IntervalIndex(()), ())
+    chunks = (pa.array(["a", "b"]), pa.array(["c", "d"]))
+    wrapper = _OriginWrapper(
+        pa.table({"0": pa.chunked_array(chunks)}),
+        [0],
+    )
+    original_concat = xlsx_materialized_module.pa.concat_arrays
+
+    def bounded_concat(arrays: list[pa.Array]) -> pa.Array:
+        if any(len(array) for array in arrays):
+            pytest.fail("raw worksheet buffers must not be concatenated")
+        return original_concat(arrays)
+
+    monkeypatch.setattr(
+        xlsx_materialized_module.pa,
+        "concat_arrays",
+        bounded_concat,
+    )
+
+    table = FastexcelMaterializedReader(
+        _TransformSessionFake(wrapper),  # type: ignore[arg-type]
+        "Data",
+        plan,
+        transform,
+    ).read_table()
+
+    assert table.column(0).num_chunks == 2
+    assert table.column(0).to_pylist() == ["a", "b", "c", "d"]
+    for original, retained in zip(chunks, table.column(0).chunks, strict=True):
+        assert original.buffers()[2].address == retained.buffers()[2].address
+
+
+def test_homogeneous_numeric_range_preserves_integral_legacy_dtype_without_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "numeric-range.xlsx"
+    _save_rows(path, [[1, 10], [2, 20], [3, 30]])
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("lossless numeric range must stay primary"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(cell_range="A1:B3", header_rows=1),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert list(frame.columns) == ["1", "10"]
+    assert frame.dtypes.tolist() == ["int64", "int64"]
+    assert frame.to_dict(orient="list") == {"1": [2, 3], "10": [20, 30]}
+
+
+def test_mixed_header_numeric_range_retries_legacy_with_exact_dtypes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "mixed-header-numeric.xlsx"
+    _save_rows(path, [["Value"], [1], [2]])
+    materializations = 0
+    openpyxl_calls = 0
+    materialize_original = FastexcelSession.materialize
+    load_original = openpyxl.load_workbook
+
+    def recording_materialize(
+        self: FastexcelSession,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal materializations
+        materializations += 1
+        return materialize_original(self, *args, **kwargs)
+
+    def recording_load(*args: object, **kwargs: object) -> Any:
+        nonlocal openpyxl_calls
+        openpyxl_calls += 1
+        return load_original(*args, **kwargs)
+
+    monkeypatch.setattr(FastexcelSession, "materialize", recording_materialize)
+    monkeypatch.setattr(openpyxl, "load_workbook", recording_load)
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(cell_range="A1:A3", header_rows=1),
+    ) as workbook:
+        frame = workbook._to_dataframe_compat("Data")
+
+    assert materializations == 1
+    assert openpyxl_calls == 1
+    assert str(frame.dtypes.iloc[0]) == "object"
+    assert frame.to_dict(orient="list") == {"Value": [1, 2]}
+    assert all(type(value) is int for value in frame["Value"])
+
+
+def test_homogeneous_text_range_stays_primary_with_exact_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "homogeneous-text.xlsx"
+    _save_rows(path, [["Name"], ["Alice"], ["Bob"]])
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("homogeneous text must stay primary"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(cell_range="A1:A3", header_rows=1),
+    ) as workbook:
+        frame = workbook._to_dataframe_compat("Data")
+
+    assert isinstance(frame.dtypes.iloc[0], pd.StringDtype)
+    assert frame.to_dict(orient="list") == {"Name": ["Alice", "Bob"]}
+
+
+def test_public_timestamp_range_preserves_legacy_dtype_without_openpyxl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime
+
+    path = tmp_path / "timestamp-range.xlsx"
+    _save_rows(
+        path,
+        [[datetime(2024, 1, 1, 12, 30)], [datetime(2024, 1, 2, 13, 45)]],
+    )
+    options = ParseOptions(
+        cell_range="A1:A2",
+        header_rows=0,
+        merge_strategy=MergeStrategy.SKIP,
+    )
+    expected = XLSXHandler().parse(path, "Data", options)
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("timestamp coordinate path must stay primary"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(cell_range="A1:A2", header_rows=0),
+    ) as workbook:
+        actual = workbook._to_dataframe_compat("Data")
+
+    assert_frame_equal(actual, expected)
+    assert str(actual.dtypes.iloc[0]) == "datetime64[us]"
+
+
+def test_style_only_trailing_extent_preserves_no_range_legacy_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "style-only-tail.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet["A1"] = "value"
+    sheet["D4"].number_format = "0.00"
+    workbook.save(path)
+    workbook.close()
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("style extent must stay coordinate-primary"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(
+            merge_strategy=MergeStrategy.FILL,
+            header_rows=0,
+        ),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.shape == (4, 4)
+    assert frame.iloc[0, 0] == "value"
+    assert frame.iloc[1:, :].isna().all().all()
+    assert frame.iloc[:, 1:].isna().all().all()
+
+
+@pytest.mark.parametrize("hidden_kind", ["grouped", "all"])
+def test_range_suppresses_grouped_and_all_hidden_column_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hidden_kind: str,
+) -> None:
+    path = tmp_path / f"range-hidden-{hidden_kind}.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet.append(["a", "b", "c", "d"])
+    if hidden_kind == "grouped":
+        sheet.column_dimensions.group("B", "D", hidden=True)
+    else:
+        for column in ("A", "B", "C", "D"):
+            sheet.column_dimensions[column].hidden = True
+    workbook.save(path)
+    workbook.close()
+    monkeypatch.setattr(
+        openpyxl,
+        "load_workbook",
+        lambda *_args, **_kwargs: pytest.fail("range must suppress hidden filtering"),
+    )
+
+    with MessyWorkbook(
+        path,
+        sheet_config=_eligible_config(
+            cell_range="A1:D1",
+            include_hidden=False,
+            header_rows=0,
+        ),
+    ) as messy:
+        frame = messy._to_dataframe_compat("Data")
+
+    assert frame.iloc[0].tolist() == ["a", "b", "c", "d"]
+
+
+def test_ordinary_plan_never_constructs_manifest_reader(
+    sample_xlsx: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ManifestReader,
+        "__init__",
+        lambda *_args, **_kwargs: pytest.fail("ordinary Task7 path needs no manifest"),
+    )
+
+    with MessyWorkbook(sample_xlsx, sheet_config=_eligible_config()) as workbook:
+        frame = workbook._to_dataframe_compat("Data")
+
+    assert frame.shape == (3, 3)
+
+
+def test_invalid_range_routes_before_manifest_and_coordinate_primary(
+    sample_xlsx: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ManifestReader,
+        "__init__",
+        lambda *_args, **_kwargs: pytest.fail("invalid range must not build manifest"),
+    )
+    monkeypatch.setattr(
+        FastexcelMaterializedReader,
+        "read_table",
+        lambda _self: pytest.fail("invalid range must not start coordinate primary"),
+    )
+    with (
+        MessyWorkbook(
+            sample_xlsx,
+            sheet_config=_eligible_config(cell_range="A1"),
+        ) as workbook,
+        pytest.raises(FormatError),
+    ):
+        workbook._to_dataframe_compat("Data")
 
 
 def test_streaming_plan_is_not_eligible_for_materialized_fastexcel() -> None:
@@ -764,6 +1623,44 @@ def test_large_workbook_initialization_reuses_owned_spill_path(
         workbook.close()
 
     assert not spill_path.exists()
+    assert stream.closed is False
+
+
+@pytest.mark.parametrize("source_kind", ["seekable", "nonseekable"])
+def test_coordinate_manifest_parse_preserves_stream_ownership_and_cursor(
+    tmp_path: Path,
+    source_kind: str,
+) -> None:
+    path = tmp_path / "coordinate-stream.xlsx"
+    _save_rows(path, [["a", "b"], ["c", "d"]])
+    content = path.read_bytes()
+    stream: Any
+    entry_position: int | None
+    if source_kind == "seekable":
+        stream = io.BytesIO(content)
+        stream.seek(17)
+        entry_position = stream.tell()
+    else:
+        stream = _NonSeekableBytes(content)
+        entry_position = None
+
+    with MessyWorkbook(
+        stream,
+        filename=path.name,
+        sheet_config=_eligible_config(cell_range="A1:B2", header_rows=0),
+    ) as workbook:
+        frame = workbook._to_dataframe_compat("Data")
+        if entry_position is not None:
+            assert stream.tell() == entry_position
+        assert stream.closed is False
+
+    assert frame.to_dict(orient="split") == {
+        "index": [0, 1],
+        "columns": ["col_0", "col_1"],
+        "data": [["a", "b"], ["c", "d"]],
+    }
+    if entry_position is not None:
+        assert stream.tell() == entry_position
     assert stream.closed is False
 
 
@@ -993,6 +1890,13 @@ def test_nonzero_skip_preserves_backend_type_inference_and_avoids_bound_reader(
         "read_table",
         lambda _self: (_ for _ in ()).throw(
             AssertionError("nonzero skip must preserve backend-pushed legacy inference")
+        ),
+    )
+    monkeypatch.setattr(
+        ManifestReader,
+        "__init__",
+        lambda *_args, **_kwargs: pytest.fail(
+            "nonzero skip must not construct coordinate metadata"
         ),
     )
     config = _eligible_config(skip_rows=1, header_rows=0)

@@ -24,6 +24,10 @@ from messy_xlsx.parsing.base_handler import (
     ParseOptions,
 )
 from messy_xlsx.parsing.contracts import OutputMode, ParseMetrics
+from messy_xlsx.parsing.coordinates import (
+    CoordinateCompatibilityError,
+    CoordinateTransform,
+)
 from messy_xlsx.parsing.fallback import FallbackCoordinator
 from messy_xlsx.parsing.fastexcel_session import FastexcelSession
 from messy_xlsx.parsing.legacy_adapter import LegacyDataFrameAdapter
@@ -54,6 +58,7 @@ _FASTEXCEL_COMPATIBILITY_ERRORS = (
     fastexcel.UnsupportedColumnTypeCombinationError,
     fastexcel.CannotRetrieveCellDataError,
     fastexcel.CalamineCellError,
+    CoordinateCompatibilityError,
 )
 
 
@@ -66,10 +71,7 @@ def _is_fastexcel_materialized_plan(plan: ParsePlan) -> bool:
     """Gate features whose shared coordinate transforms arrive in Task 8."""
     return (
         plan.output_mode is OutputMode.MATERIALIZED
-        and plan.skip_rows == 0
-        and plan.merge_strategy == "skip"
-        and not plan.ignore_hidden
-        and plan.cell_range is None
+        and (plan.skip_rows == 0 or bool(plan.cell_range))
         and plan.data_only
     )
 
@@ -84,6 +86,7 @@ class _FastexcelDataFrameReader:
         sheet: str | None,
         options: ParseOptions,
         plan: ParsePlan | None,
+        transform: CoordinateTransform | None = None,
         session_factory: Callable[[], FastexcelSession] | None = None,
     ) -> None:
         self._handler = handler
@@ -131,6 +134,7 @@ class _FastexcelDataFrameReader:
                     session,
                     resolved_sheet,
                     plan,
+                    transform,
                 )
         except BaseException:
             if self._owns_session:
@@ -145,6 +149,12 @@ class _FastexcelDataFrameReader:
             raise RuntimeError("Fastexcel materialized operation is closed")
         table = reader.read_table()
         frame = LegacyDataFrameAdapter().to_dataframe(table, self._plan)
+        if (
+            self._plan is not None
+            and isinstance(reader, FastexcelMaterializedReader)
+            and reader._transform is not None
+        ):
+            return self._handler._clean_excel_data(frame, self._options)
         return self._handler._frame_fastexcel_data(
             frame,
             self._options,
@@ -249,6 +259,7 @@ class XLSXHandler(FormatHandler):
         session_factory: Callable[[], FastexcelSession],
         *,
         metrics: ParseMetrics | None = None,
+        transform: CoordinateTransform | None = None,
     ) -> pd.DataFrame:
         """Parse an eligible built-in plan without reconstructing it."""
         if not _is_fastexcel_materialized_plan(plan):
@@ -263,6 +274,7 @@ class XLSXHandler(FormatHandler):
                 plan=plan,
                 metrics=metrics,
                 session_factory=session_factory,
+                transform=transform,
             )
         finally:
             if source is not file_source:
@@ -281,6 +293,7 @@ class XLSXHandler(FormatHandler):
         plan: ParsePlan | None,
         metrics: ParseMetrics | None = None,
         session_factory: Callable[[], FastexcelSession] | None = None,
+        transform: CoordinateTransform | None = None,
     ) -> pd.DataFrame:
         """Fast Arrow path with one narrowly classified transactional fallback."""
         file_desc = source.description
@@ -295,6 +308,7 @@ class XLSXHandler(FormatHandler):
                     sheet,
                     options,
                     plan,
+                    transform,
                     session_factory,
                 ),
                 lambda: _OpenpyxlDataFrameReader(self, source, sheet, options),

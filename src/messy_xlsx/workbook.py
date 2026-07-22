@@ -23,6 +23,9 @@ from messy_xlsx.formulas.config import FormulaConfig, FormulaEvaluationMode
 from messy_xlsx.formulas.engine import FormulaEngine
 from messy_xlsx.models import CellValue, SheetConfig, SheetError, StructureInfo
 from messy_xlsx.normalization.pipeline import NormalizationPipeline
+from messy_xlsx.ooxml.manifest import ManifestReader
+from messy_xlsx.ooxml.models import IntervalIndex, SheetManifest
+from messy_xlsx.parsing.coordinates import CoordinateTransform
 from messy_xlsx.parsing.fastexcel_session import FastexcelSession
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
 from messy_xlsx.parsing.parse_plan import (
@@ -87,6 +90,7 @@ class MessyWorkbook:
         self._wb_source: BinaryIO | None = None
         self._cached_wb_source: BinaryIO | None = None
         self._fastexcel_session: FastexcelSession | None = None
+        self._manifest_reader: ManifestReader | None = None
 
         try:
             self._initialize_source()
@@ -436,12 +440,26 @@ class MessyWorkbook:
             return _NO_BUILTIN_MATERIALIZATION
         if not _is_fastexcel_materialized_plan(plan):
             return _NO_BUILTIN_MATERIALIZATION
+        transform: CoordinateTransform | None = None
+        coordinate_features = (
+            plan.merge_strategy != "skip" or plan.ignore_hidden or bool(plan.cell_range)
+        )
+        if coordinate_features:
+            if not self._coordinate_range_is_supported(plan):
+                return _NO_BUILTIN_MATERIALIZATION
+            if sheet not in self._sheet_names:
+                return _NO_BUILTIN_MATERIALIZATION
+            manifest = self._get_sheet_manifest(sheet)
+            if not self._manifest_supports_coordinate_plan(manifest, plan):
+                return _NO_BUILTIN_MATERIALIZATION
+            transform = CoordinateTransform.from_manifest(manifest)
         try:
             return handler._parse_materialized_plan(
                 self._source_handle,
                 sheet,
                 plan,
                 self._get_fastexcel_session,
+                transform=transform,
             )
         except Exception as error:
             if _blocks_backend_retry(error):
@@ -463,6 +481,45 @@ class MessyWorkbook:
             session = FastexcelSession(self._source_handle)
             self._fastexcel_session = session
         return session
+
+    def _get_sheet_manifest(self, sheet: str) -> SheetManifest:
+        reader = self._manifest_reader
+        if reader is None:
+            reader = ManifestReader(self._source_handle)
+            self._manifest_reader = reader
+        return reader.sheet(sheet)
+
+    @staticmethod
+    def _coordinate_range_is_supported(plan: ParsePlan) -> bool:
+        if not plan.cell_range:
+            return True
+        try:
+            CoordinateTransform(
+                hidden_rows=IntervalIndex(()),
+                hidden_columns=IntervalIndex(()),
+                merged_ranges=(),
+            ).open(plan)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _manifest_supports_coordinate_plan(
+        manifest: SheetManifest,
+        plan: ParsePlan,
+    ) -> bool:
+        if not plan.ignore_hidden or bool(plan.cell_range):
+            return True
+        if any(interval.start != interval.end for interval in manifest.hidden_columns.intervals):
+            return False
+        if manifest.observed_max_col == 0:
+            return True
+        intervals = manifest.hidden_columns.intervals
+        return not (
+            len(intervals) == 1
+            and intervals[0].start == 1
+            and intervals[0].end >= manifest.observed_max_col
+        )
 
     def _analyze_structure(self, sheet: str, config: SheetConfig | None = None) -> StructureInfo:
         """Analyze sheet structure."""
@@ -611,6 +668,7 @@ class MessyWorkbook:
         cached_workbook_source = getattr(self, "_cached_wb_source", None)
         source_handle = getattr(self, "_source_handle", None)
         self._fastexcel_session = None
+        self._manifest_reader = None
         self._wb = None
         self._cached_wb = None
         self._wb_source = None

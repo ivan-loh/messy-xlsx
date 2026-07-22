@@ -286,13 +286,22 @@ def test_bounded_range_suppresses_automatic_sheet_footer_rules(
     assert plan.skip_footer == expected_footer
 
 
-def test_bounded_range_preserves_explicit_caller_footer() -> None:
+def test_range_plan_preserves_explicit_footer() -> None:
     config = SheetConfig(cell_range="A1:B8", skip_footer=1)
     structure = _structure(suggested_skip_footer=4)
 
     plan = _compile_with_structure(config, structure)
 
     assert plan.skip_footer == 1
+
+
+def test_range_plan_suppresses_detected_footer() -> None:
+    config = SheetConfig(cell_range="A1:B8")
+    structure = _structure(suggested_skip_footer=4)
+
+    plan = _compile_with_structure(config, structure)
+
+    assert plan.skip_footer == 0
 
 
 def test_structure_application_preserves_every_user_option_and_inputs() -> None:

@@ -605,14 +605,14 @@ def test_build_manifest_opens_source_once(monkeypatch: pytest.MonkeyPatch) -> No
     raw = io.BytesIO(_package(_entries()))
     source = SourceHandle(raw, filename="book.xlsx")
     calls = 0
-    original = source.open_binary
+    original = source.open_backend
 
-    def counted_open_binary():
+    def counted_open_backend():
         nonlocal calls
         calls += 1
         return original()
 
-    monkeypatch.setattr(source, "open_binary", counted_open_binary)
+    monkeypatch.setattr(source, "open_backend", counted_open_backend)
 
     try:
         build_manifest(source)

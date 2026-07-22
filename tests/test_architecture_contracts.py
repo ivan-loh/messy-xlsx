@@ -11,6 +11,7 @@ from pandas.testing import assert_frame_equal
 
 from messy_xlsx import MessyWorkbook, SheetConfig, read_all_sheets, read_excel
 from messy_xlsx.formulas import FormulaConfig, FormulaEvaluationMode
+from messy_xlsx.ooxml.manifest import ManifestReader
 from messy_xlsx.parsing import HandlerRegistry, XLSXHandler
 from messy_xlsx.parsing.xlsx_materialized import FastexcelMaterializedReader
 
@@ -221,6 +222,41 @@ class TestRegistryContracts:
 
         assert_frame_equal(actual, expected)
 
+    def test_custom_registry_coordinate_options_preserve_sentinel_output(
+        self,
+        sample_xlsx,
+        monkeypatch,
+    ):
+        expected = pd.DataFrame({"coordinate_registry_sentinel": [404]})
+
+        class SentinelRegistry(HandlerRegistry):
+            def parse(self, *args, **kwargs):
+                return expected.copy()
+
+        monkeypatch.setattr(
+            ManifestReader,
+            "__init__",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("custom registry must bypass coordinate metadata")
+            ),
+        )
+        registry = SentinelRegistry()
+        config = SheetConfig(
+            auto_detect=False,
+            cell_range="A1:B2",
+            include_hidden=False,
+            merge_strategy="fill",
+        )
+
+        with MessyWorkbook(
+            sample_xlsx,
+            registry=registry,
+            sheet_config=config,
+        ) as workbook:
+            actual = workbook.to_dataframe()
+
+        assert_frame_equal(actual, expected)
+
     def test_registry_subclass_cannot_claim_builtin_eligibility(
         self,
         sample_xlsx,
@@ -268,6 +304,41 @@ class TestRegistryContracts:
                     AssertionError("custom handler must stay on its DataFrame SPI")
                 ),
             )
+            actual = workbook.to_dataframe()
+
+        assert_frame_equal(actual, expected)
+
+    def test_custom_handler_coordinate_options_preserve_sentinel_output(
+        self,
+        sample_xlsx,
+        monkeypatch,
+    ):
+        expected = pd.DataFrame({"coordinate_handler_sentinel": [505]})
+
+        class SentinelHandler(XLSXHandler):
+            def parse(self, *args, **kwargs):
+                return expected.copy()
+
+        monkeypatch.setattr(
+            ManifestReader,
+            "__init__",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("custom handler must bypass coordinate metadata")
+            ),
+        )
+        config = SheetConfig(
+            auto_detect=False,
+            cell_range="A1:B2",
+            include_hidden=False,
+            merge_strategy="fill",
+        )
+        registry = HandlerRegistry(handlers=[SentinelHandler()])
+
+        with MessyWorkbook(
+            sample_xlsx,
+            registry=registry,
+            sheet_config=config,
+        ) as workbook:
             actual = workbook.to_dataframe()
 
         assert_frame_equal(actual, expected)

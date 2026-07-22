@@ -782,7 +782,7 @@ def build_manifest(
 ) -> WorkbookManifest:
     """Build and return a closed-resource, metadata-only workbook manifest."""
     try:
-        with source.open_binary() as binary, ZipFile(binary) as package:
+        with source.open_backend() as binary, ZipFile(binary) as package:
             manifest = _manifest_from_package(package, limits)
     except BadZipFile as error:
         raise FormatError(
@@ -1111,7 +1111,7 @@ class ManifestReader:
     def _parse_sheet(self, descriptor: SheetDescriptor) -> SheetManifest:
         member = descriptor.target
         try:
-            with self._source.open_binary() as binary, ZipFile(binary) as package:
+            with self._source.open_backend() as binary, ZipFile(binary) as package:
                 validate_archive(package, self._limits)
                 _required_member(package, member)
                 if self._on_member_open is not None:
