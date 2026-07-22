@@ -96,7 +96,7 @@
 | 7 | Fastexcel materialized Arrow reader | 6 | [x] |
 | 8 | Coordinate-aware Arrow transforms | 5, 7 | [x] |
 | 9 | Closable stream lifecycle | 3, 6 | [x] |
-| 10 | Openpyxl bounded-row OOXML reader | 8, 9 | [ ] |
+| 10 | Openpyxl bounded-row OOXML reader | 8, 9 | [x] |
 | 11 | Streaming normalization and schema enforcement | 9, 10 | [ ] |
 | 12 | Public Arrow, batch, and pandas-chunk APIs | 7, 9, 11 | [ ] |
 | 13 | Unified multi-sheet planning and `SheetStream` | 5, 7, 12 | [ ] |
@@ -2133,6 +2133,12 @@ git commit -m "feat: add deterministic parser streams"
 
 ### Task 10: Implement the Openpyxl Bounded-Row OOXML Reader
 
+Completed in `e3a9e30..e78c975`; full suite: 1,740 passed. Two independent
+Critical/Important rereviews are clean. The implementation follows the
+hardened Task 10 brief: fallback owns streaming metrics, exact transformed
+schemas are precompiled before parser I/O, and format-overhead telemetry is
+deferred until the acceptance/performance slices add dedicated evidence.
+
 **Files:**
 - Create: `src/messy_xlsx/parsing/xlsx_streaming.py`
 - Create: `tests/test_xlsx_streaming.py`
@@ -2145,7 +2151,7 @@ git commit -m "feat: add deterministic parser streams"
 - Consumes: `SourceHandle`, `SheetManifest`, `ParsePlan`, `CoordinateTransform`, and a precompiled raw Arrow schema.
 - Guarantees: one read-only worksheet pass, column-oriented buffers only, at most `batch_size` output rows per yielded batch.
 
-- [ ] **Step 1: Write failing batch-size, one-pass, formula, and cleanup tests**
+- [x] **Step 1: Write failing batch-size, one-pass, formula, and cleanup tests**
 
 ```python
 # tests/test_xlsx_streaming.py
@@ -2245,7 +2251,7 @@ Run: `.venv/bin/pytest tests/test_xlsx_streaming.py -q`
 
 Expected: collection fails because the streaming reader does not exist.
 
-- [ ] **Step 2: Implement the read-only reader with column buffers**
+- [x] **Step 2: Implement the read-only reader with column buffers**
 
 ```python
 # src/messy_xlsx/parsing/xlsx_streaming.py
@@ -2315,9 +2321,9 @@ class OpenpyxlStreamingReader:
         self._stack.close()
 ```
 
-The production implementation must accumulate transformed rows until it has at most `batch_size` output rows, because hidden/filtered input rows may shrink a raw window. It may retain openpyxl's shared-string/style tables; record their declared manifest sizes in parse metrics.
+The production implementation must accumulate transformed rows until it has at most `batch_size` output rows, because hidden/filtered input rows may shrink a raw window. It may retain openpyxl's shared-string/style tables; dedicated format-overhead metrics are deferred until the metrics model and manifest expose the required immutable evidence.
 
-- [ ] **Step 3: Add an iterator adapter that closes before propagation**
+- [x] **Step 3: Add an iterator adapter that closes before propagation**
 
 ```python
 def reader_batches(reader: StreamingBatchReader):
@@ -2333,13 +2339,13 @@ def reader_batches(reader: StreamingBatchReader):
 
 Do not transparently retry after the first batch is yielded. Any later backend error closes and propagates.
 
-- [ ] **Step 4: Run streaming, coordinate, and lifecycle suites**
+- [x] **Step 4: Run streaming, coordinate, and lifecycle suites**
 
 Run: `.venv/bin/pytest tests/test_xlsx_streaming.py tests/test_coordinate_transforms.py tests/test_stream_lifecycle.py tests/test_resource_lifecycle.py -q`
 
 Expected: all tests pass with one read-only workbook load and deterministic cleanup.
 
-- [ ] **Step 5: Commit the OOXML streaming reader**
+- [x] **Step 5: Commit the OOXML streaming reader**
 
 ```bash
 git add src/messy_xlsx/parsing/xlsx_streaming.py src/messy_xlsx/parsing/router.py src/messy_xlsx/parsing/coordinates.py tests/test_xlsx_streaming.py tests/test_resource_lifecycle.py
