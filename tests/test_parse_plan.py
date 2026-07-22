@@ -6,6 +6,7 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, dataclass, fields, replace
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -1005,6 +1006,19 @@ class _MutablePayloadEnum(Enum):
     ITEM: ClassVar[list[str]] = ["initial"]
 
 
+@dataclass
+class _PostInitPayload:
+    labels: list[str]
+
+    def __post_init__(self) -> None:
+        self.cache = {"initial": list(self.labels)}
+
+
+class _IdentityCondition:
+    def __init__(self) -> None:
+        self.mutable_state = ["initial"]
+
+
 def test_plan_thaws_fresh_values_with_original_supported_container_kinds() -> None:
     dataclass_value = _MutablePayload(["alpha"], {"codes": {1, 2}})
     object_value = _MutableObject(["original"])
@@ -1155,8 +1169,74 @@ def test_type_and_function_hints_are_preserved_by_thaw_projection() -> None:
     assert plan.thaw_type_hints() == {"type": list, "callable": len}
 
 
+def test_dataclass_snapshot_preserves_post_init_state_without_aliases() -> None:
+    payload = _PostInitPayload(["alpha"])
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"payload": payload},  # type: ignore[dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+
+    payload.labels.append("changed")
+    payload.cache["initial"].append("changed")
+    first = plan.thaw_type_hints()["payload"]
+    second = plan.thaw_type_hints()["payload"]
+
+    assert first.labels == ["alpha"]
+    assert first.cache == {"initial": ["alpha"]}
+    assert first is not payload
+    assert first.cache is not second.cache
+    assert hash(plan) == hash(plan)
+
+
+def test_identity_semantic_drop_condition_preserves_legacy_identity() -> None:
+    condition = _IdentityCondition()
+    other = _IdentityCondition()
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": condition}],
+        ),
+        None,
+        "xlsx",
+    )
+    initial_hash = hash(plan)
+
+    condition.mutable_state.append("changed")
+    condition.__eq__ = lambda _other: True  # type: ignore[method-assign]
+    condition.__hash__ = lambda: 0  # type: ignore[method-assign]
+    comparison_value = plan.thaw_drop_conditions()[0][1]
+    frame = pd.DataFrame({"value": [condition, other]})
+    filtered = frame[frame["value"] != comparison_value].reset_index(drop=True)
+
+    assert filtered["value"].tolist() == [other]
+    assert comparison_value is condition
+    assert plan.drop_conditions[0][1] is condition
+    assert type(condition).__eq__ is object.__eq__
+    assert type(condition).__hash__ is object.__hash__
+    assert hash(plan) == initial_hash
+
+
+def test_opaque_c_backed_mutable_callable_is_rejected_before_backend_io() -> None:
+    opaque = partial(pow, 2)
+
+    with pytest.raises(TypeError, match="opaque mutable configuration value"):
+        compile_parse_plan(
+            SheetConfig(
+                auto_detect=False,
+                type_hints={"callable": opaque},  # type: ignore[dict-item]
+            ),
+            None,
+            "xlsx",
+        )
+
+
 def test_parse_plan_preserves_identity_sensitive_drop_condition_values() -> None:
     sentinel = object()
+    other = object()
 
     plan = compile_parse_plan(
         SheetConfig(
@@ -1167,6 +1247,11 @@ def test_parse_plan_preserves_identity_sensitive_drop_condition_values() -> None
         "xlsx",
     )
 
+    comparison_value = plan.thaw_drop_conditions()[0][1]
+    frame = pd.DataFrame({"status": [sentinel, other]})
+    filtered = frame[frame["status"] != comparison_value].reset_index(drop=True)
+
+    assert filtered["status"].tolist() == [other]
     assert plan.drop_conditions[0][1] is sentinel
 
 

@@ -8,10 +8,11 @@ projections consumed by the existing parsing and normalization layers.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, is_dataclass
 from enum import Enum
-from inspect import isbuiltin, isfunction, ismethoddescriptor
+from inspect import isbuiltin, isfunction
 from itertools import pairwise
+from types import MethodDescriptorType, WrapperDescriptorType
 from typing import Any, Final
 
 from messy_xlsx.enums import (
@@ -68,7 +69,7 @@ class FrozenDataclassValue:
     """Deterministic immutable projection of a supported dataclass value."""
 
     dataclass_type: type[Any]
-    field_values: tuple[tuple[str, Any], ...]
+    attribute_values: tuple[tuple[str, Any], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +141,10 @@ class ConfigSnapshot:
             drop_conditions=tuple(
                 (
                     _freeze(condition.get("column")),
-                    _freeze(condition.get("value")),
+                    _freeze(
+                        condition.get("value"),
+                        preserve_identity_reference=True,
+                    ),
                 )
                 for condition in config.drop_conditions
             ),
@@ -165,6 +169,8 @@ class ParsePlan:
 
     Configuration values are projected to immutable tagged snapshots. Legacy
     consumers receive fresh deep projections through the ``thaw_*`` methods.
+    Drop operands with exact object identity equality/hash remain semantic
+    references because reconstruction would change the legacy comparison.
     """
 
     # Projection for format handlers.
@@ -319,7 +325,12 @@ def _freeze_mapping(value: Mapping[Any, Any]) -> tuple[tuple[Any, Any], ...]:
     return _order_mapping_items(frozen_items)
 
 
-def _freeze(value: Any, active: set[int] | None = None) -> Any:  # noqa: C901
+def _freeze(  # noqa: C901
+    value: Any,
+    active: set[int] | None = None,
+    *,
+    preserve_identity_reference: bool = False,
+) -> Any:
     """Recursively snapshot supported mutable values without retaining aliases."""
     if active is None:
         active = set()
@@ -339,9 +350,13 @@ def _freeze(value: Any, active: set[int] | None = None) -> Any:  # noqa: C901
         isinstance(value, type)
         or isfunction(value)
         or isbuiltin(value)
-        or ismethoddescriptor(value)
+        or _is_method_descriptor(value)
     ):
         return value
+    if _uses_legacy_identity_semantics(value):
+        if preserve_identity_reference:
+            return value
+        raise TypeError(f"opaque mutable configuration value: {type(value).__name__}")
 
     identity = id(value)
     if identity in active:
@@ -366,16 +381,18 @@ def _freeze(value: Any, active: set[int] | None = None) -> Any:  # noqa: C901
         if type(value) is memoryview:
             return _FrozenMemoryview(value.tobytes())
         if is_dataclass(value) and not isinstance(value, type):
+            attributes = _object_attributes(value)
             return FrozenDataclassValue(
                 dataclass_type=type(value),
-                field_values=tuple(
-                    (field.name, _freeze(getattr(value, field.name), active))
-                    for field in fields(value)
+                attribute_values=tuple(
+                    (name, _freeze(item, active)) for name, item in sorted(attributes.items())
                 ),
             )
 
         attributes = _object_attributes(value)
         if attributes:
+            if not _is_safely_reconstructable_python_object(value):
+                raise TypeError(f"opaque mutable configuration value: {type(value).__name__}")
             return _FrozenObject(
                 object_type=type(value),
                 attribute_values=tuple(
@@ -415,7 +432,7 @@ def _thaw(value: Any) -> Any:  # noqa: C901
         return complex(_thaw(value.real), _thaw(value.imaginary))
     if isinstance(value, FrozenDataclassValue):
         instance = object.__new__(value.dataclass_type)
-        for name, item in value.field_values:
+        for name, item in value.attribute_values:
             object.__setattr__(instance, name, _thaw(item))
         return instance
     if isinstance(value, _FrozenObject):
@@ -493,13 +510,13 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
             "dataclass",
             value.dataclass_type.__module__,
             value.dataclass_type.__qualname__,
-            tuple((name, _stable_token(item)) for name, item in value.field_values),
+            tuple((name, _stable_token(item)) for name, item in value.attribute_values),
         )
     if (
         isinstance(value, type)
         or isfunction(value)
         or isbuiltin(value)
-        or ismethoddescriptor(value)
+        or _is_method_descriptor(value)
     ):
         return ("symbol", value.__module__, value.__qualname__)
     raise TypeError(
@@ -519,7 +536,7 @@ def _is_deeply_immutable(value: Any) -> bool:
         return True
     if isinstance(value, tuple | frozenset):
         return all(_is_deeply_immutable(item) for item in value)
-    return isfunction(value) or isbuiltin(value) or ismethoddescriptor(value)
+    return isfunction(value) or isbuiltin(value) or _is_method_descriptor(value)
 
 
 def _object_attributes(value: Any) -> dict[str, Any]:
@@ -533,6 +550,32 @@ def _object_attributes(value: Any) -> dict[str, Any]:
             if name not in {"__dict__", "__weakref__"} and hasattr(value, name):
                 attributes.setdefault(name, getattr(value, name))
     return attributes
+
+
+def _uses_legacy_identity_semantics(value: Any) -> bool:
+    """Recognize the default identity comparison contract used by sentinels."""
+    value_type = type(value)
+    return (
+        _raw_mro_attribute(value_type, "__eq__") is object.__eq__
+        and _raw_mro_attribute(value_type, "__hash__") is object.__hash__
+    )
+
+
+def _is_safely_reconstructable_python_object(value: Any) -> bool:
+    """Reject C-backed values whose complete hidden state cannot be captured."""
+    return _raw_mro_attribute(type(value), "__new__") is object.__new__
+
+
+def _raw_mro_attribute(value_type: type[Any], name: str) -> Any:
+    for owner in value_type.__mro__:
+        namespace = vars(owner)
+        if name in namespace:
+            return namespace[name]
+    return None
+
+
+def _is_method_descriptor(value: Any) -> bool:
+    return isinstance(value, (MethodDescriptorType, WrapperDescriptorType))
 
 
 def _resolve_header_rows(
