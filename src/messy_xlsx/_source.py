@@ -1,9 +1,8 @@
 """Private source and ownership abstraction.
 
 ``SourceHandle`` gives the parsing pipeline one repeatable view of a path or a
-caller-owned binary stream.  It deliberately does not cache parser backends or
-workbook objects; its only persistent payload cache is an immutable byte view
-requested by an adapter, plus the mandatory snapshot for a read-once stream.
+caller-owned binary stream. It never retains an unbounded complete byte cache;
+replay-required sources use a bounded-memory, spillable spool.
 """
 
 from __future__ import annotations
@@ -14,6 +13,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Literal, TypeAlias, cast
+
+from messy_xlsx._spool import ReplaySpool, _SpoolStorageError
+from messy_xlsx.exceptions import FileError
 
 SourceInput: TypeAlias = str | Path | BinaryIO
 SourceIdentity: TypeAlias = tuple[Literal["path", "stream"], str | int]
@@ -76,16 +78,15 @@ class SourceHandle:
     Paths are kept as paths for backends that can open them directly. Seekable
     caller streams are borrowed at byte zero and restored to their entry
     position after every borrow. Non-seekable streams are consumed exactly once
-    into an internal immutable snapshot and are never closed by the handle.
+    into an owned replay spool and are never closed by the handle.
     """
 
     def __init__(self, source: SourceInput, filename: str | None = None) -> None:
         self._path: Path | None = None
         self._stream: BinaryIO | None = None
-        self._snapshot: bytes | None = None
-        self._byte_cache: bytes | None = None
-        self._has_byte_cache = False
+        self._spool: ReplaySpool | None = None
         self._backend_requires_copy: bool | None = None
+        self._active_borrow = False
         self._closed = False
 
         if _is_readable(source):
@@ -97,7 +98,7 @@ class SourceHandle:
             self._identity: SourceIdentity = ("stream", id(stream))
 
             if not self._stream_is_seekable:
-                self._snapshot_nonseekable()
+                self._ensure_spool()
         else:
             path = Path(cast(str | Path, source))
             self._path = path
@@ -155,31 +156,6 @@ class SourceHandle:
             return False
         return True
 
-    def _snapshot_nonseekable(self) -> None:
-        """Consume a read-once stream into the handle's canonical byte view."""
-        stream = self._require_stream()
-
-        # If a read-once stream can report that a prefix is already gone, do not
-        # silently interpret the remaining suffix as a complete workbook.
-        try:
-            tell = getattr(stream, "tell", None)
-        except Exception:
-            tell = None
-        if callable(tell):
-            try:
-                position = tell()
-            except Exception:
-                position = None
-            if position not in (None, 0):
-                raise ValueError(
-                    "A non-seekable binary source must be positioned at byte 0 when it is supplied"
-                )
-
-        content = _coerce_bytes(stream.read())
-        self._snapshot = content
-        self._byte_cache = content
-        self._has_byte_cache = True
-
     @property
     def original(self) -> BackendSource:
         """Original caller stream, or the normalized ``Path`` for path input."""
@@ -219,13 +195,13 @@ class SourceHandle:
 
     @property
     def is_seekable(self) -> bool:
-        """Whether the original source can be replayed without a snapshot."""
+        """Whether the original source can be replayed without a spool."""
         return self._path is not None or self._stream_is_seekable
 
     @property
     def was_snapshotted(self) -> bool:
-        """Whether a non-seekable original required a one-time snapshot."""
-        return self._snapshot is not None
+        """Whether a non-seekable original required a one-time replay copy."""
+        return not self._stream_is_seekable and self._spool is not None
 
     @property
     def owns_stream(self) -> bool:
@@ -239,7 +215,7 @@ class SourceHandle:
 
     @property
     def closed(self) -> bool:
-        """Whether this handle has released its internal snapshot/cache."""
+        """Whether this handle has released its internal replay spool."""
         return self._closed
 
     def rewind(self) -> None:
@@ -250,24 +226,16 @@ class SourceHandle:
         so rewinding them is a no-op.
         """
         self._ensure_open()
-        if self._path is not None or self._snapshot is not None:
+        if self._path is not None or not self._stream_is_seekable:
             return
         stream = self._require_stream()
         stream.seek(0)
 
     def read_bytes(self) -> bytes:
-        """Return one memoized immutable byte view of the complete source."""
+        """Return complete bytes without retaining an unbounded handle cache."""
         self._ensure_open()
-        if self._has_byte_cache:
-            assert self._byte_cache is not None
-            return self._byte_cache
-
         with self.open_binary() as stream:
-            content = _coerce_bytes(stream.read())
-
-        self._byte_cache = content
-        self._has_byte_cache = True
-        return content
+            return _coerce_bytes(stream.read())
 
     def detached_binary(self) -> BinaryIO:
         """Return an owned seekable copy for a backend that outlives a borrow.
@@ -281,20 +249,112 @@ class SourceHandle:
     def open_binary(self) -> Iterator[BinaryIO]:
         """Borrow a complete seekable binary view and clean it up safely.
 
-        The context owns path-opened files and snapshot views. It never closes a
+        The context owns path-opened files and replay views. It never closes a
         caller stream, and it restores a seekable caller stream even when the
         consumer raises.
         """
-        self._ensure_open()
+        with self._borrow(), self._open_binary_unchecked() as stream:
+            yield stream
 
+    @contextmanager
+    def open_path_or_bytes(self) -> Iterator[Path | bytes]:
+        """Yield a path or bounded-memory bytes for path/bytes-only backends."""
+        with self._borrow():
+            if self._path is not None:
+                yield self._path
+                return
+            spool = self._ensure_spool()
+            with spool.open_path_or_bytes() as source:
+                yield source
+
+    @contextmanager
+    def open_legacy(self) -> Iterator[BackendSource]:
+        """Yield the ordinary path/stream type expected by legacy extensions."""
+        with self._borrow():
+            if self._path is not None:
+                yield self._path
+                return
+            with self._open_binary_unchecked() as stream:
+                yield stream
+
+    @contextmanager
+    def open_backend(self) -> Iterator[BackendSource]:
+        """Yield a path or a byte-normalized stream suitable for parsers.
+
+        A few valid binary stream implementations return ``bytearray`` or
+        ``memoryview`` from ``read()``. The source boundary accepts those
+        values, but third-party parsers generally require actual ``bytes``.
+        Detect that limitation once and provide an owned normalized view only
+        for those adapters.
+        """
+        with self._borrow():
+            if self._path is not None:
+                yield self._path
+                return
+
+            if not self._stream_is_seekable:
+                with self._ensure_spool().open_binary() as stream:
+                    yield stream
+                return
+
+            if self._backend_requires_copy is None:
+                with self._open_binary_unchecked() as stream:
+                    probe = stream.read(1)
+                _coerce_bytes(probe)
+                self._backend_requires_copy = not isinstance(probe, bytes)
+
+            if self._backend_requires_copy:
+                with self._ensure_spool().open_binary() as normalized_stream:
+                    yield normalized_stream
+                return
+
+            with self._open_binary_unchecked() as stream:
+                yield stream
+
+    def close(self) -> None:
+        """Release handle-owned replay storage; never close caller streams."""
+        if self._closed:
+            return
+        if self._spool is not None:
+            self._spool.close()
+            self._spool = None
+        self._closed = True
+        self._backend_requires_copy = None
+
+    def _ensure_spool(self) -> ReplaySpool:
+        if self._spool is not None:
+            return self._spool
+        try:
+            spool = ReplaySpool.from_stream(self._require_stream())
+        except _SpoolStorageError as error:
+            raise FileError(
+                f"Cannot spool source: {error}",
+                file_path=self.description,
+                operation="spool",
+            ) from error
+        self._spool = spool
+        return spool
+
+    @contextmanager
+    def _borrow(self) -> Iterator[None]:
+        self._ensure_open()
+        if self._active_borrow:
+            raise RuntimeError("SourceHandle already has an active borrow")
+        self._active_borrow = True
+        try:
+            yield
+        finally:
+            self._active_borrow = False
+
+    @contextmanager
+    def _open_binary_unchecked(self) -> Iterator[BinaryIO]:
         if self._path is not None:
             with self._path.open("rb") as opened_stream:
                 yield opened_stream
             return
-
-        if self._snapshot is not None:
-            with io.BytesIO(self._snapshot) as snapshot_stream:
-                yield snapshot_stream
+        if not self._stream_is_seekable:
+            with self._ensure_spool().open_binary() as replay:
+                yield replay
             return
 
         caller_stream = self._require_stream()
@@ -310,65 +370,8 @@ class SourceHandle:
             try:
                 caller_stream.seek(entry_position)
             except Exception:
-                # Keep the consumer's exception as the primary failure. A
-                # restoration error after successful consumption is actionable.
                 if not consumer_failed:
                     raise
-
-    @contextmanager
-    def open_legacy(self) -> Iterator[BackendSource]:
-        """Yield the ordinary path/stream type expected by legacy extensions."""
-        self._ensure_open()
-        if self._path is not None:
-            yield self._path
-            return
-        with self.open_binary() as stream:
-            yield stream
-
-    @contextmanager
-    def open_backend(self) -> Iterator[BackendSource]:
-        """Yield a path or a byte-normalized stream suitable for parsers.
-
-        A few valid binary stream implementations return ``bytearray`` or
-        ``memoryview`` from ``read()``. The source boundary accepts those
-        values, but third-party parsers generally require actual ``bytes``.
-        Detect that limitation once and provide an owned normalized view only
-        for those adapters.
-        """
-        self._ensure_open()
-        if self._path is not None:
-            yield self._path
-            return
-
-        if self._snapshot is not None:
-            with self.open_binary() as stream:
-                yield stream
-            return
-
-        if self._backend_requires_copy is None:
-            with self.open_binary() as stream:
-                probe = stream.read(1)
-                stream.seek(0)
-            _coerce_bytes(probe)
-            self._backend_requires_copy = not isinstance(probe, bytes)
-
-        if self._backend_requires_copy:
-            with io.BytesIO(self.read_bytes()) as normalized_stream:
-                yield normalized_stream
-            return
-
-        with self.open_binary() as stream:
-            yield stream
-
-    def close(self) -> None:
-        """Release only handle-owned memory; never close the caller's stream."""
-        if self._closed:
-            return
-        self._closed = True
-        self._snapshot = None
-        self._byte_cache = None
-        self._has_byte_cache = False
-        self._backend_requires_copy = None
 
     def _ensure_open(self) -> None:
         if self._closed:

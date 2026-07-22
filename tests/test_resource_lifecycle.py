@@ -15,6 +15,8 @@ import messy_xlsx.detection.structure_analyzer as structure_analyzer_module
 import messy_xlsx.parsing.csv_handler as csv_handler_module
 import messy_xlsx.parsing.xls_handler as xls_handler_module
 import messy_xlsx.parsing.xlsx_handler as xlsx_handler_module
+from messy_xlsx._source import SourceHandle
+from messy_xlsx._spool import DEFAULT_MEMORY_LIMIT
 from messy_xlsx.detection import StructureAnalyzer
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.parsing import (
@@ -245,6 +247,24 @@ def test_legacy_xls_caller_buffer_remains_open_and_readable() -> None:
     assert source.closed is False
     source.seek(0)
     assert source.read() == content
+
+
+def test_source_handle_close_removes_spill_and_is_idempotent() -> None:
+    source = io.BytesIO(b"x" * (DEFAULT_MEMORY_LIMIT + 1))
+    source.seek(3)
+    handle = SourceHandle(source)
+
+    with handle.open_path_or_bytes() as backend:
+        assert isinstance(backend, Path)
+        spill_path = backend
+        assert spill_path.exists()
+
+    handle.close()
+    handle.close()
+
+    assert not spill_path.exists()
+    assert source.tell() == 3
+    assert source.closed is False
 
 
 @pytest.mark.parametrize("failing_resource", ["primary", "cached"])

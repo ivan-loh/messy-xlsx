@@ -17,11 +17,13 @@ import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
 
+import messy_xlsx._spool as spool_module
 import messy_xlsx.workbook as workbook_module
 from messy_xlsx import FormatInfo, MessyWorkbook, SheetConfig, read_excel
 from messy_xlsx._source import SourceHandle
+from messy_xlsx._spool import DEFAULT_MEMORY_LIMIT
 from messy_xlsx.detection import FormatDetector, StructureAnalyzer
-from messy_xlsx.exceptions import FormatError
+from messy_xlsx.exceptions import FileError, FormatError
 from messy_xlsx.parsing import CSVHandler, HandlerRegistry, ParseOptions
 from messy_xlsx.parsing.base_handler import FormatHandler
 
@@ -396,7 +398,9 @@ def test_supported_byte_like_streams_match_bytes_across_formats(
     if seekable:
         assert source.tell() == 3
     else:
-        assert source.read_calls == 1
+        # One bounded acquisition consists of the data read and EOF probe;
+        # all parser passes replay the spool without touching the caller again.
+        assert source.read_calls == 2
 
 
 def test_memoryview_xlsx_stream_supports_the_no_analysis_fast_path() -> None:
@@ -470,7 +474,7 @@ def test_non_seekable_stream_is_snapshotted_once_without_taking_ownership(
 
     assert_frame_equal(actual, expected)
     assert source.closed is False
-    assert source.read_calls == 1
+    assert source.read_calls == 2
 
 
 def test_named_buffer_identity_is_used_in_source_errors() -> None:
@@ -562,6 +566,71 @@ def test_source_handle_restores_seekable_position_when_consumer_raises() -> None
     assert source.closed is False
 
 
+def test_source_handle_rejects_nested_active_borrows() -> None:
+    source = io.BytesIO(b"complete source")
+    source.seek(5)
+    handle = SourceHandle(source)
+
+    with handle.open_binary() as borrowed:
+        assert borrowed is source
+        with (
+            pytest.raises(
+                RuntimeError,
+                match="SourceHandle already has an active borrow",
+            ),
+            handle.open_path_or_bytes(),
+        ):
+            pass
+
+    assert source.tell() == 5
+    assert source.closed is False
+
+
+def test_seekable_open_path_or_bytes_spills_without_leaking_cursor() -> None:
+    source = io.BytesIO(b"x" * (DEFAULT_MEMORY_LIMIT + 1))
+    source.seek(7)
+    handle = SourceHandle(source)
+
+    with handle.open_path_or_bytes() as backend:
+        assert isinstance(backend, Path)
+        path = backend
+        assert path.exists()
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.stat().st_size == DEFAULT_MEMORY_LIMIT + 1
+
+    assert source.tell() == 7
+    assert source.closed is False
+    handle.close()
+    assert not path.exists()
+
+
+def test_temporary_spool_failure_becomes_file_error_and_restores_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = io.BytesIO(b"x" * (DEFAULT_MEMORY_LIMIT + 1))
+    source.seek(9)
+    handle = SourceHandle(source, filename="large-upload.xlsx")
+
+    def fail_mkstemp(*_args: object, **_kwargs: object) -> tuple[int, str]:
+        raise OSError("injected spool capacity failure")
+
+    monkeypatch.setattr(spool_module.tempfile, "mkstemp", fail_mkstemp)
+
+    with (
+        pytest.raises(FileError, match="injected spool capacity failure") as captured,
+        handle.open_path_or_bytes(),
+    ):
+        pass
+
+    assert captured.value.context == {
+        "file_path": "large-upload.xlsx",
+        "operation": "spool",
+    }
+    assert isinstance(captured.value.__cause__, OSError)
+    assert source.tell() == 9
+    assert source.closed is False
+
+
 def test_consumer_failure_remains_primary_when_cursor_restoration_also_fails() -> None:
     source = RestoreFailureBytesIO(b"complete source")
     source.seek(5)
@@ -640,7 +709,7 @@ def test_formula_view_cursor_restoration_failure_is_not_silently_ignored() -> No
     assert source.closed is False
 
 
-def test_seekable_read_bytes_is_memoized_and_restores_the_caller_cursor() -> None:
+def test_seekable_read_bytes_replays_without_a_permanent_cache() -> None:
     source = CountingBytesIO(b"repeatable")
     source.seek(4)
     handle = SourceHandle(source)
@@ -650,9 +719,9 @@ def test_seekable_read_bytes_is_memoized_and_restores_the_caller_cursor() -> Non
     detached_one = handle.detached_binary()
     detached_two = handle.detached_binary()
 
-    assert first is second
     assert first == b"repeatable"
-    assert source.read_sizes == [-1]
+    assert second == first
+    assert source.read_sizes == [-1, -1, -1, -1]
     assert source.tell() == 4
     assert detached_one is not detached_two
     assert detached_one.read() == detached_two.read() == first
@@ -663,15 +732,16 @@ def test_seekable_read_bytes_is_memoized_and_restores_the_caller_cursor() -> Non
 def test_nonseekable_handle_snapshots_once_and_replays_without_ownership() -> None:
     source = NonSeekableStream(b"repeatable", "source.bin")
     handle = SourceHandle(source)
+    acquisition_reads = source.read_calls
 
     first = handle.read_bytes()
     second = handle.read_bytes()
     with handle.open_binary() as replay:
         third = replay.read()
 
-    assert source.read_calls == 1
-    assert first is second
-    assert first == third == b"repeatable"
+    assert acquisition_reads == 2
+    assert source.read_calls == acquisition_reads
+    assert first == second == third == b"repeatable"
     assert handle.was_snapshotted is True
 
     handle.close()
@@ -870,7 +940,7 @@ def test_legacy_registry_subclass_gets_fresh_raw_source_for_each_workbook_operat
     assert source.tell() == 3
 
 
-def test_builtin_registry_reuses_one_handle_and_one_memoized_byte_read() -> None:
+def test_builtin_registry_reuses_one_handle_without_a_permanent_byte_cache() -> None:
     observations: list[tuple[str, SourceHandle]] = []
 
     class HandleDetector:
@@ -931,7 +1001,7 @@ def test_builtin_registry_reuses_one_handle_and_one_memoized_byte_read() -> None
         "parse",
     ]
     assert len({id(handle) for _, handle in observations}) == 1
-    assert source.read_sizes == [-1]
+    assert source.read_sizes == [-1, -1, -1, -1, -1]
     assert source.tell() == 4
     assert source.closed is False
 

@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+import io
+import os
+from pathlib import Path
+from typing import BinaryIO
+
+import pytest
+
+import messy_xlsx._spool as spool_module
+from messy_xlsx._spool import ReplaySpool
+
+
+def test_small_spool_stays_in_memory_and_restores_cursor() -> None:
+    source = io.BytesIO(b"abcdef")
+    source.seek(3)
+
+    spool = ReplaySpool.from_stream(source, memory_limit=16)
+
+    assert source.tell() == 3
+    with spool.open_path_or_bytes() as backend:
+        assert backend == b"abcdef"
+    spool.close()
+
+
+def test_large_spool_uses_private_path_and_deletes_it() -> None:
+    spool = ReplaySpool.from_stream(io.BytesIO(b"x" * 32), memory_limit=8)
+
+    with spool.open_path_or_bytes() as backend:
+        assert isinstance(backend, Path)
+        path = backend
+        assert path.exists()
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    spool.close()
+    assert not path.exists()
+
+
+def test_open_binary_returns_fresh_complete_replays() -> None:
+    spool = ReplaySpool.from_stream(io.BytesIO(b"complete"), memory_limit=4)
+
+    with spool.open_binary() as first:
+        assert first.read() == b"complete"
+    with spool.open_binary() as second:
+        assert second.read() == b"complete"
+
+    spool.close()
+
+
+def test_close_is_idempotent() -> None:
+    spool = ReplaySpool.from_stream(io.BytesIO(b"data"), memory_limit=8)
+
+    spool.close()
+    spool.close()
+
+    with (
+        pytest.raises(ValueError, match="ReplaySpool is closed"),
+        spool.open_binary(),
+    ):
+        pass
+
+
+def test_spool_restores_cursor_when_read_fails() -> None:
+    class Broken(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            raise OSError("injected read failure")
+
+    source = Broken(b"data")
+    source.seek(2)
+
+    with pytest.raises(OSError, match="injected read failure"):
+        ReplaySpool.from_stream(source, memory_limit=8)
+
+    assert source.tell() == 2
+
+
+def test_spill_file_is_removed_when_a_later_source_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_paths: list[Path] = []
+    original_mkstemp = spool_module.tempfile.mkstemp
+
+    def tracking_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        descriptor, raw_path = original_mkstemp(*args, **kwargs)
+        created_paths.append(Path(raw_path))
+        return descriptor, raw_path
+
+    class BrokenAfterSpill(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__(b"x" * 32)
+            self._read_calls = 0
+
+        def read(self, size: int = -1) -> bytes:
+            self._read_calls += 1
+            if self._read_calls == 2:
+                raise OSError("source failed after spill")
+            return super().read(size)
+
+    monkeypatch.setattr(spool_module.tempfile, "mkstemp", tracking_mkstemp)
+    source = BrokenAfterSpill()
+    source.seek(3)
+
+    with pytest.raises(OSError, match="source failed after spill"):
+        ReplaySpool.from_stream(source, memory_limit=8)
+
+    assert source.tell() == 3
+    assert len(created_paths) == 1
+    assert not created_paths[0].exists()
+
+
+def test_spill_file_is_removed_when_a_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_paths: list[Path] = []
+    original_mkstemp = spool_module.tempfile.mkstemp
+    original_fdopen = os.fdopen
+
+    def tracking_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        descriptor, raw_path = original_mkstemp(*args, **kwargs)
+        created_paths.append(Path(raw_path))
+        return descriptor, raw_path
+
+    class BrokenWriter:
+        def __init__(self, wrapped: BinaryIO) -> None:
+            self._wrapped = wrapped
+
+        def write(self, _content: bytes | bytearray) -> int:
+            raise OSError("injected capacity failure")
+
+        def close(self) -> None:
+            self._wrapped.close()
+
+    def broken_fdopen(descriptor: int, mode: str) -> BrokenWriter:
+        return BrokenWriter(original_fdopen(descriptor, mode))
+
+    monkeypatch.setattr(spool_module.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(spool_module.os, "fdopen", broken_fdopen)
+    source = io.BytesIO(b"x" * 32)
+    source.seek(4)
+
+    with pytest.raises(OSError, match="injected capacity failure"):
+        ReplaySpool.from_stream(source, memory_limit=8)
+
+    assert source.tell() == 4
+    assert len(created_paths) == 1
+    assert not created_paths[0].exists()
