@@ -242,6 +242,22 @@ def test_contextmanager_wrapper_closure_mutation_and_restore_is_detected() -> No
     assert registry._uses_builtin_components() is True
 
 
+def test_referenced_project_global_rebind_and_restore_is_detected() -> None:
+    registry = HandlerRegistry()
+    wrapper = vars(HandlerRegistry)["_source_handle"]
+    wrapped = wrapper.__wrapped__
+    function_globals = wrapped.__globals__
+    original = function_globals["SourceHandle"]
+
+    try:
+        function_globals["SourceHandle"] = object
+        assert registry._uses_builtin_components() is False
+    finally:
+        function_globals["SourceHandle"] = original
+
+    assert registry._uses_builtin_components() is True
+
+
 def test_private_descriptor_override_before_construction_and_restore_is_detected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -317,6 +333,8 @@ def test_multiple_ordinary_builtin_registries_remain_fast_path_eligible() -> Non
     [
         pytest.param([0] * 1_000_000, id="million-primitives"),
         pytest.param(b"x" * 1_000_000, id="large-bytes"),
+        pytest.param("x" * 1_000_000, id="large-string"),
+        pytest.param(1 << 1_000_000, id="huge-integer"),
     ],
 )
 def test_fingerprint_budget_counts_primitive_edges_and_bulk_bytes(

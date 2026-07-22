@@ -44,6 +44,13 @@ _REGISTRY_STATE_NAMES = frozenset(
 _CANONICAL_BEHAVIOR_TYPES: tuple[type[object], ...] = ()
 _CANONICAL_CLASS_BEHAVIOR: object | None = None
 _CANONICAL_COMPONENT_SHAPE: object | None = None
+_FINGERPRINT_BOOTSTRAP_GLOBALS = frozenset(
+    {
+        "_CANONICAL_BEHAVIOR_TYPES",
+        "_CANONICAL_CLASS_BEHAVIOR",
+        "_CANONICAL_COMPONENT_SHAPE",
+    }
+)
 
 
 class _FingerprintError(RuntimeError):
@@ -73,8 +80,14 @@ class _CompositionFingerprinter(_FingerprintBudget):
         if isinstance(value, bytes):
             self._charge(len(value))
             return (bytes, value)
-        if value is None or isinstance(value, (bool, int, str)):
+        if value is None or isinstance(value, bool):
             return (type(value), value)
+        if isinstance(value, int):
+            self._charge(max(1, (value.bit_length() + 7) // 8))
+            return (int, value)
+        if isinstance(value, str):
+            self._charge(len(value))
+            return (str, value)
         if isinstance(value, float):
             return (float, value.hex())
         if isinstance(value, complex):
@@ -189,8 +202,14 @@ class _BehaviorFingerprinter(_FingerprintBudget):
         if isinstance(value, bytes):
             self._charge(len(value))
             return (bytes, value)
-        if value is None or isinstance(value, (bool, int, str)):
+        if value is None or isinstance(value, bool):
             return (type(value), value)
+        if isinstance(value, int):
+            self._charge(max(1, (value.bit_length() + 7) // 8))
+            return (int, value)
+        if isinstance(value, str):
+            self._charge(len(value))
+            return (str, value)
         if isinstance(value, float):
             return (float, value.hex())
         if isinstance(value, complex):
@@ -206,24 +225,27 @@ class _BehaviorFingerprinter(_FingerprintBudget):
             node = len(self._seen)
             self._seen[identity] = node
             closure: list[tuple[str, object]] = []
-            self._charge(len(value.__closure__ or ()) + 4)
+            self._charge(len(value.__closure__ or ()) + len(value.__code__.co_names) + 4)
             for name, cell in zip(
                 value.__code__.co_freevars,
                 value.__closure__ or (),
                 strict=True,
             ):
+                self._charge(len(name))
                 try:
                     contents = cell.cell_contents
                 except ValueError:
                     closure.append((name, ("empty-cell",)))
                 else:
                     closure.append((name, self.token(contents)))
+            referenced_globals = self._referenced_globals(value)
             return (
                 "function",
                 node,
                 id(value),
                 id(value.__code__),
                 tuple(closure),
+                referenced_globals,
                 self.token(value.__defaults__),
                 self.token(value.__kwdefaults__),
                 self.token(value.__annotations__),
@@ -293,6 +315,56 @@ class _BehaviorFingerprinter(_FingerprintBudget):
             self._charge(value.nbytes)
             return ("memoryview", node, value.tobytes())
         return ("opaque", type(value), identity)
+
+    def _referenced_globals(
+        self,
+        function: FunctionType,
+    ) -> tuple[tuple[str, object], ...]:
+        """Fingerprint only globals named by this function's bytecode."""
+        references: list[tuple[str, object]] = []
+        namespace = function.__globals__
+        for name in sorted(set(function.__code__.co_names)):
+            if name in _FINGERPRINT_BOOTSTRAP_GLOBALS or name not in namespace:
+                continue
+            self._charge(len(name))
+            references.append(
+                (name, self._global_reference_token(dict.__getitem__(namespace, name)))
+            )
+        return tuple(references)
+
+    def _global_reference_token(self, value: object) -> object:
+        """Recurse only into project functions and bounded data globals."""
+        if isinstance(value, FunctionType):
+            if isinstance(value.__module__, str) and value.__module__.startswith("messy_xlsx"):
+                return self.token(value)
+            return ("external-function", id(value))
+        if isinstance(value, type):
+            try:
+                module = type.__getattribute__(value, "__module__")
+            except BaseException:
+                module = "<unknown>"
+            return ("project-type" if module.startswith("messy_xlsx") else "type", id(value))
+        if isinstance(value, ModuleType):
+            return ("module", value.__name__, id(value))
+        if isinstance(
+            value,
+            (
+                BuiltinFunctionType,
+                MethodDescriptorType,
+                WrapperDescriptorType,
+            ),
+        ):
+            return ("callable", type(value), id(value))
+        if (
+            value is None
+            or isinstance(
+                value,
+                (bool, int, float, complex, str, bytes, Enum),
+            )
+            or type(value) in {dict, list, tuple, set, frozenset, bytearray, memoryview}
+        ):
+            return self.token(value)
+        return ("global", type(value), id(value))
 
 
 def _component_token(
