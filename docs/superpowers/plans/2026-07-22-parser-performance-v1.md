@@ -92,7 +92,7 @@
 | 3 | Spillable source lifecycle | 1 | [x] |
 | 4 | OOXML archive security and eager manifest | 3 | [x] |
 | 5 | Lazy sheet metadata, interval indexes, and bounded structure sampling | 4 | [x] |
-| 6 | Immutable plans, reader contracts, and router | 2, 5 | [ ] |
+| 6 | Immutable plans, reader contracts, and router | 2, 5 | [x] |
 | 7 | Fastexcel materialized Arrow reader | 6 | [ ] |
 | 8 | Coordinate-aware Arrow transforms | 5, 7 | [ ] |
 | 9 | Closable stream lifecycle | 3, 6 | [ ] |
@@ -1435,7 +1435,7 @@ git commit -m "perf: index OOXML sheet metadata lazily"
 - Produces: `BackendRouter.select(workbook_context) -> ReaderDecision`.
 - Produces: `FallbackCoordinator.materialize()` and `FallbackCoordinator.batches()` with cleanup-before-fallback and no retry after observable output.
 
-- [ ] **Step 1: Write the failing routing decision matrix**
+- [x] **Step 1: Write the failing routing decision matrix**
 
 ```python
 # tests/test_reader_routing.py
@@ -1472,7 +1472,7 @@ Run: `.venv/bin/pytest tests/test_reader_routing.py tests/test_parse_plan.py -q`
 
 Expected: collection fails because reader contract modules do not exist.
 
-- [ ] **Step 2: Define exact internal reader contracts**
+- [x] **Step 2: Define exact internal reader contracts**
 
 ```python
 # src/messy_xlsx/parsing/contracts.py
@@ -1531,7 +1531,7 @@ class StreamingBatchReader(Protocol):
         raise NotImplementedError
 ```
 
-- [ ] **Step 3: Add output mode, batch size, and deep snapshots to `ParsePlan`**
+- [x] **Step 3: Add output mode, batch size, and deep snapshots to `ParsePlan`**
 
 Create a frozen `ConfigSnapshot` whose dict/list fields become sorted tuples and whose values are recursively copied. Validate `batch_size` when compiling, before any I/O:
 
@@ -1552,7 +1552,7 @@ def _validated_batch_size(mode: OutputMode, batch_size: int | None) -> int | Non
     return batch_size
 ```
 
-- [ ] **Step 4: Implement the output-mode router and custom-registry escape hatch**
+- [x] **Step 4: Implement the output-mode router and custom-registry escape hatch**
 
 ```python
 # src/messy_xlsx/parsing/router.py
@@ -1581,7 +1581,7 @@ class BackendRouter:
 
 Treat a registry as custom when it is not the exact built-in instance/type composition created by `MessyWorkbook`; do not infer compatibility merely from the file format.
 
-- [ ] **Step 5: Implement transactional classified fallback**
+- [x] **Step 5: Implement transactional classified fallback**
 
 ```python
 # src/messy_xlsx/parsing/fallback.py
@@ -1652,13 +1652,13 @@ class FallbackCoordinator:
 
 The factories own source restoration and spool cleanup. The primary reader is closed before `fallback_factory()` executes. `PermissionError`, `FileNotFoundError`, `MemoryError`, invalid configuration, and source-ownership failures must fail the classifier.
 
-- [ ] **Step 6: Run plan, routing, and fallback tests**
+- [x] **Step 6: Run plan, routing, and fallback tests**
 
 Run: `.venv/bin/pytest tests/test_reader_routing.py tests/test_parse_plan.py tests/test_architecture_contracts.py -q`
 
 Expected: all tests pass; custom registry injections continue to drive parsing.
 
-- [ ] **Step 7: Commit the reader contracts and router**
+- [x] **Step 7: Commit the reader contracts and router**
 
 ```bash
 git add src/messy_xlsx/parsing/contracts.py src/messy_xlsx/parsing/router.py src/messy_xlsx/parsing/fallback.py src/messy_xlsx/parsing/parse_plan.py src/messy_xlsx/parsing/handler_registry.py tests/test_reader_routing.py tests/test_parse_plan.py
