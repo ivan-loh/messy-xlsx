@@ -283,6 +283,47 @@ def test_range_coordinate_rejects_reversed_bounds_with_context() -> None:
 
 
 @pytest.mark.parametrize(
+    "xml_fragment",
+    [
+        '<dimension ref="B2:A1"/>',
+        '<mergeCells><mergeCell ref="B2:A1"/></mergeCells>',
+    ],
+    ids=["dimension", "merge"],
+)
+def test_sheet_parser_rejects_reversed_dimension_and_merge_ranges(
+    xml_fragment: str,
+) -> None:
+    xml = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        f'spreadsheetml/2006/main">{xml_fragment}</worksheet>'
+    )
+
+    with pytest.raises(FormatError, match="malformed range coordinate") as raised:
+        _parse_synthetic_sheet(xml)
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+    assert raised.value.context["coordinate"] == "B2:A1"
+
+
+def test_sheet_parser_rejects_reversed_hidden_column_range_with_context() -> None:
+    xml = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        'spreadsheetml/2006/main"><cols>'
+        '<col min="2" max="1" hidden="1"/>'
+        "</cols></worksheet>"
+    )
+
+    with pytest.raises(FormatError, match="hidden column range") as raised:
+        _parse_synthetic_sheet(xml)
+
+    assert raised.value.context == {
+        "member": "xl/worksheets/sheet1.xml",
+        "min": 2,
+        "max": 1,
+    }
+
+
+@pytest.mark.parametrize(
     ("xml_fragment", "coordinate"),
     [
         ('<dimension ref="A0:A1"/>', "A0:A1"),
@@ -610,6 +651,46 @@ def test_path_manifest_reader_rejects_equal_size_replacement_with_restored_mtime
             reader.sheet("Sheet")
 
     assert raised.value.context["file_path"] == str(path)
+
+
+def test_path_manifest_reader_rejects_replacement_during_eager_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "eager-race.xlsx"
+    workbook = openpyxl.Workbook()
+    workbook.active["A1"] = "old"
+    workbook.save(path)
+    workbook.close()
+    original_identity = path.stat()
+    original_build_manifest = manifest_module.build_manifest
+
+    def replace_after_build(source, limits=DEFAULT_LIMITS):
+        parsed = original_build_manifest(source, limits)
+        replacement = tmp_path / "eager-race-replacement.xlsx"
+        replacement.write_bytes(path.read_bytes())
+        os.utime(
+            replacement,
+            ns=(original_identity.st_atime_ns, original_identity.st_mtime_ns),
+        )
+        replacement.replace(path)
+        os.utime(path, ns=(original_identity.st_atime_ns, original_identity.st_mtime_ns))
+        assert path.stat().st_size == original_identity.st_size
+        assert path.stat().st_mtime_ns == original_identity.st_mtime_ns
+        return parsed
+
+    monkeypatch.setattr(manifest_module, "build_manifest", replace_after_build)
+
+    with (
+        SourceHandle(path) as source,
+        pytest.raises(FormatError, match="source changed") as raised,
+    ):
+        ManifestReader(source)
+
+    assert raised.value.context == {
+        "file_path": str(path),
+        "operation": "read worksheet metadata",
+    }
 
 
 def test_path_manifest_reader_rechecks_identity_after_lazy_parse(tmp_path: Path) -> None:

@@ -1074,8 +1074,11 @@ class ManifestReader:
         self._source = source
         self._limits = limits
         self._on_member_open = on_member_open
-        self.workbook = build_manifest(source, limits)
-        self._path_identity = PathIdentity.before(source.path) if source.path is not None else None
+        path_identity = PathIdentity.before(source.path) if source.path is not None else None
+        workbook = build_manifest(source, limits)
+        self._assert_identity_unchanged(path_identity)
+        self.workbook = workbook
+        self._path_identity = path_identity
         self._sheets: dict[str, SheetManifest] = {}
 
     def sheet(self, name: str) -> SheetManifest:
@@ -1094,7 +1097,9 @@ class ManifestReader:
         return parsed
 
     def _assert_source_unchanged(self) -> None:
-        identity = self._path_identity
+        self._assert_identity_unchanged(self._path_identity)
+
+    def _assert_identity_unchanged(self, identity: PathIdentity | None) -> None:
         path = self._source.path
         if identity is not None and path is not None and not identity.unchanged(path):
             raise FormatError(
@@ -1270,12 +1275,20 @@ class ManifestReader:
                 and local_name == "col"
                 and _xml_boolean(element.attrib.get("hidden"))
             ):
-                hidden_columns.append(
-                    Interval(
-                        _one_based_int(element.attrib.get("min"), member, "min", _MAX_EXCEL_COLUMN),
-                        _one_based_int(element.attrib.get("max"), member, "max", _MAX_EXCEL_COLUMN),
-                    )
+                min_column = _one_based_int(
+                    element.attrib.get("min"), member, "min", _MAX_EXCEL_COLUMN
                 )
+                max_column = _one_based_int(
+                    element.attrib.get("max"), member, "max", _MAX_EXCEL_COLUMN
+                )
+                if max_column < min_column:
+                    raise FormatError(
+                        "OOXML worksheet contains malformed hidden column range",
+                        member=member,
+                        min=min_column,
+                        max=max_column,
+                    )
+                hidden_columns.append(Interval(min_column, max_column))
             elif event == "end" and local_name == "mergeCell":
                 min_row, min_col, max_row, max_col = _range(element.attrib.get("ref"), member)
                 merged_ranges.append(MergeRange(min_row, min_col, max_row, max_col))
