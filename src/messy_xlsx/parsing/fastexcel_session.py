@@ -11,17 +11,12 @@ from messy_xlsx.detection.structure_sampler import SampleWindow, StructureEviden
 
 
 class FastexcelSession:
-    """Own exactly one fastexcel reader and its source backend context."""
+    """Own exactly one fastexcel reader without retaining a source borrow."""
 
     def __init__(self, source: Any) -> None:
-        self._context = source.open_path_or_bytes()
-        backend = self._context.__enter__()
-        try:
+        with source.open_path_or_bytes() as backend:
             self._reader = fastexcel.read_excel(backend)
             self._sheet_names = tuple(self._reader.sheet_names)
-        except BaseException:
-            self._context.__exit__(None, None, None)
-            raise
         self._closed = False
 
     @property
@@ -73,12 +68,11 @@ class FastexcelSession:
         )
 
     def close(self) -> None:
-        """Close the source backend deterministically and idempotently."""
+        """Release the reader deterministically and idempotently."""
         if self._closed:
             return
         self._closed = True
         self._reader = None
-        self._context.__exit__(None, None, None)
 
     def _ensure_open(self) -> None:
         if self._closed:

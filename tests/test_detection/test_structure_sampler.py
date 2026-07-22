@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from pathlib import Path
+from zipfile import ZIP_STORED, ZipFile
 
+import openpyxl
 import pandas as pd
 import pytest
 
@@ -154,6 +157,7 @@ def test_fastexcel_session_uses_integer_windows_and_one_backend_context(monkeypa
     )
 
     session = FastexcelSession(source)
+    assert source.exit_count == 1
     evidence = session.sample_windows(
         "Data",
         (SampleWindow(3, 2), SampleWindow(10, 1)),
@@ -207,6 +211,58 @@ def test_fastexcel_session_closes_source_when_sheet_metadata_fails(monkeypatch) 
 
     assert source.enter_count == 1
     assert source.exit_count == 1
+
+
+class NonSeekableBytes:
+    def __init__(self, content: bytes) -> None:
+        self._stream = io.BytesIO(content)
+
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
+
+    def seekable(self) -> bool:
+        return False
+
+
+def _workbook_bytes(tmp_path: Path, *, disk_spool: bool) -> bytes:
+    path = tmp_path / "composition.xlsx"
+    workbook = openpyxl.Workbook()
+    first = workbook.active
+    first.title = "First"
+    first.append(["name", "amount"])
+    first.append(["alpha", 1])
+    second = workbook.create_sheet("Second")
+    second.append(["label", "value"])
+    second.append(["beta", 2])
+    workbook.save(path)
+    workbook.close()
+    if disk_spool:
+        with ZipFile(path, "a", ZIP_STORED) as package:
+            package.writestr("unreferenced.bin", b"x" * (9 * 1024 * 1024))
+    return path.read_bytes()
+
+
+@pytest.mark.parametrize("source_kind", ["path", "memory_spool", "disk_spool"])
+def test_fresh_components_analyze_multiple_sheets_without_nested_borrows(
+    tmp_path: Path,
+    source_kind: str,
+) -> None:
+    content = _workbook_bytes(tmp_path, disk_spool=source_kind == "disk_spool")
+    raw_source = (
+        tmp_path / "composition.xlsx"
+        if source_kind == "path"
+        else NonSeekableBytes(content)
+    )
+
+    with SourceHandle(raw_source) as source:
+        reader = ManifestReader(source)
+        with FastexcelSession(source) as session:
+            sampler = StructureSampler(session, reader)
+            first = sampler.analyze("First")
+            second = sampler.analyze("Second")
+
+        assert first.data_start_row == 1
+        assert second.data_start_row == 1
 
 
 @pytest.mark.parametrize(
