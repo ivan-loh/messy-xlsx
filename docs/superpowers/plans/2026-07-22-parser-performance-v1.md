@@ -89,7 +89,7 @@
 |---:|---|---|:---:|
 | 1 | v0.10.0 compatibility and performance contract | — | [x] |
 | 2 | Legacy warning and API classification | 1 | [x] |
-| 3 | Spillable source lifecycle | 1 | [ ] |
+| 3 | Spillable source lifecycle | 1 | [x] |
 | 4 | OOXML archive security and eager manifest | 3 | [ ] |
 | 5 | Lazy sheet metadata, interval indexes, and bounded structure sampling | 4 | [ ] |
 | 6 | Immutable plans, reader contracts, and router | 2, 5 | [ ] |
@@ -531,7 +531,7 @@ git commit -m "feat: mark materialized APIs as legacy"
 - Produces: `ReplaySpool.open_binary()`, `ReplaySpool.open_path_or_bytes()`, `ReplaySpool.close()`.
 - `SourceHandle.open_path_or_bytes()` yields `Path | bytes` for path/bytes-only backends without an unbounded byte cache.
 
-- [ ] **Step 1: Write failing spill, cursor, and cleanup tests**
+- [x] **Step 1: Write failing spill, cursor, and cleanup tests**
 
 ```python
 # tests/test_spool.py
@@ -586,7 +586,7 @@ Run: `.venv/bin/pytest tests/test_spool.py -q`
 
 Expected: collection fails because `messy_xlsx._spool` does not exist.
 
-- [ ] **Step 2: Implement the spill state machine**
+- [x] **Step 2: Implement the spill state machine**
 
 ```python
 # src/messy_xlsx/_spool.py
@@ -717,7 +717,7 @@ class ReplaySpool:
             raise ValueError("ReplaySpool is closed")
 ```
 
-- [ ] **Step 3: Integrate the spool into `SourceHandle`**
+- [x] **Step 3: Integrate the spool into `SourceHandle`**
 
 Replace `_snapshot`, `_byte_cache`, and `_has_byte_cache` with one optional `ReplaySpool`. Keep `open_binary()` borrowing seekable caller streams directly. Add:
 
@@ -735,13 +735,13 @@ def open_path_or_bytes(self) -> Iterator[Path | bytes]:
 
 Track an active-borrow flag around caller stream contexts and raise `RuntimeError("SourceHandle already has an active borrow")` on nesting. Translate temporary-file creation/write/capacity `OSError` into `FileError(operation="spool")` at the public source boundary.
 
-- [ ] **Step 4: Run source and lifecycle regression tests**
+- [x] **Step 4: Run source and lifecycle regression tests**
 
 Run: `.venv/bin/pytest tests/test_spool.py tests/test_source_handle.py tests/test_resource_lifecycle.py -q`
 
 Expected: all tests pass; seekable streams are restored and large replay sources leave no temporary files.
 
-- [ ] **Step 5: Commit the source lifecycle**
+- [x] **Step 5: Commit the source lifecycle**
 
 ```bash
 git add src/messy_xlsx/_spool.py src/messy_xlsx/_source.py tests/test_spool.py tests/test_source_handle.py tests/test_resource_lifecycle.py
