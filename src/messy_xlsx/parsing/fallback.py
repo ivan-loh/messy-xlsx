@@ -318,12 +318,13 @@ def _open_reader(
     else:
         opened = _OpenedReader(owner=owner, reader=owner, entered=False)
 
-    if inspect_schema and _declares_schema(opened.reader):
+    if inspect_schema:
         try:
-            schema = opened.reader.schema
+            if _declares_schema(opened.reader):
+                schema = opened.reader.schema
+                del schema
         except BaseException as error:
             return None, _close_reader(opened, error, error.__traceback__)
-        del schema
 
     return opened, _Attempt()
 
@@ -331,7 +332,12 @@ def _open_reader(
 def _declares_schema(reader: Any) -> bool:
     """Avoid requiring the future protocol field from legacy test doubles."""
     class_declares = any("schema" in vars(owner) for owner in type(reader).__mro__)
-    instance_state = vars(reader) if hasattr(reader, "__dict__") else {}
+    if class_declares:
+        return True
+    try:
+        instance_state = object.__getattribute__(reader, "__dict__")
+    except AttributeError:
+        instance_state = {}
     return class_declares or "schema" in instance_state
 
 

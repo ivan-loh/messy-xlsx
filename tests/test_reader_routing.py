@@ -517,6 +517,34 @@ class _ContextStreamingReaderFake(_StreamingReaderFake):
         return self.suppress
 
 
+class _RaisingSchemaDiscoveryReader:
+    def __init__(self) -> None:
+        self.enter_calls = 0
+        self.exit_triples: list[
+            tuple[type[BaseException] | None, BaseException | None, object]
+        ] = []
+
+    @property
+    def __dict__(self) -> dict[str, object]:
+        raise RuntimeError("schema discovery failed")
+
+    def __enter__(self) -> _RaisingSchemaDiscoveryReader:
+        self.enter_calls += 1
+        return self
+
+    def __exit__(
+        self,
+        error_type: type[BaseException] | None,
+        error: BaseException | None,
+        traceback: object,
+    ) -> bool:
+        self.exit_triples.append((error_type, error, traceback))
+        return False
+
+    def read_next_batch(self) -> pa.RecordBatch | None:
+        pytest.fail("schema discovery failure must happen before reading")
+
+
 def _batch(value: int) -> pa.RecordBatch:
     return pa.record_batch({"value": [value]})
 
@@ -1040,6 +1068,31 @@ def test_streaming_schema_failure_closes_primary_before_fallback() -> None:
     )
     assert events.index("primary-close") < events.index("fallback-factory")
     assert primary.close_calls == fallback.close_calls == 1
+
+
+def test_schema_declaration_probe_failure_exits_entered_reader_exactly_once() -> None:
+    reader = _RaisingSchemaDiscoveryReader()
+    metrics = ParseMetrics()
+    fallback_calls = 0
+
+    def fallback_factory() -> object:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    with pytest.raises(RuntimeError, match="schema discovery failed"):
+        list(
+            FallbackCoordinator(
+                _is_compatibility_failure,
+                metrics=metrics,
+            ).batches(lambda: reader, fallback_factory)
+        )
+
+    assert reader.enter_calls == 1
+    assert len(reader.exit_triples) == 1
+    assert reader.exit_triples[0][0] is RuntimeError
+    assert fallback_calls == 0
+    assert metrics == ParseMetrics(failed_attempts=1)
 
 
 @pytest.mark.parametrize("failure_point", ["schema", "read"])
