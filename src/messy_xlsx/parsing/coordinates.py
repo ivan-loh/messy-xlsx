@@ -80,6 +80,16 @@ class CoordinateBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedCoordinateSchema:
+    """Immutable raw and transformed schema contract for one coordinate stream."""
+
+    raw_schema: pa.Schema
+    raw_column_numbers: tuple[int, ...]
+    output_schema: pa.Schema
+    output_column_numbers: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CoordinateTransform:
     """Immutable coordinate metadata shared by independent operations."""
 
@@ -119,9 +129,43 @@ class CoordinateTransform:
         )
         return transform
 
-    def open(self, plan: ParsePlan) -> CoordinateOperation:
+    def prepare_schema(
+        self,
+        plan: ParsePlan,
+        raw_schema: pa.Schema,
+        raw_column_numbers: tuple[int, ...],
+    ) -> PreparedCoordinateSchema:
+        """Compile a pure, idempotent schema contract before parser I/O."""
+        prepared, _merge_output_types = _prepare_coordinate_schema(
+            self,
+            plan,
+            raw_schema,
+            raw_column_numbers,
+        )
+        return prepared
+
+    def open(
+        self,
+        plan: ParsePlan,
+        prepared_schema: PreparedCoordinateSchema | None = None,
+    ) -> CoordinateOperation:
         """Open fresh mutable state for one parse operation."""
-        return CoordinateOperation(self, plan)
+        merge_output_types: dict[int, pa.DataType] | None = None
+        if prepared_schema is not None:
+            recomputed, merge_output_types = _prepare_coordinate_schema(
+                self,
+                plan,
+                prepared_schema.raw_schema,
+                prepared_schema.raw_column_numbers,
+            )
+            if recomputed != prepared_schema:
+                raise CoordinateCompatibilityError("prepared coordinate schema is inconsistent")
+        return CoordinateOperation(
+            self,
+            plan,
+            prepared_schema=prepared_schema,
+            merge_output_types=merge_output_types,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +178,129 @@ class _RangeProjection:
     @property
     def column_numbers(self) -> tuple[int, ...]:
         return tuple(range(self.min_col, self.max_col + 1))
+
+
+def _prepare_coordinate_schema(
+    transform: CoordinateTransform,
+    plan: ParsePlan,
+    raw_schema: pa.Schema,
+    raw_column_numbers: tuple[int, ...],
+) -> tuple[PreparedCoordinateSchema, dict[int, pa.DataType]]:
+    _validate_raw_coordinate_schema(raw_schema, raw_column_numbers)
+    projection = CoordinateOperation._parse_projection(plan.cell_range)
+    merge_ranges = tuple(
+        merged_range
+        for merged_range in transform.merged_ranges
+        if projection is None
+        or CoordinateOperation._merge_intersects_projection(merged_range, projection)
+    )
+    input_types = dict(zip(raw_column_numbers, raw_schema.types, strict=True))
+    output_columns = _prepared_output_columns(
+        transform,
+        plan,
+        raw_column_numbers,
+        projection,
+    )
+    merge_output_types = _prepared_merge_output_types(
+        plan,
+        raw_column_numbers,
+        input_types,
+        merge_ranges,
+    )
+    output_types = tuple(
+        merge_output_types.get(column, input_types.get(column, pa.null()))
+        for column in output_columns
+    )
+    output_schema = pa.schema(
+        [pa.field(str(ordinal), data_type) for ordinal, data_type in enumerate(output_types)]
+    )
+    prepared = PreparedCoordinateSchema(
+        raw_schema=raw_schema,
+        raw_column_numbers=raw_column_numbers,
+        output_schema=output_schema,
+        output_column_numbers=output_columns,
+    )
+    return prepared, merge_output_types
+
+
+def _validate_raw_coordinate_schema(
+    raw_schema: pa.Schema,
+    raw_column_numbers: tuple[int, ...],
+) -> None:
+    if not isinstance(raw_schema, pa.Schema):
+        raise TypeError("raw_schema must be a pyarrow.Schema")
+    if not isinstance(raw_column_numbers, tuple):
+        raise TypeError("raw column coordinates must be an immutable tuple")
+    if len(raw_schema) != len(raw_column_numbers):
+        raise ValueError("raw schema width does not match absolute columns")
+    if any(column < 1 or column > _MAX_EXCEL_COLUMN for column in raw_column_numbers):
+        raise ValueError("raw column coordinates exceed Excel worksheet bounds")
+    if any(left >= right for left, right in pairwise(raw_column_numbers)):
+        raise ValueError("raw column coordinates must be strictly increasing")
+
+
+def _prepared_output_columns(
+    transform: CoordinateTransform,
+    plan: ParsePlan,
+    raw_column_numbers: tuple[int, ...],
+    projection: _RangeProjection | None,
+) -> tuple[int, ...]:
+    if projection is None:
+        return tuple(
+            column
+            for column in raw_column_numbers
+            if not (plan.ignore_hidden and transform.hidden_columns.contains(column))
+        )
+    return projection.column_numbers
+
+
+def _prepared_merge_output_types(
+    plan: ParsePlan,
+    raw_column_numbers: tuple[int, ...],
+    input_types: dict[int, pa.DataType],
+    merge_ranges: tuple[MergeRange, ...],
+) -> dict[int, pa.DataType]:
+    merge_output_types: dict[int, pa.DataType] = {}
+    if MergeStrategy(plan.merge_strategy) is not MergeStrategy.FILL:
+        return merge_output_types
+    candidate_types: dict[int, set[pa.DataType]] = {}
+    for merged_range in merge_ranges:
+        _add_merge_candidate_types(
+            raw_column_numbers,
+            input_types,
+            merged_range,
+            candidate_types,
+        )
+    for column, candidates in candidate_types.items():
+        if len(candidates) != 1:
+            raise CoordinateCompatibilityError("merged-cell fill cannot establish one Arrow schema")
+        merge_output_types[column] = next(iter(candidates))
+    return merge_output_types
+
+
+def _add_merge_candidate_types(
+    raw_column_numbers: tuple[int, ...],
+    input_types: dict[int, pa.DataType],
+    merged_range: MergeRange,
+    candidate_types: dict[int, set[pa.DataType]],
+) -> None:
+    anchor_type = input_types.get(merged_range.min_col)
+    if anchor_type is None:
+        raise CoordinateCompatibilityError(
+            "merged-cell anchor is unavailable in the coordinate schema"
+        )
+    if pa.types.is_null(anchor_type):
+        return
+    for column in raw_column_numbers:
+        if not merged_range.min_col <= column <= merged_range.max_col:
+            continue
+        source_type = input_types[column]
+        if pa.types.is_null(source_type):
+            candidate_types.setdefault(column, set()).add(anchor_type)
+        elif source_type != anchor_type:
+            raise CoordinateCompatibilityError(
+                "merged-cell fill cannot guarantee lossless streaming output"
+            )
 
 
 class CoordinateOperation:
@@ -164,7 +331,14 @@ class CoordinateOperation:
         "_transform",
     )
 
-    def __init__(self, transform: CoordinateTransform, plan: ParsePlan) -> None:
+    def __init__(
+        self,
+        transform: CoordinateTransform,
+        plan: ParsePlan,
+        *,
+        prepared_schema: PreparedCoordinateSchema | None = None,
+        merge_output_types: dict[int, pa.DataType] | None = None,
+    ) -> None:
         self._transform = transform
         self._plan = plan
         self._merge_strategy = MergeStrategy(plan.merge_strategy)
@@ -190,16 +364,22 @@ class CoordinateOperation:
             )
         )
         self._merge_cursor = 0
-        self._merge_output_types: dict[int, pa.DataType] = {}
+        self._merge_output_types = dict(merge_output_types or {})
         self._active_merge_ranges: list[MergeRange] = []
         self._next_range_row = self._projection.min_row if self._projection is not None else None
-        self._range_types: tuple[pa.DataType, ...] | None = None
+        self._range_types = (
+            tuple(prepared_schema.output_schema.types)
+            if prepared_schema is not None and self._projection is not None
+            else None
+        )
         self._remaining_skip = 0 if self._projection is not None else plan.skip_rows
         self._buffer: deque[CoordinateBatch] = deque()
         self._buffered_rows = 0
         self._identities: tuple[ColumnIdentity, ...] | None = None
-        self._input_column_numbers: tuple[int, ...] | None = None
-        self._input_schema: pa.Schema | None = None
+        self._input_column_numbers = (
+            prepared_schema.raw_column_numbers if prepared_schema is not None else None
+        )
+        self._input_schema = prepared_schema.raw_schema if prepared_schema is not None else None
         self._template: CoordinateBatch | None = None
         self._emitted_any = False
         self._hidden_interval_cursor = 0
