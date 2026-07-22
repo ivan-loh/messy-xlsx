@@ -96,3 +96,27 @@ def test_small_class_namespace_still_uses_normal_sort_path(
     registry_module._BehaviorFingerprinter()._project_type_token(SmallBehavior)
 
     assert sort_calls >= 1
+
+
+def test_oversized_transitive_project_type_fails_closed_before_sort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value_type = type(
+        "OversizedTransitiveBehavior",
+        (),
+        {
+            "__module__": "messy_xlsx.oversized_test",
+            **{f"behavior_{index}": index for index in range(10_001)},
+        },
+    )
+
+    def guarded_sorted(iterable: Any, *args: object, **kwargs: object) -> list[Any]:
+        items = list(iterable)
+        if len(items) > 10_000:
+            raise AssertionError("oversized transitive namespace was sorted")
+        return builtins.sorted(items, *args, **kwargs)
+
+    monkeypatch.setattr(registry_module, "sorted", guarded_sorted, raising=False)
+
+    with pytest.raises(registry_module._FingerprintError, match="budget exceeded"):
+        registry_module._BehaviorFingerprinter()._project_global_reference_token(value_type)

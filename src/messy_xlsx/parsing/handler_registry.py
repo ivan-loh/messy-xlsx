@@ -32,6 +32,7 @@ from messy_xlsx.parsing.xlsx_handler import XLSXHandler
 _BUILTIN_HANDLER_TYPES = (XLSXHandler, XLSHandler, CSVHandler)
 _MAX_FINGERPRINT_NODES = 10_000
 _MAX_FINGERPRINT_COST = 10_000
+_MAX_PROJECT_GRAPH_COST = 50_000
 _REGISTRY_STATE_NAMES = frozenset(
     {
         "handlers",
@@ -54,6 +55,19 @@ _FINGERPRINT_BOOTSTRAP_GLOBALS = frozenset(
 _NON_BEHAVIOR_CLASS_ATTRIBUTES = frozenset(
     {"__dict__", "__doc__", "__module__", "__qualname__", "__weakref__"}
 )
+
+
+def _type_module(value_type: type[object]) -> str:
+    """Read a type's module without invoking metaclass overrides."""
+    try:
+        module = type.__getattribute__(value_type, "__module__")
+    except BaseException:
+        return "<unknown>"
+    return module if isinstance(module, str) else "<unknown>"
+
+
+def _is_project_type(value_type: type[object]) -> bool:
+    return _type_module(value_type).startswith("messy_xlsx")
 
 
 class _FingerprintError(RuntimeError):
@@ -210,6 +224,27 @@ class _BehaviorFingerprinter(_FingerprintBudget):
     def __init__(self) -> None:
         super().__init__()
         self._seen: dict[int, int] = {}
+        self._project_graph_cost = 0
+        self._project_graph_depth = 0
+
+    def _charge(self, units: int = 1) -> None:
+        if self._project_graph_depth:
+            self._project_graph_cost += units
+            if self._project_graph_cost > _MAX_PROJECT_GRAPH_COST:
+                raise _FingerprintError("fingerprint budget exceeded")
+            return
+        super()._charge(units)
+
+    def _preflight(self, units: int) -> None:
+        if self._project_graph_depth:
+            if (
+                units < 0
+                or units > _MAX_FINGERPRINT_COST
+                or self._project_graph_cost + units > _MAX_PROJECT_GRAPH_COST
+            ):
+                raise _FingerprintError("fingerprint budget exceeded")
+            return
+        super()._preflight(units)
 
     def token(self, value: object) -> object:  # noqa: C901
         self._charge()
@@ -280,6 +315,8 @@ class _BehaviorFingerprinter(_FingerprintBudget):
                 self.token(value.fdel),
             )
         if isinstance(value, type):
+            if self._project_graph_depth and _is_project_type(value):
+                return self._project_type_token(value)
             return ("type", value, id(value))
         if isinstance(value, ModuleType):
             return ("module", value.__name__, id(value))
@@ -385,6 +422,14 @@ class _BehaviorFingerprinter(_FingerprintBudget):
 
     def _project_type_token(self, value_type: type[object]) -> object:
         """Fingerprint bounded raw behavior for a referenced project type."""
+        self._project_graph_depth += 1
+        try:
+            return self._project_type_token_active(value_type)
+        finally:
+            self._project_graph_depth -= 1
+
+    def _project_type_token_active(self, value_type: type[object]) -> object:
+        """Fingerprint one project type while project-graph accounting is active."""
         identity = id(value_type)
         if identity in self._seen:
             return ("ref", self._seen[identity])
@@ -401,8 +446,19 @@ class _BehaviorFingerprinter(_FingerprintBudget):
                 continue
             self._charge(len(name))
             attributes.append((name, self._class_attribute_token(value)))
-        self._charge(len(attributes))
-        return ("project-type", node, value_type, tuple(attributes))
+        project_bases = tuple(
+            self._project_type_token(owner)
+            for owner in value_type.__mro__[1:]
+            if _is_project_type(owner)
+        )
+        self._charge(len(attributes) + len(project_bases))
+        return (
+            "project-type",
+            node,
+            value_type,
+            tuple(attributes),
+            project_bases,
+        )
 
     def _class_attribute_token(self, value: object) -> object:
         """Fingerprint raw class behavior and bounded project-global references."""
@@ -419,6 +475,8 @@ class _BehaviorFingerprinter(_FingerprintBudget):
                 self._class_attribute_token(value.fset),
                 self._class_attribute_token(value.fdel),
             )
+        if isinstance(value, type) and _is_project_type(value):
+            return self._project_type_token(value)
         return self.token(value)
 
     def _project_function_token(self, value: FunctionType) -> object:
@@ -479,16 +537,15 @@ class _BehaviorFingerprinter(_FingerprintBudget):
         return tuple(references)
 
     def _project_global_reference_token(self, value: object) -> object:
-        """Recurse through project functions without reopening project type graphs."""
+        """Recurse through project functions, types, and inherited behavior."""
         if isinstance(value, FunctionType):
             if isinstance(value.__module__, str) and value.__module__.startswith("messy_xlsx"):
                 return self._project_function_token(value)
             return ("external-function", id(value), id(value.__code__))
         if isinstance(value, type):
-            try:
-                module = type.__getattribute__(value, "__module__")
-            except BaseException:
-                module = "<unknown>"
+            module = _type_module(value)
+            if module.startswith("messy_xlsx"):
+                return self._project_type_token(value)
             return ("global-type", module, id(value))
         if isinstance(value, ModuleType):
             return ("module", value.__name__, id(value))
