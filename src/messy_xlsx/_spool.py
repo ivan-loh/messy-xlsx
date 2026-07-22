@@ -8,11 +8,17 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import TracebackType
 from typing import BinaryIO, cast
 
 from messy_xlsx._fallback_signals import (
+    _contains_process_failure,
+    _exception_traceback,
     _FallbackBlockReason,
     _mark_fallback_blocked,
+    _raise_with_traceback,
+    _safe_add_note,
+    _type_name,
 )
 
 DEFAULT_MEMORY_LIMIT = 8 * 1024 * 1024
@@ -45,29 +51,40 @@ def _storage_error(error: OSError) -> _SpoolStorageError:
     return _SpoolStorageError(str(error))
 
 
-def _safe_error_repr(error: BaseException) -> str:
-    """Return a cleanup description without allowing diagnostics to raise."""
-    try:
-        return repr(error)
-    except BaseException:
-        try:
-            name = type.__getattribute__(type(error), "__name__")
-        except BaseException:
-            name = "unknown"
-        return f"<{name}>"
-
-
-def _safe_add_note(error: BaseException, note: str) -> None:
-    """Attach secondary cleanup context on a best-effort basis."""
-    try:
-        BaseException.add_note(error, note)
-    except BaseException:
-        pass
-
-
 def _cleanup_takes_precedence(error: BaseException) -> bool:
     """Return whether source teardown must replace an operation failure."""
-    return isinstance(error, MemoryError) or not isinstance(error, Exception)
+    return _contains_process_failure(error)
+
+
+_CleanupWinner = tuple[BaseException, TracebackType | None]
+
+
+def _record_cleanup_failure(
+    primary_error: BaseException,
+    cleanup_error: BaseException,
+    label: str,
+    winner: _CleanupWinner | None,
+) -> _CleanupWinner | None:
+    """Record one teardown failure and retain the first process-level winner."""
+    if winner is not None:
+        _safe_add_note(winner[0], f"{label}: {_type_name(cleanup_error)}")
+        return winner
+    if _contains_process_failure(cleanup_error):
+        _mark_fallback_blocked(
+            cleanup_error,
+            _FallbackBlockReason.SOURCE_OWNERSHIP,
+        )
+        _safe_add_note(
+            cleanup_error,
+            f"source operation also failed: {_type_name(primary_error)}",
+        )
+        return cleanup_error, _exception_traceback(cleanup_error)
+    _mark_fallback_blocked(
+        primary_error,
+        _FallbackBlockReason.SOURCE_OWNERSHIP,
+    )
+    _safe_add_note(primary_error, f"{label}: {_type_name(cleanup_error)}")
+    return None
 
 
 def _is_seekable(stream: BinaryIO) -> bool:
@@ -105,32 +122,38 @@ def _cleanup_pending_spill(
     raw_path: str,
     error: BaseException,
 ) -> None:
+    winner: _CleanupWinner | None = None
     if opened is not None:
         try:
             opened.close()
         except BaseException as cleanup_error:
-            _mark_fallback_blocked(error, _FallbackBlockReason.SOURCE_OWNERSHIP)
-            _safe_add_note(
+            winner = _record_cleanup_failure(
                 error,
-                f"temporary file close also failed: {_safe_error_repr(cleanup_error)}",
+                cleanup_error,
+                "temporary file close also failed",
+                winner,
             )
     elif descriptor is not None:
         try:
             os.close(descriptor)
         except BaseException as cleanup_error:
-            _mark_fallback_blocked(error, _FallbackBlockReason.SOURCE_OWNERSHIP)
-            _safe_add_note(
+            winner = _record_cleanup_failure(
                 error,
-                f"temporary descriptor close also failed: {_safe_error_repr(cleanup_error)}",
+                cleanup_error,
+                "temporary descriptor close also failed",
+                winner,
             )
     try:
         os.unlink(raw_path)
     except BaseException as cleanup_error:
-        _mark_fallback_blocked(error, _FallbackBlockReason.SOURCE_OWNERSHIP)
-        _safe_add_note(
+        winner = _record_cleanup_failure(
             error,
-            f"temporary file removal also failed: {_safe_error_repr(cleanup_error)}",
+            cleanup_error,
+            "temporary file removal also failed",
+            winner,
         )
+    if winner is not None:
+        _raise_with_traceback(*winner)
 
 
 def _create_spill() -> tuple[Path, BinaryIO]:
@@ -177,24 +200,29 @@ def _cleanup_spill(
     path: Path | None,
     error: BaseException,
 ) -> None:
+    winner: _CleanupWinner | None = None
     if opened is not None:
         try:
             opened.close()
         except BaseException as cleanup_error:
-            _mark_fallback_blocked(error, _FallbackBlockReason.SOURCE_OWNERSHIP)
-            _safe_add_note(
+            winner = _record_cleanup_failure(
                 error,
-                f"temporary file close also failed: {_safe_error_repr(cleanup_error)}",
+                cleanup_error,
+                "temporary file close also failed",
+                winner,
             )
     if path is not None:
         try:
             path.unlink(missing_ok=True)
         except BaseException as cleanup_error:
-            _mark_fallback_blocked(error, _FallbackBlockReason.SOURCE_OWNERSHIP)
-            _safe_add_note(
+            winner = _record_cleanup_failure(
                 error,
-                f"temporary file removal also failed: {_safe_error_repr(cleanup_error)}",
+                cleanup_error,
+                "temporary file removal also failed",
+                winner,
             )
+    if winner is not None:
+        _raise_with_traceback(*winner)
 
 
 def _restore_position(
@@ -219,7 +247,7 @@ def _restore_position(
             )
             _safe_add_note(
                 primary_error,
-                f"cursor restoration also failed: {_safe_error_repr(restore_error)}",
+                f"cursor restoration also failed: {_type_name(restore_error)}",
             )
             return
         _mark_fallback_blocked(
@@ -230,9 +258,19 @@ def _restore_position(
             try:
                 completed.close()
             except BaseException as cleanup_error:
+                if _cleanup_takes_precedence(cleanup_error):
+                    _mark_fallback_blocked(
+                        cleanup_error,
+                        _FallbackBlockReason.SOURCE_OWNERSHIP,
+                    )
+                    _safe_add_note(
+                        cleanup_error,
+                        f"cursor restoration also failed: {_type_name(restore_error)}",
+                    )
+                    raise
                 _safe_add_note(
                     restore_error,
-                    f"temporary spool cleanup also failed: {_safe_error_repr(cleanup_error)}",
+                    f"temporary spool cleanup also failed: {_type_name(cleanup_error)}",
                 )
         raise
 

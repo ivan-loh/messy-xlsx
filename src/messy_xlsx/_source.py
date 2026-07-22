@@ -15,8 +15,13 @@ from pathlib import Path
 from typing import BinaryIO, Literal, TypeAlias, cast
 
 from messy_xlsx._fallback_signals import (
+    _attach_cleanup_failure,
+    _attach_operation_failure,
+    _contains_process_failure,
     _FallbackBlockReason,
     _mark_fallback_blocked,
+    _safe_add_note,
+    _type_name,
 )
 from messy_xlsx._spool import ReplaySpool, _SpoolStorageError
 from messy_xlsx.exceptions import FileError
@@ -419,9 +424,39 @@ class SourceHandle:
         return self
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
-        self.close()
+        del exc_type, traceback
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            _mark_fallback_blocked(
+                cleanup_error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
+            _attach_cleanup_failure(cleanup_error, cleanup_error)
+            if not isinstance(exc_value, BaseException):
+                _safe_add_note(
+                    cleanup_error,
+                    f"source cleanup failed: {_type_name(cleanup_error)}",
+                )
+                raise
+            if _contains_process_failure(cleanup_error):
+                _attach_operation_failure(cleanup_error, exc_value)
+                _safe_add_note(
+                    cleanup_error,
+                    f"source operation also failed: {_type_name(exc_value)}",
+                )
+                raise
+            _mark_fallback_blocked(
+                exc_value,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
+            _attach_cleanup_failure(exc_value, cleanup_error)
+            _safe_add_note(
+                exc_value,
+                f"source cleanup also failed: {_type_name(cleanup_error)}",
+            )
 
 
 def _cleanup_takes_precedence(error: BaseException) -> bool:
     """Return whether source teardown must replace an operation failure."""
-    return isinstance(error, MemoryError) or not isinstance(error, Exception)
+    return _contains_process_failure(error)

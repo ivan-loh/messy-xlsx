@@ -747,11 +747,11 @@ class HandlerRegistry:
         """Keep caller-owned handles alive and close local snapshots."""
         created = not isinstance(source, SourceHandle)
         handle = SourceHandle.coerce(source, filename=filename)
-        try:
+        if not created:
             yield handle
-        finally:
-            if created:
-                handle.close()
+            return
+        with handle:
+            yield handle
 
     def _detect(self, source: SourceHandle, filename: str | None = None) -> FormatInfo:
         accepts_handle = bool(type(self.detector).__dict__.get("_accepts_source_handle", False))

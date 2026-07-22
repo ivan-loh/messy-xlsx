@@ -1,9 +1,10 @@
-"""Private structured reasons that make a backend retry unsafe."""
+"""Private retry signals and non-masking exception diagnostics."""
 
 from __future__ import annotations
 
 from enum import Enum, auto
-from typing import TypeVar
+from types import TracebackType
+from typing import NoReturn, TypeVar
 
 _FALLBACK_BLOCK_REASON_KEY = "_messy_xlsx_fallback_block_reason"
 _MAX_EXCEPTION_TREE_NODES = 10_000
@@ -104,6 +105,101 @@ def _contains_process_failure(error: BaseException) -> bool:
 def _blocks_backend_retry(error: BaseException) -> bool:
     """Return whether process semantics or an internal marker forbid retry."""
     return _contains_process_failure(error) or _is_fallback_blocked(error)
+
+
+def _failure_summary(error: BaseException) -> dict[str, str]:
+    """Return useful context without source paths, values, or error messages."""
+    return {"type": _type_name(error)}
+
+
+def _attach_cleanup_failure(
+    primary_error: BaseException,
+    cleanup_error: BaseException,
+) -> None:
+    _merge_backend_context(
+        primary_error,
+        cleanup_failure=_failure_summary(cleanup_error),
+    )
+
+
+def _attach_operation_failure(
+    cleanup_error: BaseException,
+    operation_error: BaseException,
+) -> None:
+    _merge_backend_context(
+        cleanup_error,
+        operation_failure=_failure_summary(operation_error),
+    )
+
+
+def _merge_backend_context(
+    error: BaseException,
+    **updates: dict[str, str],
+) -> None:
+    """Best-effort merge of sanitized summaries without virtual hooks."""
+    try:
+        state = BaseException.__getattribute__(error, "__dict__")
+        if type(state) is not dict:
+            return
+        context: dict[str, dict[str, str]] = {}
+        existing = dict.get(state, "backend_context")
+        if type(existing) is dict:
+            for name in (
+                "primary_failure",
+                "fallback_failure",
+                "operation_failure",
+                "cleanup_failure",
+                "classifier_failure",
+            ):
+                summary = dict.get(existing, name)
+                if (
+                    type(summary) is dict
+                    and set(summary) == {"type"}
+                    and isinstance(dict.__getitem__(summary, "type"), str)
+                ):
+                    context[name] = {"type": dict.__getitem__(summary, "type")}
+        context.update({name: dict(summary) for name, summary in updates.items()})
+        dict.__setitem__(state, "backend_context", context)
+    except BaseException:
+        return
+
+
+def _type_name(value: object) -> str:
+    """Read a concrete type name without invoking metaclass overrides."""
+    try:
+        name = type.__getattribute__(type(value), "__name__")
+    except BaseException:
+        return "<unknown>"
+    return name if isinstance(name, str) else "<unknown>"
+
+
+def _exception_traceback(error: BaseException) -> TracebackType | None:
+    """Read traceback state without invoking exception attribute overrides."""
+    try:
+        traceback = BaseException.__getattribute__(error, "__traceback__")
+    except BaseException:
+        return None
+    return traceback if isinstance(traceback, TracebackType) else None
+
+
+def _safe_add_note(error: BaseException, note: str) -> None:
+    """Attach sanitized diagnostics without allowing annotation failures to mask."""
+    try:
+        BaseException.add_note(error, note)
+    except BaseException:
+        return
+
+
+def _raise_with_traceback(
+    error: BaseException,
+    traceback: TracebackType | None,
+) -> NoReturn:
+    """Raise the exact exception with captured traceback state when possible."""
+    try:
+        error = BaseException.with_traceback(error, traceback)
+    except BaseException:
+        pass
+    raise error
 
 
 def _nested_exceptions(

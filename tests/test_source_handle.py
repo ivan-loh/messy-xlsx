@@ -25,7 +25,7 @@ from messy_xlsx._fallback_signals import (
     _FallbackBlockReason,
 )
 from messy_xlsx._source import SourceHandle
-from messy_xlsx._spool import DEFAULT_MEMORY_LIMIT
+from messy_xlsx._spool import DEFAULT_MEMORY_LIMIT, ReplaySpool
 from messy_xlsx.detection import FormatDetector, StructureAnalyzer
 from messy_xlsx.exceptions import FileError, FormatError
 from messy_xlsx.parsing import CSVHandler, HandlerRegistry, ParseOptions
@@ -672,7 +672,14 @@ def test_consumer_failure_remains_primary_when_cursor_restoration_also_fails() -
 
 @pytest.mark.parametrize(
     "restore_error",
-    [MemoryError("capacity"), KeyboardInterrupt(), SystemExit(2), _FatalRestore()],
+    [
+        MemoryError("capacity"),
+        KeyboardInterrupt(),
+        SystemExit(2),
+        _FatalRestore(),
+        ExceptionGroup("outer", [MemoryError("nested capacity")]),
+        BaseExceptionGroup("outer", [KeyboardInterrupt()]),
+    ],
 )
 def test_process_level_cursor_restoration_failure_wins_over_consumer_error(
     restore_error: BaseException,
@@ -687,6 +694,172 @@ def test_process_level_cursor_restoration_failure_wins_over_consumer_error(
         raise RuntimeError("consumer failed")
 
     assert captured.value is restore_error
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
+
+
+def test_source_handle_exit_preserves_primary_over_ordinary_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = SourceHandle(NonSeekableStream(b"source", "source.bin"))
+    primary_error = ValueError("parse failed")
+    cleanup_error = OSError("spool unlink failed")
+
+    def fail_close(_spool: ReplaySpool) -> None:
+        raise cleanup_error
+
+    def fail_parse() -> None:
+        raise primary_error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ReplaySpool, "close", fail_close)
+        with pytest.raises(ValueError) as captured, handle:
+            fail_parse()
+
+    assert captured.value is primary_error
+    assert captured.traceback[-1].name == "fail_parse"
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "cleanup_failure": {"type": "OSError"}
+    }
+    assert "spool unlink failed" not in repr(captured.value.__notes__)
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
+    handle.close()
+
+
+@pytest.mark.parametrize(
+    "primary_error",
+    [MemoryError("capacity"), KeyboardInterrupt(), SystemExit(2), _FatalRestore()],
+)
+def test_source_handle_exit_preserves_process_primary_over_ordinary_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    primary_error: BaseException,
+) -> None:
+    handle = SourceHandle(NonSeekableStream(b"source", "source.bin"))
+    cleanup_error = OSError("spool unlink failed")
+
+    def fail_close(_spool: ReplaySpool) -> None:
+        raise cleanup_error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ReplaySpool, "close", fail_close)
+        with pytest.raises(type(primary_error)) as captured, handle:
+            raise primary_error
+
+    assert captured.value is primary_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "cleanup_failure": {"type": "OSError"}
+    }
+    assert "spool unlink failed" not in repr(captured.value.__notes__)
+    handle.close()
+
+
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [
+        MemoryError("capacity"),
+        KeyboardInterrupt(),
+        SystemExit(2),
+        _FatalRestore(),
+        ExceptionGroup("outer", [MemoryError("nested capacity")]),
+        BaseExceptionGroup("outer", [KeyboardInterrupt()]),
+    ],
+)
+def test_source_handle_exit_process_cleanup_wins_over_ordinary_primary(
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_error: BaseException,
+) -> None:
+    handle = SourceHandle(NonSeekableStream(b"source", "source.bin"))
+    primary_error = ValueError("parse failed")
+
+    def fail_close(_spool: ReplaySpool) -> None:
+        raise cleanup_error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ReplaySpool, "close", fail_close)
+        with pytest.raises(type(cleanup_error)) as captured, handle:
+            raise primary_error
+
+    assert captured.value is cleanup_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "operation_failure": {"type": "ValueError"},
+        "cleanup_failure": {"type": type(cleanup_error).__name__},
+    }
+    assert "parse failed" not in repr(captured.value.__notes__)
+    handle.close()
+
+
+def test_source_handle_exit_without_primary_propagates_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = SourceHandle(NonSeekableStream(b"source", "source.bin"))
+    cleanup_error = OSError("spool unlink failed")
+
+    def fail_close(_spool: ReplaySpool) -> None:
+        raise cleanup_error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ReplaySpool, "close", fail_close)
+        with pytest.raises(OSError) as captured, handle:
+            pass
+
+    assert captured.value is cleanup_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "cleanup_failure": {"type": "OSError"}
+    }
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
+    assert "spool unlink failed" not in repr(captured.value.__notes__)
+    handle.close()
+
+
+def test_source_handle_exit_merges_existing_sanitized_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = SourceHandle(NonSeekableStream(b"source", "source.bin"))
+    primary_error = ValueError("parse failed")
+    primary_error.backend_context = {  # type: ignore[attr-defined]
+        "primary_failure": {"type": "PrimaryReaderError"},
+        "fallback_failure": {"type": "FallbackReaderError"},
+    }
+    cleanup_error = OSError("spool unlink failed")
+
+    def fail_close(_spool: ReplaySpool) -> None:
+        raise cleanup_error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ReplaySpool, "close", fail_close)
+        with pytest.raises(ValueError) as captured, handle:
+            raise primary_error
+
+    assert captured.value is primary_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "primary_failure": {"type": "PrimaryReaderError"},
+        "fallback_failure": {"type": "FallbackReaderError"},
+        "cleanup_failure": {"type": "OSError"},
+    }
+    handle.close()
+
+
+def test_registry_owned_source_uses_source_handle_exit_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = HandlerRegistry()
+    primary_error = ValueError("parse failed")
+    cleanup_error = OSError("spool unlink failed")
+
+    def fail_close(_spool: ReplaySpool) -> None:
+        raise cleanup_error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ReplaySpool, "close", fail_close)
+        with (
+            pytest.raises(ValueError) as captured,
+            registry._source_handle(NonSeekableStream(b"source", "source.bin")),
+        ):
+            raise primary_error
+
+    assert captured.value is primary_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "cleanup_failure": {"type": "OSError"}
+    }
     assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
 
 

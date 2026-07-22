@@ -31,6 +31,10 @@ class _HostileCleanupError(RuntimeError):
         raise AssertionError("cleanup diagnostics must tolerate hostile repr")
 
 
+class _FatalSpoolCleanup(BaseException):
+    pass
+
+
 def _descriptor_is_closed(descriptor: int) -> bool:
     try:
         os.fstat(descriptor)
@@ -254,9 +258,8 @@ def test_non_oserror_remains_primary_when_spill_cleanup_also_fails(
 
         assert captured.value is primary_error
         assert captured.value.__notes__ == [
-            "temporary descriptor close also failed: "
-            "RuntimeError('injected descriptor cleanup failure')",
-            "temporary file removal also failed: RuntimeError('injected path cleanup failure')",
+            "temporary descriptor close also failed: RuntimeError",
+            "temporary file removal also failed: RuntimeError",
         ]
         assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
     finally:
@@ -295,7 +298,7 @@ def test_hostile_spill_cleanup_diagnostics_never_mask_the_primary(
 
         assert captured.value is primary_error
         notes = BaseException.__getattribute__(primary_error, "__notes__")
-        assert notes == ["temporary descriptor close also failed: <_HostileCleanupError>"]
+        assert notes == ["temporary descriptor close also failed: _HostileCleanupError"]
         assert _fallback_block_reason(primary_error) is _FallbackBlockReason.SOURCE_OWNERSHIP
     finally:
         if created:
@@ -308,3 +311,125 @@ def test_hostile_spill_cleanup_diagnostics_never_mask_the_primary(
                 original_unlink(path)
             except FileNotFoundError:
                 pass
+
+
+@pytest.mark.parametrize("operation", ["close", "unlink"])
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [
+        MemoryError("capacity"),
+        KeyboardInterrupt(),
+        SystemExit(2),
+        _FatalSpoolCleanup(),
+        ExceptionGroup("outer", [MemoryError("nested capacity")]),
+        BaseExceptionGroup("outer", [KeyboardInterrupt()]),
+    ],
+)
+def test_pending_spill_process_cleanup_wins_over_fdopen_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    cleanup_error: BaseException,
+) -> None:
+    created = _track_temp_creation(monkeypatch)
+    original_close = os.close
+    original_unlink = os.unlink
+    primary_error = RuntimeError("fdopen failed")
+
+    def fail_fdopen(_descriptor: int, _mode: str) -> BinaryIO:
+        raise primary_error
+
+    def fail_cleanup(*_args: object) -> None:
+        raise cleanup_error
+
+    monkeypatch.setattr(spool_module.os, "fdopen", fail_fdopen)
+    monkeypatch.setattr(spool_module.os, operation, fail_cleanup)
+
+    try:
+        with pytest.raises(type(cleanup_error)) as captured:
+            ReplaySpool.from_stream(io.BytesIO(b"x" * 32), memory_limit=8)
+
+        assert captured.value is cleanup_error
+    finally:
+        if created:
+            descriptor, path = created[0]
+            try:
+                original_close(descriptor)
+            except OSError:
+                pass
+            try:
+                original_unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [
+        MemoryError("capacity"),
+        KeyboardInterrupt(),
+        SystemExit(2),
+        _FatalSpoolCleanup(),
+        ExceptionGroup("outer", [MemoryError("nested capacity")]),
+        BaseExceptionGroup("outer", [KeyboardInterrupt()]),
+    ],
+)
+def test_active_spill_process_cleanup_wins_over_primary_failure(
+    cleanup_error: BaseException,
+) -> None:
+    primary_error = RuntimeError("read failed")
+
+    class FailingClose:
+        def close(self) -> None:
+            raise cleanup_error
+
+    with pytest.raises(type(cleanup_error)) as captured:
+        spool_module._cleanup_spill(  # type: ignore[arg-type]
+            FailingClose(),
+            None,
+            primary_error,
+        )
+
+    assert captured.value is cleanup_error
+
+
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [
+        MemoryError("capacity"),
+        KeyboardInterrupt(),
+        SystemExit(2),
+        _FatalSpoolCleanup(),
+        ExceptionGroup("outer", [MemoryError("nested capacity")]),
+        BaseExceptionGroup("outer", [KeyboardInterrupt()]),
+    ],
+)
+def test_completed_spool_process_cleanup_wins_over_restoration_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_error: BaseException,
+) -> None:
+    class RestoreFailureAfterRead(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__(b"source")
+            self.read_started = False
+
+        def read(self, size: int = -1) -> bytes:
+            self.read_started = True
+            return super().read(size)
+
+        def seek(self, position: int, whence: int = 0) -> int:
+            if self.read_started and position == 3 and whence == 0:
+                raise OSError("restore failed")
+            return super().seek(position, whence)
+
+    source = RestoreFailureAfterRead()
+    source.seek(3)
+
+    def fail_close(_spool: ReplaySpool) -> None:
+        raise cleanup_error
+
+    monkeypatch.setattr(ReplaySpool, "close", fail_close)
+
+    with pytest.raises(type(cleanup_error)) as captured:
+        ReplaySpool.from_stream(source)
+
+    assert captured.value is cleanup_error

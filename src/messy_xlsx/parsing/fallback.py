@@ -5,11 +5,19 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, NoReturn
+from typing import Any
 
 from messy_xlsx._fallback_signals import (
+    _attach_cleanup_failure,
+    _attach_operation_failure,
     _blocks_backend_retry,
     _contains_process_failure,
+    _exception_traceback,
+    _failure_summary,
+    _merge_backend_context,
+    _raise_with_traceback,
+    _safe_add_note,
+    _type_name,
 )
 from messy_xlsx.parsing.contracts import ParseMetrics
 
@@ -421,11 +429,6 @@ def _is_suppressible_parse_failure(error: BaseException) -> bool:
     return isinstance(error, Exception) and not _contains_process_failure(error)
 
 
-def _failure_summary(error: BaseException) -> dict[str, str]:
-    """Return useful backend context without source paths or cell values."""
-    return {"type": _type_name(error)}
-
-
 def _attach_primary_failure(
     fallback_error: BaseException,
     primary_summary: dict[str, str],
@@ -440,92 +443,3 @@ def _attach_primary_failure(
         fallback_error,
         f"primary backend failed: {primary_summary['type']}",
     )
-
-
-def _attach_cleanup_failure(
-    primary_error: BaseException,
-    cleanup_error: BaseException,
-) -> None:
-    _merge_backend_context(
-        primary_error,
-        cleanup_failure=_failure_summary(cleanup_error),
-    )
-
-
-def _attach_operation_failure(
-    cleanup_error: BaseException,
-    operation_error: BaseException,
-) -> None:
-    _merge_backend_context(
-        cleanup_error,
-        operation_failure=_failure_summary(operation_error),
-    )
-
-
-def _merge_backend_context(
-    error: BaseException,
-    **updates: dict[str, str],
-) -> None:
-    """Best-effort merge of sanitized summaries without virtual hooks."""
-    try:
-        state = BaseException.__getattribute__(error, "__dict__")
-        if type(state) is not dict:
-            return
-        context: dict[str, dict[str, str]] = {}
-        existing = dict.get(state, "backend_context")
-        if type(existing) is dict:
-            for name in (
-                "primary_failure",
-                "fallback_failure",
-                "operation_failure",
-                "cleanup_failure",
-                "classifier_failure",
-            ):
-                summary = dict.get(existing, name)
-                if (
-                    type(summary) is dict
-                    and set(summary) == {"type"}
-                    and isinstance(dict.__getitem__(summary, "type"), str)
-                ):
-                    context[name] = {"type": dict.__getitem__(summary, "type")}
-        context.update({name: dict(summary) for name, summary in updates.items()})
-        dict.__setitem__(state, "backend_context", context)
-    except BaseException:
-        return
-
-
-def _type_name(value: object) -> str:
-    """Read a concrete type name without invoking metaclass overrides."""
-    try:
-        name = type.__getattribute__(type(value), "__name__")
-    except BaseException:
-        return "<unknown>"
-    return name if isinstance(name, str) else "<unknown>"
-
-
-def _exception_traceback(error: BaseException) -> TracebackType | None:
-    """Read traceback state without invoking exception attribute overrides."""
-    try:
-        traceback = BaseException.__getattribute__(error, "__traceback__")
-    except BaseException:
-        return None
-    return traceback if isinstance(traceback, TracebackType) else None
-
-
-def _safe_add_note(error: BaseException, note: str) -> None:
-    """Attach sanitized diagnostics without allowing annotation failures to mask."""
-    try:
-        BaseException.add_note(error, note)
-    except BaseException:
-        return
-
-
-def _raise_with_traceback(
-    error: BaseException,
-    traceback: TracebackType | None,
-) -> NoReturn:
-    try:
-        error = BaseException.with_traceback(error, traceback)
-    except BaseException:
-        pass
-    raise error
