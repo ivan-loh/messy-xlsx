@@ -198,6 +198,44 @@ def test_canonical_class_fingerprint_bypasses_hostile_metaclass_hooks() -> None:
     assert virtual_hook_calls == []
 
 
+def test_transitive_project_type_fingerprint_bypasses_hostile_metaclass_hooks() -> None:
+    virtual_hook_calls: list[str] = []
+
+    class HostileMeta(type):
+        def __getattribute__(cls, name: str) -> object:
+            if name in {"__bases__", "__dict__", "__mro__"}:
+                virtual_hook_calls.append(name)
+                raise AssertionError("fingerprint invoked a virtual metaclass hook")
+            return type.__getattribute__(cls, name)
+
+        @property
+        def __dict__(cls) -> object:
+            virtual_hook_calls.append("__dict__ property")
+            raise AssertionError("fingerprint invoked a metaclass property")
+
+        @property
+        def __bases__(cls) -> object:
+            virtual_hook_calls.append("__bases__ property")
+            raise AssertionError("fingerprint invoked a metaclass property")
+
+        @property
+        def __mro__(cls) -> object:
+            virtual_hook_calls.append("__mro__ property")
+            raise AssertionError("fingerprint invoked a metaclass property")
+
+    cycle: list[object] = []
+    cycle.append(cycle)
+
+    class HostileProjectBehavior(metaclass=HostileMeta):
+        __module__ = "messy_xlsx.hostile_test"
+        behavior = cycle
+
+    virtual_hook_calls.clear()
+    registry_module._BehaviorFingerprinter()._project_type_token(HostileProjectBehavior)
+
+    assert virtual_hook_calls == []
+
+
 def test_non_exact_handler_list_fails_closed_without_iteration() -> None:
     class TrackingHandlerList(list[object]):
         def __init__(self, values: list[object]) -> None:

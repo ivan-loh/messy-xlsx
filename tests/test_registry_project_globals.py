@@ -7,7 +7,7 @@ import pandas as pd
 import messy_xlsx._source as source_module
 import messy_xlsx._spool as spool_module
 from messy_xlsx._spool import ReplaySpool
-from messy_xlsx.exceptions import MessyXlsxError
+from messy_xlsx.exceptions import FormatError, MessyXlsxError
 from messy_xlsx.parsing.base_handler import FormatHandler, ParseOptions
 from messy_xlsx.parsing.csv_handler import CSVHandler
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
@@ -21,6 +21,11 @@ class _BehaviorChangingInt(int):
 class _InheritedBehaviorOverride(FormatHandler):
     def _apply_row_limits(self, df: pd.DataFrame, options: ParseOptions) -> pd.DataFrame:
         return df
+
+
+class _ExternalFormatBehavior:
+    def to_dict(self) -> dict[str, bool]:
+        return {"external": True}
 
 
 def test_referenced_project_type_global_rebind_and_restore_is_detected() -> None:
@@ -80,6 +85,20 @@ def test_inherited_project_base_behavior_is_detected_and_restored() -> None:
         assert registry._uses_builtin_components() is False
     finally:
         MessyXlsxError.__init__ = original  # type: ignore[method-assign]
+
+    assert registry._uses_builtin_components() is True
+
+
+def test_transitive_project_type_external_mro_change_is_detected_and_restored() -> None:
+    registry = HandlerRegistry()
+    original_bases = FormatError.__bases__
+
+    try:
+        FormatError.__bases__ = (_ExternalFormatBehavior, *original_bases)
+        assert FormatError("changed").to_dict() == {"external": True}
+        assert registry._uses_builtin_components() is False
+    finally:
+        FormatError.__bases__ = original_bases
 
     assert registry._uses_builtin_components() is True
 

@@ -436,26 +436,39 @@ class _BehaviorFingerprinter(_FingerprintBudget):
         node = len(self._seen)
         self._seen[identity] = node
 
-        namespace = vars(value_type)
+        try:
+            type_namespace = type.__dict__
+            value_metaclass = type(value_type)
+            namespace = type_namespace["__dict__"].__get__(value_type, value_metaclass)
+            bases = type_namespace["__bases__"].__get__(value_type, value_metaclass)
+            mro = type_namespace["__mro__"].__get__(value_type, value_metaclass)
+        except BaseException as error:
+            raise _FingerprintError("project type cannot be inspected safely") from error
         self._preflight(len(namespace))
+        self._preflight(len(bases))
+        self._preflight(len(mro))
+        self._charge(len(bases) + len(mro))
         attributes: list[tuple[str, object]] = []
         for name, value in sorted(namespace.items()):
             if name in _NON_BEHAVIOR_CLASS_ATTRIBUTES:
                 continue
             self._charge(len(name))
             attributes.append((name, self._class_attribute_token(value)))
-        project_bases = tuple(
+        project_mro = tuple(
             self._project_type_token(owner)
-            for owner in value_type.__mro__[1:]
+            for index, owner in enumerate(mro)
+            if index
             if _is_project_type(owner)
         )
-        self._charge(len(attributes) + len(project_bases))
+        self._charge(len(attributes) + len(project_mro))
         return (
             "project-type",
             node,
             value_type,
+            tuple(id(base) for base in bases),
+            tuple(id(owner) for owner in mro),
             tuple(attributes),
-            project_bases,
+            project_mro,
         )
 
     def _class_attribute_token(self, value: object) -> object:
