@@ -5,6 +5,7 @@ from __future__ import annotations
 import lzma
 import posixpath
 import zlib
+from array import array
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -17,14 +18,24 @@ from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
 from messy_xlsx._source import SourceHandle
 from messy_xlsx.cache import PathIdentity
+from messy_xlsx.detection.locale_detector import is_european_number_format
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.ooxml.models import (
+    CELL_EUROPEAN_FORMAT,
+    CELL_HAS_FORMULA,
+    CELL_HAS_VALUE,
+    CELL_KIND_BOOLEAN,
+    CELL_KIND_DATE,
+    CELL_KIND_NUMBER,
+    CELL_KIND_OTHER,
+    CELL_KIND_TEXT,
     DEFAULT_LIMITS,
-    CellEvidence,
+    CellEvidenceIndex,
     Interval,
     IntervalIndex,
     MergeRange,
     OoxmlLimits,
+    RowBitSet,
     SheetDescriptor,
     SheetManifest,
     StyleManifest,
@@ -86,6 +97,11 @@ _CRITICAL_PART_CONTENT_TYPES = {
 }
 _MAX_EXCEL_ROW = 1_048_576
 _MAX_EXCEL_COLUMN = 16_384
+_ROW_BITSET_BYTES = (_MAX_EXCEL_ROW + 7) // 8
+_HEADER_EVIDENCE_ROWS = 19
+_LOCALE_EVIDENCE_ROWS = 51
+_LOCALE_EVIDENCE_COLUMNS = 21
+_SPARSE_EVIDENCE_ROWS = 1_000
 
 
 @dataclass(frozen=True)
@@ -866,32 +882,128 @@ def _xml_boolean(value: str | None) -> bool:
     return value is not None and value.casefold() in {"1", "true"}
 
 
-def _semantic_region(
-    row_bounds: Mapping[int, tuple[int, int]],
-    observed_max_row: int,
-) -> tuple[int, int, int, int]:
-    """Apply the legacy bounded-region heuristic to value-presence metadata."""
-    if not row_bounds:
-        return 1, 1, 1, 1
-    first_row = min(row_bounds)
-    scan_start = 1 if first_row <= 10_000 else first_row
-    scan_end = min(observed_max_row, scan_start + 9_999)
-    included: list[int] = []
-    last_data_row: int | None = None
-    for row in sorted(row for row in row_bounds if scan_start <= row <= scan_end):
-        if last_data_row is not None and row - last_data_row >= 102:
-            break
-        included.append(row)
-        last_data_row = row
-    if not included:
-        return 1, 1, 1, 1
-    start_row = included[0]
-    end_row = included[-1]
-    start_col = min(row_bounds[row][0] for row in included)
-    end_col = max(row_bounds[row][1] for row in included)
-    if scan_end < observed_max_row and scan_end - end_row < 10:
-        end_row = observed_max_row
-    return start_row, end_row, start_col, end_col
+@dataclass
+class _SemanticRegionState:
+    """Constant-space streaming state for the legacy data-region scan."""
+
+    first_row: int | None = None
+    last_row: int | None = None
+    start_col: int | None = None
+    end_col: int | None = None
+    scan_end: int | None = None
+    stopped: bool = False
+
+    def observe(self, row: int, column: int) -> bool:
+        """Record one value-bearing coordinate and return whether it is in-region."""
+        if self.first_row is None:
+            self.first_row = row
+            self.scan_end = (1 if row <= 10_000 else row) + 9_999
+        assert self.scan_end is not None
+        if self.stopped or row > self.scan_end:
+            return False
+        if self.last_row is not None and row - self.last_row >= 102:
+            self.stopped = True
+            return False
+        self.last_row = row
+        self.start_col = column if self.start_col is None else min(self.start_col, column)
+        self.end_col = column if self.end_col is None else max(self.end_col, column)
+        return True
+
+    def finish(self, observed_max_row: int) -> tuple[int, int, int, int]:
+        """Return the final region after applying the legacy max-row hint rule."""
+        if (
+            self.first_row is None
+            or self.last_row is None
+            or self.start_col is None
+            or self.end_col is None
+            or self.scan_end is None
+        ):
+            return 1, 1, 1, 1
+        scan_limit = min(observed_max_row, self.scan_end)
+        end_row = self.last_row
+        if scan_limit < observed_max_row and scan_limit - end_row < 10:
+            end_row = observed_max_row
+        return self.first_row, end_row, self.start_col, self.end_col
+
+
+def _set_row_bit(bits: bytearray, row: int) -> None:
+    bit = row - 1
+    bits[bit >> 3] |= 1 << (bit & 7)
+
+
+def _packed_cell_code(
+    data_type: str,
+    has_value: bool,
+    has_formula: bool,
+    number_format: str,
+) -> int:
+    if data_type in {"inlineStr", "s", "str", "e"}:
+        kind = CELL_KIND_TEXT
+    elif data_type == "b":
+        kind = CELL_KIND_BOOLEAN
+    elif data_type == "d" or is_date_format(number_format):
+        kind = CELL_KIND_DATE
+    elif data_type in {"n", ""}:
+        kind = CELL_KIND_NUMBER
+    else:
+        kind = CELL_KIND_OTHER
+    return (
+        kind
+        | (CELL_HAS_VALUE if has_value else 0)
+        | (CELL_HAS_FORMULA if has_formula else 0)
+        | (
+            CELL_EUROPEAN_FORMAT
+            if number_format != "General" and is_european_number_format(number_format)
+            else 0
+        )
+    )
+
+
+def _cell_evidence_index(
+    candidates: bytearray | None,
+    region: tuple[int, int, int, int],
+) -> tuple[CellEvidenceIndex, bool]:
+    if candidates is None:
+        return CellEvidenceIndex(), False
+    start_row, end_row, start_col, end_col = region
+    total_rows = end_row - start_row + 1
+    width = end_col - start_col + 1
+    header_rows = min(_HEADER_EVIDENCE_ROWS, total_rows)
+    locale_rows = min(_LOCALE_EVIDENCE_ROWS, total_rows)
+    locale_width = min(_LOCALE_EVIDENCE_COLUMNS, width)
+    header = bytearray(header_rows * width)
+    locale_extra_rows = max(0, locale_rows - header_rows)
+    locale = bytearray(locale_extra_rows * locale_width)
+    locale_has_european_format = False
+
+    for row_offset in range(locale_rows):
+        source_offset = row_offset * _MAX_EXCEL_COLUMN + start_col - 1
+        locale_slice = candidates[source_offset : source_offset + locale_width]
+        if any(code & CELL_EUROPEAN_FORMAT for code in locale_slice):
+            locale_has_european_format = True
+        if row_offset < header_rows:
+            target_offset = row_offset * width
+            header[target_offset : target_offset + width] = candidates[
+                source_offset : source_offset + width
+            ]
+        else:
+            target_offset = (row_offset - header_rows) * locale_width
+            locale[target_offset : target_offset + locale_width] = locale_slice
+
+    return (
+        CellEvidenceIndex(
+            start_row=start_row,
+            start_col=start_col,
+            end_col=end_col,
+            header_row_count=header_rows,
+            header_codes=bytes(header),
+            locale_row_offset=header_rows,
+            locale_row_count=locale_extra_rows,
+            locale_column_count=locale_width,
+            locale_codes=bytes(locale),
+        ),
+        locale_has_european_format,
+    )
 
 
 class ManifestReader:
@@ -970,12 +1082,16 @@ class ManifestReader:
         hidden_columns: list[Interval] = []
         merged_ranges: list[MergeRange] = []
         formula_samples: list[str] = []
-        formula_probe_coordinates: list[tuple[int, int]] = []
         number_format_codes: list[str] = []
         seen_number_format_codes: set[str] = set()
-        semantic_row_bounds: dict[int, tuple[int, int]] = {}
-        primary_cell_evidence: dict[tuple[int, int], CellEvidence] = {}
-        tail_cell_evidence: dict[int, list[CellEvidence]] = {}
+        region_state = _SemanticRegionState()
+        semantic_row_bits = bytearray(_ROW_BITSET_BYTES)
+        scoring_candidates: bytearray | None = None
+        pre_semantic_row = 0
+        pre_semantic_codes = bytearray(_MAX_EXCEL_COLUMN)
+        sparse_counts = array("H", [0]) * _MAX_EXCEL_COLUMN
+        sparse_row = 0
+        sparse_row_columns: set[int] = set()
         has_formulas = False
         current_cell: str | None = None
         current_row = 0
@@ -984,7 +1100,6 @@ class ManifestReader:
         current_number_format = "General"
         current_has_value = False
         current_has_formula = False
-        first_semantic_row: int | None = None
         namespace: str | None = None
         namespaced_elements = frozenset(
             {"worksheet", "dimension", "row", "col", "c", "f", "v", "t", "mergeCell"}
@@ -1007,6 +1122,14 @@ class ManifestReader:
             if event == "start" and local_name == "c":
                 current_cell = element.attrib.get("r")
                 current_row, current_column = _coordinate(current_cell, member)
+                if region_state.first_row is None and current_row != pre_semantic_row:
+                    pre_semantic_codes[:] = b"\x00" * _MAX_EXCEL_COLUMN
+                    pre_semantic_row = current_row
+                if sparse_row and current_row != sparse_row:
+                    for column in sparse_row_columns:
+                        sparse_counts[column - 1] += 1
+                    sparse_row_columns.clear()
+                sparse_row = current_row
                 observed_max_row = max(observed_max_row, current_row)
                 observed_max_col = max(observed_max_col, current_column)
                 observed_min_col = (
@@ -1072,64 +1195,62 @@ class ManifestReader:
                 ):
                     formula_samples.append(current_cell)
             elif event == "end" and local_name == "c":
-                if current_has_value:
-                    previous = semantic_row_bounds.get(current_row)
-                    if previous is None:
-                        semantic_row_bounds[current_row] = (
-                            current_column,
-                            current_column,
-                        )
-                    else:
-                        semantic_row_bounds[current_row] = (
-                            min(previous[0], current_column),
-                            max(previous[1], current_column),
-                        )
-                    first_semantic_row = (
-                        current_row
-                        if first_semantic_row is None
-                        else min(first_semantic_row, current_row)
-                    )
-                evidence = CellEvidence(
-                    row=current_row,
-                    column=current_column,
-                    data_type=current_data_type,
-                    has_value=current_has_value,
-                    has_formula=current_has_formula,
-                    number_format=current_number_format,
+                packed_code = _packed_cell_code(
+                    current_data_type,
+                    current_has_value,
+                    current_has_formula,
+                    current_number_format,
                 )
-                tail_cell_evidence.setdefault(current_row, []).append(evidence)
-                for old_row in tuple(tail_cell_evidence):
-                    if old_row < observed_max_row - 9:
-                        del tail_cell_evidence[old_row]
+                in_region = False
+                if current_has_value:
+                    _set_row_bit(semantic_row_bits, current_row)
+                    in_region = region_state.observe(current_row, current_column)
                 if (
-                    first_semantic_row is not None
-                    and first_semantic_row <= current_row <= first_semantic_row + 9_999
+                    in_region
+                    and region_state.first_row is not None
+                    and current_row < region_state.first_row + _SPARSE_EVIDENCE_ROWS
                 ):
-                    primary_cell_evidence[(current_row, current_column)] = evidence
+                    sparse_row_columns.add(current_column)
+                if region_state.first_row is not None and scoring_candidates is None:
+                    scoring_candidates = bytearray(_LOCALE_EVIDENCE_ROWS * _MAX_EXCEL_COLUMN)
+                    if pre_semantic_row == region_state.first_row:
+                        scoring_candidates[:_MAX_EXCEL_COLUMN] = pre_semantic_codes
+                if region_state.first_row is None:
+                    pre_semantic_codes[current_column - 1] = packed_code
                 if (
-                    current_has_formula
-                    and first_semantic_row is not None
-                    and first_semantic_row <= current_row <= first_semantic_row + 49
+                    scoring_candidates is not None
+                    and region_state.first_row is not None
+                    and region_state.first_row
+                    <= current_row
+                    < region_state.first_row + _LOCALE_EVIDENCE_ROWS
                 ):
-                    formula_probe_coordinates.append((current_row, current_column))
+                    offset = (
+                        (current_row - region_state.first_row) * _MAX_EXCEL_COLUMN
+                        + current_column
+                        - 1
+                    )
+                    scoring_candidates[offset] = packed_code
                 current_cell = None
             if event == "end":
                 element.clear()
 
-        semantic_data_region = _semantic_region(
-            semantic_row_bounds,
-            observed_max_row,
+        for column in sparse_row_columns:
+            sparse_counts[column - 1] += 1
+        semantic_data_region = region_state.finish(observed_max_row)
+        cell_evidence, locale_has_european_format = _cell_evidence_index(
+            scoring_candidates,
+            semantic_data_region,
         )
         start_row, _end_row, start_col, end_col = semantic_data_region
         legacy_has_formulas = any(
-            start_row <= row <= start_row + 49
-            and start_col <= column <= min(end_col, start_col + 9)
-            for row, column in formula_probe_coordinates
+            cell_evidence.code(row, column) & CELL_HAS_FORMULA
+            for row in range(start_row, min(_end_row, start_row + 49) + 1)
+            for column in range(start_col, min(end_col, start_col + 9) + 1)
         )
-        combined_evidence = dict(primary_cell_evidence)
-        for row_evidence in tail_cell_evidence.values():
-            for evidence in row_evidence:
-                combined_evidence[(evidence.row, evidence.column)] = evidence
+        sparse_filled_counts = bytearray(_MAX_EXCEL_COLUMN * 2)
+        for offset, count in enumerate(sparse_counts):
+            byte_offset = offset * 2
+            sparse_filled_counts[byte_offset : byte_offset + 2] = count.to_bytes(2, "little")
 
         return SheetManifest(
             name=descriptor.name,
@@ -1145,9 +1266,9 @@ class ManifestReader:
             number_format_codes=tuple(number_format_codes),
             observed_min_col=observed_min_col,
             semantic_data_region=semantic_data_region,
-            semantic_nonempty_rows=IntervalIndex(
-                tuple(Interval(row, row) for row in semantic_row_bounds)
-            ),
-            cell_evidence=tuple(combined_evidence.values()),
+            semantic_nonempty_rows=RowBitSet(bytes(semantic_row_bits)),
+            cell_evidence=cell_evidence,
+            sparse_filled_counts=bytes(sparse_filled_counts),
+            locale_has_european_format=locale_has_european_format,
             legacy_has_formulas=legacy_has_formulas,
         )

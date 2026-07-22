@@ -8,13 +8,20 @@ from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
-from openpyxl.styles.numbers import is_date_format
 
 from messy_xlsx.cache import StructureCache
 from messy_xlsx.detection.locale_detector import LocaleDetector
 from messy_xlsx.detection.structure_analyzer import StructureAnalyzer
 from messy_xlsx.models import StructureInfo
-from messy_xlsx.ooxml.models import CellEvidence, IntervalIndex, SheetManifest
+from messy_xlsx.ooxml.models import (
+    CELL_HAS_VALUE,
+    CELL_KIND_BOOLEAN,
+    CELL_KIND_DATE,
+    CELL_KIND_MASK,
+    CELL_KIND_NUMBER,
+    IntervalIndex,
+    SheetManifest,
+)
 
 _NUMERIC_EVIDENCE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?$")
 _MISSING_EVIDENCE = object()
@@ -106,7 +113,7 @@ class _EvidenceWorksheet:
     def __init__(self, evidence: StructureEvidence, manifest: SheetManifest) -> None:
         self._evidence = evidence
         self._retained_rows = frozenset(evidence.row_numbers)
-        self._cell_evidence = {(cell.row, cell.column): cell for cell in manifest.cell_evidence}
+        self._cell_evidence = manifest.cell_evidence
         self._semantic_nonempty_rows = manifest.semantic_nonempty_rows
         region = manifest.semantic_data_region
         self.max_row = region[1]
@@ -114,9 +121,7 @@ class _EvidenceWorksheet:
 
     def cell(self, row: int, column: int) -> SimpleNamespace:
         value = self._value(row, column)
-        metadata = self._cell_evidence.get((row, column))
-        number_format = "General" if metadata is None else metadata.number_format
-        return SimpleNamespace(value=value, number_format=number_format)
+        return SimpleNamespace(value=value, number_format="General")
 
     def _value(self, row: int, column: int) -> object:
         if not self._semantic_nonempty_rows.contains(row):
@@ -125,7 +130,7 @@ class _EvidenceWorksheet:
             return _MISSING_EVIDENCE
         values = self._evidence.row(row)
         value = values[column - 1] if column <= len(values) else None
-        return _worksheet_scalar(value, self._cell_evidence.get((row, column)))
+        return _worksheet_scalar(value, self._cell_evidence.code(row, column))
 
     def iter_rows(
         self,
@@ -145,23 +150,20 @@ class _EvidenceWorksheet:
                 yield tuple(SimpleNamespace(value=value) for value in row)
 
 
-def _worksheet_scalar(value: object, evidence: CellEvidence | None) -> object:
+def _worksheet_scalar(value: object, evidence_code: int) -> object:
     """Recover a scalar only when exact OOXML provenance permits coercion."""
-    if evidence is None:
+    if evidence_code == 0:
         return value
-    if not evidence.has_value:
+    if not evidence_code & CELL_HAS_VALUE:
         return None
-    if evidence.data_type == "b":
+    kind = evidence_code & CELL_KIND_MASK
+    if kind == CELL_KIND_BOOLEAN:
         if isinstance(value, str):
             return value.casefold() in {"1", "true"}
         return bool(value)
-    if evidence.data_type == "d" or is_date_format(evidence.number_format):
+    if kind == CELL_KIND_DATE:
         return value if not isinstance(value, str) else _DATE_EVIDENCE
-    if (
-        evidence.data_type in {"n", ""}
-        and isinstance(value, str)
-        and _NUMERIC_EVIDENCE.fullmatch(value)
-    ):
+    if kind == CELL_KIND_NUMBER and isinstance(value, str) and _NUMERIC_EVIDENCE.fullmatch(value):
         try:
             return float(value) if any(marker in value for marker in ".eE") else int(value)
         except ValueError:
@@ -180,9 +182,8 @@ def _expand_intervals(index: IntervalIndex) -> list[int]:
 def _locale_evidence(
     worksheet: _EvidenceWorksheet,
     data_region: dict[str, int],
-) -> tuple[list[str], list[str]]:
+) -> list[str]:
     text_values: list[str] = []
-    format_codes: list[str] = []
     end_row = min(data_region["end_row"], data_region["start_row"] + 50)
     end_col = min(data_region["end_col"], data_region["start_col"] + 20)
     for row in range(data_region["start_row"], end_row + 1):
@@ -190,9 +191,23 @@ def _locale_evidence(
             cell = worksheet.cell(row, column)
             if isinstance(cell.value, str):
                 text_values.append(cell.value)
-            if cell.number_format and cell.number_format != "General":
-                format_codes.append(cell.number_format)
-    return text_values, format_codes
+    return text_values
+
+
+def _sparse_columns(
+    manifest: SheetManifest,
+    data_region: dict[str, int],
+) -> list[int]:
+    total_rows = data_region["end_row"] - data_region["start_row"] + 1
+    if total_rows == 0:
+        return []
+    sample_limit = min(1_000, total_rows)
+    threshold = sample_limit * 0.1
+    return [
+        column
+        for column in range(data_region["start_col"], data_region["end_col"] + 1)
+        if manifest.sparse_filled_count(column) < threshold
+    ]
 
 
 def analyze_structure_evidence(
@@ -224,8 +239,9 @@ def analyze_structure_evidence(
     metadata = analyzer._detect_metadata_rows(worksheet, data_region, header)
     tables = analyzer._detect_multiple_tables(worksheet, data_region, header)
     blank_rows = analyzer._detect_blank_rows(worksheet, data_region)
-    sparse_columns = analyzer._detect_sparse_columns(worksheet, data_region)
-    text_values, format_codes = _locale_evidence(worksheet, data_region)
+    sparse_columns = _sparse_columns(manifest, data_region)
+    text_values = _locale_evidence(worksheet, data_region)
+    format_codes = ["#.##0,00"] if manifest.locale_has_european_format else []
     locale = LocaleDetector().detect_from_evidence(text_values, format_codes)
     return StructureInfo(
         data_start_row=data_region["start_row"],

@@ -28,6 +28,11 @@ DOT_THOUSANDS_PATTERN = re.compile(r"\d\.\d{3}")
 COMMA_THOUSANDS_PATTERN = re.compile(r"\d,\d{3}")
 
 
+def is_european_number_format(code: str) -> bool:
+    """Return whether one Excel number format is European evidence."""
+    return any(re.search(pattern, code) for pattern in EUROPEAN_FORMAT_PATTERNS)
+
+
 # ============================================================================
 # Models
 # ============================================================================
@@ -119,11 +124,7 @@ class LocaleDetector:
 
     def _check_format_codes(self, format_codes: list[str]) -> bool:
         """Check if format codes indicate European locale."""
-        for code in format_codes:
-            for pattern in EUROPEAN_FORMAT_PATTERNS:
-                if re.search(pattern, code):
-                    return True
-        return False
+        return any(is_european_number_format(code) for code in format_codes)
 
     def _check_text_values(self, text_values: list[str]) -> tuple[bool, float]:
         """Check text values for locale patterns."""

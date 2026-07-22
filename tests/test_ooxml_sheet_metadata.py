@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
@@ -10,11 +11,20 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import openpyxl
 import pytest
+from openpyxl.utils.cell import get_column_letter
 
 from messy_xlsx._source import SourceHandle
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.ooxml.manifest import ManifestReader
-from messy_xlsx.ooxml.models import Interval, IntervalIndex, MergeRange
+from messy_xlsx.ooxml.models import (
+    DEFAULT_LIMITS,
+    Interval,
+    IntervalIndex,
+    MergeRange,
+    SheetDescriptor,
+    StyleManifest,
+    WorkbookManifest,
+)
 
 
 def _rewrite_member(path: Path, member: str, transform: Callable[[bytes], bytes]) -> None:
@@ -29,6 +39,40 @@ def _rewrite_member(path: Path, member: str, transform: Callable[[bytes], bytes]
 def _replace_required(content: bytes, old: bytes, new: bytes) -> bytes:
     assert old in content
     return content.replace(old, new)
+
+
+def _synthetic_sheet_manifest(
+    row_numbers: range,
+    max_column: int,
+):
+    descriptor = SheetDescriptor(
+        name="Data",
+        relationship_id="rId1",
+        target="xl/worksheets/sheet1.xml",
+        state="visible",
+    )
+    rows: list[str] = []
+    for row in row_numbers:
+        cells = "".join(
+            f'<c r="{get_column_letter(column)}{row}"><v>1</v></c>'
+            for column in range(1, max_column + 1)
+        )
+        rows.append(f'<row r="{row}">{cells}</row>')
+    xml = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        'spreadsheetml/2006/main"><sheetData>' + "".join(rows) + "</sheetData></worksheet>"
+    ).encode()
+    reader = object.__new__(ManifestReader)
+    reader._limits = DEFAULT_LIMITS
+    reader.workbook = WorkbookManifest(
+        workbook_type="xlsx",
+        date_system="1900",
+        sheets=(descriptor,),
+        has_shared_strings=False,
+        shared_strings_uncompressed_size=0,
+        styles=StyleManifest((), (), ("General",)),
+    )
+    return reader._parse_sheet_xml(descriptor, io.BytesIO(xml))
 
 
 def test_interval_index_normalizes_ranges_without_expanding_cells() -> None:
@@ -130,6 +174,25 @@ def test_formula_presence_is_exact_but_coordinate_samples_are_capped(tmp_path) -
     assert sheet.formula_samples[0] == "H1"
     assert sheet.formula_samples[-1] == "H256"
     assert (sheet.observed_max_row, sheet.observed_max_col) == (300, 8)
+
+
+@pytest.mark.parametrize(
+    ("row_numbers", "max_column"),
+    [
+        (range(1, 101), 200),
+        (range(1, 40_000, 2), 1),
+    ],
+)
+def test_retained_provenance_is_bounded_by_scoring_shape_not_populated_cells(
+    row_numbers: range,
+    max_column: int,
+) -> None:
+    sheet = _synthetic_sheet_manifest(row_numbers, max_column)
+    scoring_coordinate_bound = 19 * max_column + 51 * min(21, max_column)
+
+    assert len(sheet.cell_evidence) <= scoring_coordinate_bound
+    assert type(sheet.semantic_nonempty_rows).__name__ == "RowBitSet"
+    assert len(sheet.semantic_nonempty_rows.bits) == 131_072
 
 
 def test_excel_upper_coordinate_is_accepted(tmp_path) -> None:

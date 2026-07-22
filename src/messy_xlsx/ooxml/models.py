@@ -80,20 +80,65 @@ class MergeRange:
             raise ValueError("invalid one-based merge range")
 
 
+CELL_KIND_MASK = 0x07
+CELL_KIND_TEXT = 0x01
+CELL_KIND_NUMBER = 0x02
+CELL_KIND_BOOLEAN = 0x03
+CELL_KIND_DATE = 0x04
+CELL_KIND_OTHER = 0x05
+CELL_HAS_VALUE = 0x08
+CELL_HAS_FORMULA = 0x10
+CELL_EUROPEAN_FORMAT = 0x20
+
+
 @dataclass(frozen=True)
-class CellEvidence:
-    """Value-free OOXML provenance for one structurally sampled cell."""
+class RowBitSet:
+    """Compact fixed-domain truth index for one-based worksheet rows."""
 
-    row: int
-    column: int
-    data_type: str
-    has_value: bool
-    has_formula: bool
-    number_format: str = "General"
+    bits: bytes = b""
 
-    def __post_init__(self) -> None:
-        if self.row < 1 or self.column < 1:
-            raise ValueError("cell evidence requires positive one-based coordinates")
+    def contains(self, value: int) -> bool:
+        """Return whether *value* has its bit set."""
+        if value < 1:
+            return False
+        bit = value - 1
+        byte = bit >> 3
+        return byte < len(self.bits) and bool(self.bits[byte] & (1 << (bit & 7)))
+
+
+@dataclass(frozen=True)
+class CellEvidenceIndex:
+    """Packed provenance for only the coordinates used by legacy scoring."""
+
+    start_row: int = 1
+    start_col: int = 1
+    end_col: int = 0
+    header_row_count: int = 0
+    header_codes: bytes = b""
+    locale_row_offset: int = 0
+    locale_row_count: int = 0
+    locale_column_count: int = 0
+    locale_codes: bytes = b""
+
+    def __len__(self) -> int:
+        """Return the number of retained packed coordinate slots."""
+        return len(self.header_codes) + len(self.locale_codes)
+
+    def code(self, row: int, column: int) -> int:
+        """Return packed provenance for one coordinate, or zero when unneeded."""
+        row_offset = row - self.start_row
+        width = self.end_col - self.start_col + 1
+        if 0 <= row_offset < self.header_row_count and self.start_col <= column <= self.end_col:
+            offset = row_offset * width + column - self.start_col
+            return self.header_codes[offset]
+        locale_row = row_offset - self.locale_row_offset
+        if (
+            0 <= locale_row < self.locale_row_count
+            and self.start_col <= column < self.start_col + self.locale_column_count
+        ):
+            offset = locale_row * self.locale_column_count + column - self.start_col
+            return self.locale_codes[offset]
+        return 0
 
 
 @dataclass(frozen=True)
@@ -113,9 +158,18 @@ class SheetManifest:
     number_format_codes: tuple[str, ...] = ()
     observed_min_col: int = 0
     semantic_data_region: tuple[int, int, int, int] = (1, 1, 1, 1)
-    semantic_nonempty_rows: IntervalIndex = field(default_factory=lambda: IntervalIndex(()))
-    cell_evidence: tuple[CellEvidence, ...] = ()
+    semantic_nonempty_rows: RowBitSet = field(default_factory=RowBitSet)
+    cell_evidence: CellEvidenceIndex = field(default_factory=CellEvidenceIndex)
+    sparse_filled_counts: bytes = b""
+    locale_has_european_format: bool = False
     legacy_has_formulas: bool = False
+
+    def sparse_filled_count(self, column: int) -> int:
+        """Return the compact first-1,000-row filled count for *column*."""
+        offset = (column - 1) * 2
+        if column < 1 or offset + 2 > len(self.sparse_filled_counts):
+            return 0
+        return int.from_bytes(self.sparse_filled_counts[offset : offset + 2], "little")
 
 
 @dataclass(frozen=True)

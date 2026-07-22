@@ -19,6 +19,7 @@ from messy_xlsx.detection.structure_sampler import (
     SampleWindow,
     StructureEvidence,
     StructureSampler,
+    blank_row_sample_positions,
     structure_sample_windows,
 )
 from messy_xlsx.ooxml.manifest import ManifestReader
@@ -398,6 +399,33 @@ def test_uncached_formulas_beyond_diagnostic_cap_do_not_change_structure(
     assert actual.data_start_row == 301
 
 
+def test_formula_only_middle_and_footer_samples_use_compact_row_truth(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sampled-formula-blanks.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    for row in range(1, 20_001):
+        worksheet.cell(row=row, column=1, value=row)
+    for row in range(1, 257):
+        worksheet.cell(row=row, column=2, value="=1+1")
+    sampled = blank_row_sample_positions(1, 20_000)
+    middle_row = next(row for row in sampled if 10_000 < row < 19_700)
+    footer_row = 19_900
+    assert footer_row in sampled
+    worksheet.cell(row=middle_row, column=1, value="=1+1")
+    worksheet.cell(row=footer_row, column=1, value="=1+1")
+    workbook.save(path)
+    workbook.close()
+
+    expected, actual, manifest = _differential_results(path)
+
+    assert len(manifest.formula_samples) == 256
+    assert {middle_row, footer_row}.issubset(expected.blank_rows)
+    assert actual == expected
+
+
 @pytest.mark.parametrize(
     ("formula_row", "formula_column", "expected_has_formulas"),
     [(50, 10, True), (51, 10, False), (50, 11, False)],
@@ -444,6 +472,27 @@ def test_distant_number_format_does_not_affect_locale_probe(tmp_path: Path) -> N
     assert actual == expected
 
 
+def test_first_data_row_provenance_survives_later_start_column_expansion(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "first-row-provenance.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet["E1"] = "=1+1"
+    worksheet["E1"].number_format = "#.##0,00"
+    worksheet["J1"] = "title"
+    worksheet["A2"] = "identifier"
+    worksheet["J2"] = 1
+    workbook.save(path)
+    workbook.close()
+
+    expected, actual, _manifest = _differential_results(path)
+
+    assert expected.detected_locale == "de_DE"
+    assert actual == expected
+
+
 def test_offset_large_region_does_not_treat_unrequested_rows_as_blank(tmp_path: Path) -> None:
     path = tmp_path / "offset-large.xlsx"
     workbook = openpyxl.Workbook()
@@ -459,7 +508,9 @@ def test_offset_large_region_does_not_treat_unrequested_rows_as_blank(tmp_path: 
     assert expected.blank_rows == []
     assert actual.blank_rows == []
     assert actual == expected
-    assert len({cell.row for cell in manifest.cell_evidence}) <= 10_500
+    assert len(manifest.cell_evidence) <= 19 * manifest.observed_max_col + 51 * min(
+        21, manifest.observed_max_col
+    )
 
 
 def test_data_region_can_start_after_legacy_head_window(tmp_path: Path) -> None:
