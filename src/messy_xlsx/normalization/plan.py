@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
-from datetime import date, datetime, time
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from enum import StrEnum
 from itertools import pairwise
-from typing import Final
+from typing import Final, cast
 
 import pandas as pd
 import pyarrow as pa
@@ -71,6 +71,14 @@ class ConditionMode(StrEnum):
     DROP_ROWS = "drop_rows"
     MASK_ALL_DUPLICATES = "mask_all_duplicates"
     DUPLICATE_SUBSET_ERROR = "duplicate_subset_error"
+
+
+@dataclass(frozen=True, slots=True)
+class _LabelToken:
+    """Type-tagged, hash-stable identity for an untrusted display label."""
+
+    kind: str
+    value: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,12 +146,14 @@ def _validate_sample_coordinates(row_numbers: pa.Int64Array) -> None:
 
 
 def _validate_sample_columns(sample: NormalizationSample) -> None:
-    for ordinal, (field, column) in enumerate(zip(sample.schema, sample.columns, strict=True)):
+    for ordinal, (schema_field, column) in enumerate(
+        zip(sample.schema, sample.columns, strict=True)
+    ):
         if not isinstance(column, pa.Array):
             raise TypeError(f"sample column {ordinal} must be an Arrow array")
         if len(column) != sample.row_count:
             raise ValueError("sample column lengths must match row coordinates")
-        if column.type != field.type:
+        if column.type != schema_field.type:
             raise ValueError("sample column types must match the sample schema")
 
 
@@ -151,9 +161,50 @@ def _validate_sample_budget(sample: NormalizationSample) -> None:
     cells = len(sample.columns) * sample.row_count
     if cells > MAX_SAMPLE_CELLS:
         raise ValueError(f"sample may retain at most {MAX_SAMPLE_CELLS} cells")
-    buffer_bytes = sum(column.nbytes for column in sample.columns)
+    seen_buffers: set[tuple[int, int]] = set()
+    buffer_bytes = sum(
+        _unique_physical_buffer_bytes(column, seen_buffers) for column in sample.columns
+    )
     if buffer_bytes > MAX_SAMPLE_BYTES:
         raise ValueError(f"sample may retain at most {MAX_SAMPLE_BYTES} Arrow bytes")
+
+
+def _unique_physical_buffer_bytes(
+    array: pa.Array,
+    seen: set[tuple[int, int]],
+) -> int:
+    total = 0
+    for buffer in array.buffers():
+        if buffer is None:
+            continue
+        while buffer.parent is not None:
+            buffer = buffer.parent
+        identity = (buffer.address, buffer.size)
+        if identity not in seen:
+            seen.add(identity)
+            total += buffer.size
+    if isinstance(array, pa.DictionaryArray):
+        total += _unique_physical_buffer_bytes(array.dictionary, seen)
+    elif isinstance(array, pa.ExtensionArray):
+        total += _unique_physical_buffer_bytes(array.storage, seen)
+    elif (
+        pa.types.is_list(array.type)
+        or pa.types.is_large_list(array.type)
+        or pa.types.is_fixed_size_list(array.type)
+        or pa.types.is_list_view(array.type)
+        or pa.types.is_large_list_view(array.type)
+        or pa.types.is_map(array.type)
+    ):
+        total += _unique_physical_buffer_bytes(array.values, seen)
+    elif pa.types.is_struct(array.type) or pa.types.is_union(array.type):
+        total += sum(
+            _unique_physical_buffer_bytes(array.field(index), seen)
+            for index in range(array.type.num_fields)
+        )
+    elif pa.types.is_run_end_encoded(array.type):
+        total += _unique_physical_buffer_bytes(array.run_ends, seen)
+        total += _unique_physical_buffer_bytes(array.values, seen)
+    return total
 
 
 def _validate_date_system(date_system: str) -> None:
@@ -168,8 +219,10 @@ class ColumnNormalization:
     ordinal: int
     input_type: pa.DataType
     output_type: pa.DataType
-    source_display_name: object
-    final_display_name: object
+    source_display_name: object = field(compare=False, hash=False)
+    final_display_name: object = field(compare=False, hash=False)
+    source_label_token: _LabelToken
+    final_label_token: _LabelToken
     semantic: SemanticOperation
     explicit_hint: str | None
     enabled_stages: tuple[str, ...]
@@ -199,8 +252,10 @@ class NormalizationPlan:
 
     input_schema: pa.Schema
     schema: pa.Schema
-    source_display_names: tuple[object, ...]
-    final_display_names: tuple[object, ...]
+    source_display_names: tuple[object, ...] = field(compare=False, hash=False)
+    final_display_names: tuple[object, ...] = field(compare=False, hash=False)
+    source_label_tokens: tuple[_LabelToken, ...] = field(repr=False)
+    final_label_tokens: tuple[_LabelToken, ...] = field(repr=False)
     columns: tuple[ColumnNormalization, ...]
     normalize: bool
     max_input_rows: int
@@ -233,10 +288,17 @@ def compile_normalization_plan(
     if plan.batch_size is None or plan.batch_size < 1:
         raise ValueError("streaming normalization requires a positive batch_size")
 
+    source_label_tokens = tuple(
+        _display_label_token(identity.display_name) for identity in sample.column_identities
+    )
     source_names = tuple(
         _snapshot_display_name(identity.display_name) for identity in sample.column_identities
     )
-    final_names = _compile_final_names(source_names, plan)
+    final_names, final_label_tokens = _compile_final_names(
+        source_names,
+        source_label_tokens,
+        plan,
+    )
     hints = plan.thaw_type_hints()
     enabled_stages = tuple(
         stage
@@ -251,7 +313,7 @@ def compile_normalization_plan(
     )
     rules: list[ColumnNormalization] = []
     fields: list[pa.Field] = []
-    for ordinal, (field, values, source_name, final_name) in enumerate(
+    for ordinal, (schema_field, values, source_name, final_name) in enumerate(
         zip(
             sample.schema,
             sample.columns,
@@ -260,10 +322,10 @@ def compile_normalization_plan(
             strict=True,
         )
     ):
-        hint_value = _mapping_get(hints, source_name)
+        hint_value = _mapping_get(hints, source_label_tokens[ordinal])
         explicit_hint = _validated_hint(hint_value)
         decision = _compile_column_decision(
-            field.type,
+            schema_field.type,
             values,
             source_name,
             explicit_hint,
@@ -277,10 +339,12 @@ def compile_normalization_plan(
         rules.append(
             ColumnNormalization(
                 ordinal=ordinal,
-                input_type=field.type,
+                input_type=schema_field.type,
                 output_type=decision.output_type,
                 source_display_name=source_name,
                 final_display_name=final_name,
+                source_label_token=source_label_tokens[ordinal],
+                final_label_token=final_label_tokens[ordinal],
                 semantic=decision.semantic,
                 explicit_hint=explicit_hint,
                 enabled_stages=enabled_stages if plan.normalize else (),
@@ -303,25 +367,30 @@ def compile_normalization_plan(
         schema=sample.schema if not plan.normalize else pa.schema(fields),
         source_display_names=source_names,
         final_display_names=final_names,
+        source_label_tokens=source_label_tokens,
+        final_label_tokens=final_label_tokens,
         columns=tuple(rules),
         normalize=plan.normalize,
         max_input_rows=plan.batch_size or 0,
         drop_regex=drop_regex,
         drop_conditions=(
-            _compile_conditions(final_names, tuple(rules), plan) if plan.normalize else ()
+            _compile_conditions(final_label_tokens, tuple(rules), plan) if plan.normalize else ()
         ),
     )
 
 
 def _compile_final_names(
     source_names: tuple[object, ...],
+    source_label_tokens: tuple[_LabelToken, ...],
     plan: ParsePlan,
-) -> tuple[object, ...]:
+) -> tuple[tuple[object, ...], tuple[_LabelToken, ...]]:
     if plan.sanitize_column_names:
         seen: dict[str, int] = {}
         sanitized: list[object] = []
         for source_name in source_names:
-            safe_source = source_name if _is_safe_display_name(source_name) else "unsafe_label"
+            safe_source = (
+                source_name if _is_sanitizable_display_name(source_name) else "unsafe_label"
+            )
             name = sanitize_column_name(safe_source)
             occurrence = seen.get(name, 0)
             seen[name] = occurrence + 1
@@ -330,26 +399,43 @@ def _compile_final_names(
     else:
         names = source_names
     renames = plan.thaw_column_renames()
-    return tuple(_snapshot_display_name(_mapping_get(renames, name, name)) for name in names)
+    name_tokens = (
+        tuple(_display_label_token(name) for name in names)
+        if plan.sanitize_column_names
+        else source_label_tokens
+    )
+    renamed = tuple(
+        _mapping_get(renames, token, name) for name, token in zip(names, name_tokens, strict=True)
+    )
+    return (
+        tuple(_snapshot_display_name(name) for name in renamed),
+        tuple(_display_label_token(name) for name in renamed),
+    )
 
 
 def _compile_conditions(
-    final_names: tuple[object, ...],
+    final_label_tokens: tuple[_LabelToken, ...],
     rules: tuple[ColumnNormalization, ...],
     plan: ParsePlan,
 ) -> tuple[RowCondition, ...]:
     conditions: list[RowCondition] = []
     for raw_label, raw_value in plan.thaw_drop_conditions():
-        label = _snapshot_display_name(raw_label)
         value = _snapshot_condition_value(raw_value)
-        ordinals = tuple(
-            ordinal for ordinal, final_name in enumerate(final_names) if final_name == label
+        label_token = _display_label_token(raw_label)
+        ordinals = (
+            ()
+            if raw_label is None
+            else tuple(
+                ordinal
+                for ordinal, final_token in enumerate(final_label_tokens)
+                if final_token == label_token
+            )
         )
         if not ordinals:
             mode = ConditionMode.IGNORE
         elif len(ordinals) == 1:
             mode = ConditionMode.DROP_ROWS
-        elif len(ordinals) == len(final_names):
+        elif len(ordinals) == len(final_label_tokens):
             mode = ConditionMode.MASK_ALL_DUPLICATES
         else:
             mode = ConditionMode.DUPLICATE_SUBSET_ERROR
@@ -479,7 +565,7 @@ def _decision_for_observed_values(
     if pa.types.is_string(observed_type) or pa.types.is_large_string(observed_type):
         return _string_observed_decision(
             observed_type,
-            non_null,
+            present,
             inferred,
             enabled_stages,
             decimal_separator,
@@ -501,7 +587,7 @@ def _numeric_observed_decision(
             for value in numeric_values
             if 1 <= float(value) <= 60_000 and float(value).is_integer()
         )
-        if numeric_values and len(candidates) > len(numeric_values) * 0.8:
+        if numeric_values and len(candidates) == len(numeric_values):
             return _decision(SemanticOperation.DATE, pa.timestamp("s"))
     return _decision(SemanticOperation.PASSTHROUGH, observed_type)
 
@@ -526,10 +612,12 @@ def _string_observed_decision(
     if "dates" in enabled_stages:
         date_format = _date_format(strings, inferred == "TIMESTAMP")
         if date_format is not None:
+            fixed_timezone = _fixed_text_timezone(strings)
             return _decision(
                 SemanticOperation.DATE,
-                pa.timestamp("us"),
+                pa.timestamp("us", tz=fixed_timezone),
                 date_format=date_format,
+                timezone=fixed_timezone,
             )
     return _decision(SemanticOperation.TEXT, observed_type)
 
@@ -575,12 +663,62 @@ def _hint_decision(
             numeric_mode="float",
         )
     if "TIMESTAMP" in normalized:
-        return _decision(SemanticOperation.DATE, pa.timestamp("ns"))
+        if pa.types.is_timestamp(observed_type):
+            return _decision(
+                SemanticOperation.PASSTHROUGH,
+                observed_type,
+                timezone=observed_type.tz,
+            )
+        fixed_timezone = _fixed_sample_timezone(values)
+        return _decision(
+            SemanticOperation.DATE,
+            pa.timestamp("ns", tz=fixed_timezone),
+            timezone=fixed_timezone,
+        )
     if normalized == "DATE":
         return _decision(SemanticOperation.DATE, pa.date32())
     if normalized in {"BOOL", "BOOLEAN"}:
         return _decision(SemanticOperation.PASSTHROUGH, pa.bool_())
     raise ValueError(f"Unsupported type hint: {hint}")
+
+
+def _fixed_sample_timezone(values: pa.Array) -> str | None:
+    strings = tuple(
+        value
+        for scalar in values
+        if scalar.is_valid
+        for value in (scalar.as_py(),)
+        if type(value) is str
+    )
+    return _fixed_text_timezone(strings)
+
+
+def _fixed_text_timezone(strings: tuple[str, ...]) -> str | None:
+    offsets: set[int] = set()
+    saw_naive = False
+    saw_aware = False
+    for value in strings:
+        try:
+            parsed = pd.Timestamp(value)
+        except (TypeError, ValueError):
+            continue
+        offset = parsed.utcoffset()
+        if offset is None:
+            saw_naive = True
+        else:
+            saw_aware = True
+            offsets.add(int(offset.total_seconds()))
+    if (saw_naive and saw_aware) or len(offsets) > 1:
+        raise ValueError("mixed or varying timestamp timezones are not supported")
+    if not offsets:
+        return None
+    offset_seconds = next(iter(offsets))
+    if offset_seconds % 60:
+        raise ValueError("sub-minute timestamp timezones are not supported")
+    sign = "+" if offset_seconds >= 0 else "-"
+    absolute_minutes = abs(offset_seconds) // 60
+    hours, minutes = divmod(absolute_minutes, 60)
+    return f"{sign}{hours:02d}:{minutes:02d}"
 
 
 def _decision(
@@ -748,28 +886,35 @@ def _date_format(strings: tuple[str, ...], name_suggests_date: bool) -> str | No
             except ValueError:
                 continue
             successes += 1
-        if successes > len(strings) * 0.8:
+        if successes == len(strings):
             return date_format
     if not name_suggests_date:
         return None
     parsed = pd.to_datetime(pd.Series(strings), errors="coerce", format="mixed")
-    return "mixed" if int(parsed.notna().sum()) > len(strings) * 0.5 else None
+    return "mixed" if int(parsed.notna().sum()) == len(strings) else None
 
 
 def _mapping_get(
     mapping: dict[object, object],
-    key: object,
+    key_token: _LabelToken,
     default: object | None = None,
 ) -> object | None:
-    try:
-        return mapping.get(key, default)
-    except (TypeError, ValueError):
-        return default
+    for candidate, value in mapping.items():
+        if _display_label_token(candidate) == key_token:
+            return value
+    return default
 
 
 def _snapshot_display_name(value: object) -> object:
-    if _is_safe_display_name(value):
+    if value is None or type(value) in {str, int, float, bool, bytes, date}:
         return value
+    if type(value) in {datetime, time}:
+        temporal = cast("datetime | time", value)
+        tz = temporal.tzinfo
+        if tz is None or type(tz) is timezone:
+            return value
+        value_type = type(value)
+        return f"<{value_type.__module__}.{value_type.__qualname__} label>"
     value_type = type(value)
     module = type.__getattribute__(value_type, "__module__")
     qualname = type.__getattribute__(value_type, "__qualname__")
@@ -795,8 +940,88 @@ def _snapshot_condition_value(value: object) -> object:
     return ("unsupported", module, qualname)
 
 
-def _is_safe_display_name(value: object) -> bool:
-    return value is None or type(value) in {str, int, float, bool, date, datetime, time}
+def _is_sanitizable_display_name(value: object) -> bool:
+    if value is None or type(value) in {str, int, float, bool, bytes, date}:
+        return True
+    if type(value) in {datetime, time}:
+        temporal = cast("datetime | time", value)
+        return temporal.tzinfo is None or type(temporal.tzinfo) is timezone
+    return False
+
+
+def _display_label_token(value: object) -> _LabelToken:  # noqa: C901
+    """Snapshot exact built-ins without invoking user equality, hash, or text hooks."""
+    value_type = type(value)
+    if value is None:
+        return _LabelToken("none", None)
+    if value_type is str:
+        return _LabelToken("str", value)
+    if value_type is bytes:
+        return _LabelToken("bytes", value)
+    if value_type is bool:
+        return _LabelToken("bool", value)
+    if value_type is int:
+        return _LabelToken("int", value)
+    if value_type is float:
+        float_value = cast("float", value)
+        if math.isnan(float_value):
+            return _LabelToken("float", "nan")
+        return _LabelToken("float", float_value.hex())
+    if value_type is datetime:
+        datetime_value = cast("datetime", value)
+        return _LabelToken(
+            "datetime",
+            (
+                datetime_value.year,
+                datetime_value.month,
+                datetime_value.day,
+                datetime_value.hour,
+                datetime_value.minute,
+                datetime_value.second,
+                datetime_value.microsecond,
+                datetime_value.fold,
+                _timezone_label_token(datetime_value.tzinfo),
+            ),
+        )
+    if value_type is date:
+        date_value = cast("date", value)
+        return _LabelToken("date", (date_value.year, date_value.month, date_value.day))
+    if value_type is time:
+        time_value = cast("time", value)
+        return _LabelToken(
+            "time",
+            (
+                time_value.hour,
+                time_value.minute,
+                time_value.second,
+                time_value.microsecond,
+                time_value.fold,
+                _timezone_label_token(time_value.tzinfo),
+            ),
+        )
+    module = type.__getattribute__(value_type, "__module__")
+    qualname = type.__getattribute__(value_type, "__qualname__")
+    return _LabelToken("unsupported", (module, qualname))
+
+
+def _timezone_label_token(value: object) -> object:
+    if value is None:
+        return ("naive",)
+    value_type = type(value)
+    if value_type is timezone:
+        timezone_value = cast("timezone", value)
+        offset = timezone_value.utcoffset(None)
+        name = timezone_value.tzname(None)
+        return (
+            "timezone",
+            offset.days if offset is not None else None,
+            offset.seconds if offset is not None else None,
+            offset.microseconds if offset is not None else None,
+            name,
+        )
+    module = type.__getattribute__(value_type, "__module__")
+    qualname = type.__getattribute__(value_type, "__qualname__")
+    return ("untrusted_timezone", module, qualname)
 
 
 def _safe_name_text(value: object) -> str:

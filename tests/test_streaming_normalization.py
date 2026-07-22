@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import gc
 import inspect
+import math
 import re
 import weakref
 from dataclasses import FrozenInstanceError
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta, tzinfo
 from decimal import Decimal
 from typing import Any
 
@@ -1534,3 +1535,438 @@ def test_eof_cleanup_failure_is_not_reported_as_clean_eof() -> None:
         reader.read_next_batch()
 
     assert captured.value is cleanup
+
+
+@pytest.mark.parametrize(
+    "cleanup",
+    [OSError("close"), MemoryError("close"), SystemExit("close")],
+)
+def test_coordinator_early_close_exposes_nested_source_cleanup_failure(
+    cleanup: BaseException,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]),), ("amount",)),
+        _parse_plan(),
+    )
+    raw = _Reader(
+        compiled.input_schema,
+        [pa.record_batch([pa.array(["1"])], schema=compiled.input_schema)],
+        close_error=cleanup,
+    )
+    stream = FallbackCoordinator(lambda _error: True).batches(
+        lambda: NormalizedStreamingReader(raw, compiled),
+        pytest.fail,
+    )
+
+    next(stream)
+    with pytest.raises(type(cleanup)) as captured:
+        stream.close()
+
+    assert captured.value is cleanup
+    assert raw.close_calls == 1
+
+
+def test_source_generator_exit_still_wins_over_ordinary_cleanup_failure() -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]),), ("amount",)),
+        _parse_plan(),
+    )
+    primary = GeneratorExit()
+    raw = _Reader(
+        compiled.input_schema,
+        [primary],
+        close_error=OSError("close"),
+    )
+    reader = NormalizedStreamingReader(raw, compiled)
+
+    with pytest.raises(GeneratorExit) as captured:
+        reader.read_next_batch()
+
+    assert captured.value is primary
+    assert primary.backend_context["cleanup_failure"] == {"type": "OSError"}
+
+
+def test_invalid_normalization_plan_closes_source_and_never_falls_back() -> None:
+    raw = _Reader(pa.schema([]))
+    fallback_calls = 0
+
+    def fallback_factory() -> _Reader:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return _Reader(pa.schema([]))
+
+    with pytest.raises(TypeError, match="NormalizationPlan") as captured:
+        list(
+            FallbackCoordinator(lambda _error: True).batches(
+                lambda: NormalizedStreamingReader(raw, object()),  # type: ignore[arg-type]
+                fallback_factory,
+            )
+        )
+
+    assert raw.close_calls == 1
+    assert fallback_calls == 0
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
+
+
+@pytest.mark.parametrize("descriptor", [False, True])
+def test_non_callable_owned_close_blocks_retryable_fallback(descriptor: bool) -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]),), ("amount",)),
+        _parse_plan(),
+    )
+    primary_error = CoordinateCompatibilityError("retry")
+
+    class NoCloseReader:
+        schema = compiled.input_schema
+        close = None
+
+        def read_next_batch(self) -> pa.RecordBatch | None:
+            raise primary_error
+
+    class DescriptorReader:
+        schema = compiled.input_schema
+
+        def read_next_batch(self) -> pa.RecordBatch | None:
+            raise primary_error
+
+        @property
+        def close(self) -> object:
+            return object()
+
+    raw = DescriptorReader() if descriptor else NoCloseReader()
+    fallback_calls = 0
+
+    def fallback_factory() -> _Reader:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return _Reader(compiled.schema)
+
+    with pytest.raises(CoordinateCompatibilityError) as captured:
+        list(
+            FallbackCoordinator(lambda _error: True).batches(
+                lambda: NormalizedStreamingReader(raw, compiled),  # type: ignore[arg-type]
+                fallback_factory,
+            )
+        )
+
+    assert captured.value is primary_error
+    assert fallback_calls == 0
+    assert _fallback_block_reason(primary_error) is _FallbackBlockReason.SOURCE_OWNERSHIP
+    assert primary_error.backend_context["cleanup_failure"] == {"type": "TypeError"}
+
+
+def test_nan_display_labels_compile_to_equal_hash_stable_plans() -> None:
+    first = compile_normalization_plan(
+        _sample((pa.array(["x"]),), (float("nan"),)),
+        _parse_plan(),
+    )
+    second = compile_normalization_plan(
+        _sample((pa.array(["x"]),), (float("nan"),)),
+        _parse_plan(),
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert isinstance(first.source_display_names[0], float)
+    assert math.isnan(first.source_display_names[0])
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [(True, 1), (1, 1.0), (0, -0.0), (b"a", b"b")],
+)
+def test_typed_display_labels_remain_distinct_plan_identities(
+    left: object,
+    right: object,
+) -> None:
+    left_plan = compile_normalization_plan(
+        _sample((pa.array(["x"]),), (left,)),
+        _parse_plan(),
+    )
+    right_plan = compile_normalization_plan(
+        _sample((pa.array(["x"]),), (right,)),
+        _parse_plan(),
+    )
+
+    assert left_plan != right_plan
+    assert hash(left_plan) != hash(right_plan)
+
+
+def test_distinct_bytes_labels_keep_distinct_sanitized_names() -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["x"]), pa.array(["y"])), (b"a", b"b")),
+        _parse_plan(sanitize_column_names=True),
+    )
+
+    assert compiled.source_display_names == (b"a", b"b")
+    assert compiled.final_display_names == ("b_a", "b_b")
+
+
+@pytest.mark.parametrize("sanitize", [False, True])
+@pytest.mark.parametrize("temporal_kind", ["datetime", "time"])
+def test_hostile_temporal_label_timezone_is_never_executed_or_retained(
+    sanitize: bool,
+    temporal_kind: str,
+) -> None:
+    calls = 0
+
+    class HostileTimezone(tzinfo):
+        def utcoffset(self, _value: datetime | None) -> timedelta:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("untrusted timezone must not execute")
+
+        def dst(self, _value: datetime | None) -> timedelta:
+            raise AssertionError("untrusted timezone must not execute")
+
+        def tzname(self, _value: datetime | None) -> str:
+            raise AssertionError("untrusted timezone must not execute")
+
+    timezone = HostileTimezone()
+    label = (
+        datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone)
+        if temporal_kind == "datetime"
+        else time(3, 4, 5, tzinfo=timezone)
+    )
+    timezone_ref = weakref.ref(timezone)
+    sample = _sample((pa.array(["x"]),), (label,))
+
+    compiled = compile_normalization_plan(
+        sample,
+        _parse_plan(sanitize_column_names=sanitize),
+    )
+
+    del sample, label, timezone
+    gc.collect()
+    assert calls == 0
+    assert timezone_ref() is None
+    assert hash(compiled)
+
+
+def test_none_condition_label_is_ignored_while_nan_label_resolves_positionally() -> None:
+    compiled = compile_normalization_plan(
+        _sample(
+            (pa.array(["drop", "keep"]), pa.array(["keep", "drop"])),
+            (None, float("nan")),
+        ),
+        _parse_plan(
+            drop_conditions=[
+                {"column": None, "value": "drop"},
+                {"column": float("nan"), "value": "drop"},
+            ]
+        ),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch(
+            [pa.array(["drop", "keep"]), pa.array(["keep", "drop"])],
+            schema=compiled.input_schema,
+        )
+    )
+
+    assert result.to_pydict() == {"0": ["drop"], "1": ["keep"]}
+
+
+@pytest.mark.parametrize(
+    ("array", "pattern"),
+    [
+        (
+            pa.array([datetime(2024, 1, 2, 3, 4, 5)], type=pa.timestamp("us")),
+            r"05$",
+        ),
+        (pa.array([time(3, 4, 5)], type=pa.time64("us")), r"05$"),
+        (pa.array([b"a'b"], type=pa.binary()), r'^b"a\'b"$'),
+    ],
+)
+def test_regex_temporal_and_binary_text_matches_python_scalar_formatting(
+    array: pa.Array,
+    pattern: str,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((array,), ("value",)),
+        _parse_plan(drop_regex=pattern),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([array], schema=compiled.input_schema)
+    )
+
+    assert result.num_rows == 0
+
+
+def test_unicode_case_insensitive_regex_uses_python_semantics() -> None:
+    values = pa.array(["İ", "keep"])
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(drop_regex=r"(?i)i"),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == ["keep"]
+
+
+def test_mixed_locale_late_comma_requires_exactly_two_decimal_digits() -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1,234.56", "2.345,67"]),), ("amount",)),
+        _parse_plan(batch_size=1),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([pa.array(["3,4"])], schema=compiled.input_schema)
+    )
+
+    assert compiled.columns[0].numeric_mode == "mixed_locale"
+    assert result.column(0).to_pylist() == [34.0]
+
+
+def test_sample_budget_counts_unique_physical_backing_buffers() -> None:
+    backing = pa.array([b"x" * (MAX_SAMPLE_BYTES + 1), b"ok"], type=pa.binary())
+    tiny_logical_slice = backing.slice(1, 1)
+    assert tiny_logical_slice.nbytes < 100
+
+    with pytest.raises(ValueError, match="bytes"):
+        _sample((tiny_logical_slice,), ("payload",))
+
+    shared = pa.array([b"x" * (MAX_SAMPLE_BYTES // 2 + 1)], type=pa.binary())
+    accepted = _sample((shared, shared), ("left", "right"))
+    assert accepted.row_count == 1
+
+
+def test_sample_budget_counts_nested_dictionary_backing_buffers() -> None:
+    dictionary = pa.array([b"x" * (MAX_SAMPLE_BYTES + 1)], type=pa.binary())
+    encoded = pa.DictionaryArray.from_arrays(pa.array([0], type=pa.int8()), dictionary)
+    nested = pa.ListArray.from_arrays(pa.array([0, 1], type=pa.int32()), encoded)
+
+    with pytest.raises(ValueError, match="bytes"):
+        _sample((nested,), ("payload",))
+
+
+@pytest.mark.parametrize(
+    "filter_config",
+    [
+        {},
+        {"drop_regex": r"^999$"},
+        {"drop_conditions": [{"column": "value", "value": 999}]},
+    ],
+)
+def test_all_keep_row_filters_preserve_original_batch_and_buffers(
+    filter_config: dict[str, object],
+) -> None:
+    values = pa.array([1, 2], type=pa.int64())
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(**filter_config),
+    )
+    batch = pa.record_batch([values], schema=compiled.input_schema)
+
+    result = ArrowNormalizationOperation(compiled).normalize(batch)
+
+    assert result is batch
+    assert result.column(0).buffers()[1].address == values.buffers()[1].address
+
+
+def test_uniform_timezone_text_hint_preserves_fixed_offset_schema_and_values() -> None:
+    values = pa.array(["2024-01-01T12:00:00+08:00", "2024-01-02T13:30:00+08:00"])
+    compiled = compile_normalization_plan(
+        _sample((values,), ("created_at",)),
+        _parse_plan(type_hints={"created_at": "TIMESTAMP"}),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.schema.types == [pa.timestamp("ns", tz="+08:00")]
+    assert [value.isoformat() for value in result.column(0).to_pylist()] == [
+        "2024-01-01T12:00:00+08:00",
+        "2024-01-02T13:30:00+08:00",
+    ]
+
+
+def test_mixed_timezone_text_hint_is_rejected_during_compilation() -> None:
+    values = pa.array(["2024-01-01T12:00:00+08:00", "2024-01-02T13:30:00+09:00"])
+
+    with pytest.raises(ValueError, match="timezone"):
+        compile_normalization_plan(
+            _sample((values,), ("created_at",)),
+            _parse_plan(type_hints={"created_at": "TIMESTAMP"}),
+        )
+
+
+def test_timestamp_hint_preserves_compatible_observed_timezone_and_unit() -> None:
+    timestamp_type = pa.timestamp("us", tz="Asia/Kuala_Lumpur")
+    values = pa.array([datetime(2024, 1, 1, 12)], type=timestamp_type)
+    compiled = compile_normalization_plan(
+        _sample((values,), ("created_at",)),
+        _parse_plan(type_hints={"created_at": "TIMESTAMP"}),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.schema.types == [timestamp_type]
+    assert result.column(0)[0].as_py() == values[0].as_py()
+
+
+def test_inferred_uniform_timezone_text_preserves_fixed_offset() -> None:
+    values = pa.array(["2024-01-01T12:00:00+08:00", "2024-01-02T13:30:00+08:00"])
+    compiled = compile_normalization_plan(
+        _sample((values,), ("created_at",)),
+        _parse_plan(),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.schema.types == [pa.timestamp("us", tz="+08:00")]
+    assert result.column(0)[0].as_py().isoformat() == "2024-01-01T12:00:00+08:00"
+
+
+def test_known_invalid_date_sample_evidence_does_not_compile_strict_date() -> None:
+    values = pa.array([*(f"2024-01-{day:02d}" for day in range(1, 10)), "not-a-date"])
+    compiled = compile_normalization_plan(
+        _sample((values,), ("event_date",)),
+        _parse_plan(batch_size=10),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.schema.types == [pa.string()]
+    assert result.column(0)[-1].as_py() == "not-a-date"
+
+
+def test_missing_marker_does_not_prevent_strict_date_compilation() -> None:
+    values = pa.array([*(f"2024-01-{day:02d}" for day in range(1, 10)), "NA"])
+    compiled = compile_normalization_plan(
+        _sample((values,), ("event_date",)),
+        _parse_plan(batch_size=10),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.schema.types == [pa.timestamp("us")]
+    assert result.num_rows == 9
+
+
+def test_known_invalid_numeric_date_sample_stays_numeric() -> None:
+    values = pa.array([*range(1, 10), 60_001], type=pa.int64())
+    compiled = compile_normalization_plan(
+        _sample((values,), ("event_date",)),
+        _parse_plan(batch_size=10),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.schema.types == [pa.int64()]
+    assert result.column(0)[-1].as_py() == 60_001

@@ -25,10 +25,11 @@ from messy_xlsx.normalization.plan import (
     ColumnNormalization,
     ConditionMode,
     NormalizationPlan,
+    RowCondition,
     SemanticOperation,
 )
 from messy_xlsx.parsing.contracts import StreamingBatchReader
-from messy_xlsx.parsing.streams import _close_if_present, _run_cleanups
+from messy_xlsx.parsing.streams import _run_cleanups
 
 _HORIZONTAL_SPACE: Final = re.compile(r"[ \t\xa0]+")
 _ALL_SPACE: Final = re.compile(r"[\s\xa0]+")
@@ -95,11 +96,14 @@ class ArrowNormalizationOperation:
                 raise ValueError("raw normalization schema is unstable")
             return batch
 
-        arrays = [
-            self._normalize_column(batch.column(rule.ordinal), rule, row_base)
-            for rule in self._plan.columns
-        ]
-        result = _record_batch(arrays, self._plan.schema, batch.num_rows)
+        arrays: list[pa.Array] = []
+        unchanged = batch.schema.equals(self._plan.schema, check_metadata=True)
+        for rule in self._plan.columns:
+            source = batch.column(rule.ordinal)
+            normalized = self._normalize_column(source, rule, row_base)
+            arrays.append(normalized)
+            unchanged = unchanged and normalized is source
+        result = batch if unchanged else _record_batch(arrays, self._plan.schema, batch.num_rows)
         result = _drop_all_null_rows(result)
         result = _apply_regex_filter(result, self._plan.drop_regex)
         result = _apply_conditions(result, self._plan)
@@ -232,6 +236,7 @@ class NormalizedStreamingReader:
                     "normalized reader input schema does not match its compiled plan"
                 )
         except BaseException as error:
+            _mark_semantic_failure(error)
             self._terminate(
                 primary_error=error,
                 primary_traceback=_exception_traceback(error),
@@ -283,6 +288,7 @@ class NormalizedStreamingReader:
         *,
         primary_error: BaseException | None = None,
         primary_traceback: TracebackType | None = None,
+        cleanup_overrides: bool = False,
     ) -> None:
         if self._closed:
             return
@@ -294,13 +300,15 @@ class NormalizedStreamingReader:
         cleanups = (
             []
             if reader is None
-            else [("normalized reader source cleanup", lambda: _close_if_present(reader))]
+            else [("normalized reader source cleanup", lambda: _close_owned_reader(reader))]
         )
+        cleanup_primary = None if cleanup_overrides else primary_error
+        cleanup_traceback = None if cleanup_primary is None else primary_traceback
         try:
             cleanup_failed = _run_cleanups(
                 cleanups,
-                primary_error=primary_error,
-                primary_traceback=primary_traceback,
+                primary_error=cleanup_primary,
+                primary_traceback=cleanup_traceback,
             )
         except BaseException as cleanup_error:
             if primary_error is None:
@@ -326,7 +334,11 @@ class NormalizedStreamingReader:
         if exc_value is None:
             self.close()
             return
-        self._terminate(primary_error=exc_value, primary_traceback=traceback)
+        self._terminate(
+            primary_error=exc_value,
+            primary_traceback=traceback,
+            cleanup_overrides=isinstance(exc_value, GeneratorExit),
+        )
 
 
 def _normalize_arrow_column(
@@ -357,6 +369,14 @@ def _normalize_arrow_column(
         ):
             return _normalize_arrow_fixed_dates(array, rule)
     return None
+
+
+def _close_owned_reader(reader: object) -> None:
+    """Close the required source-reader capability without optional semantics."""
+    close = getattr(reader, "close", None)
+    if not callable(close):
+        raise TypeError("owned streaming reader must provide a callable close")
+    close()
 
 
 def _normalize_arrow_passthrough(
@@ -421,7 +441,7 @@ def _normalize_arrow_number_strings(
         )
         if rule.numeric_mode == "mixed_locale":
             comma_decimal = pc.fill_null(
-                pc.match_substring_regex(text, pattern=r"\d,\d{1,2}$"),
+                pc.match_substring_regex(text, pattern=r"\d,\d{2}$"),
                 False,
             )
             comma_branch = pc.replace_substring(text, pattern=".", replacement="")
@@ -639,6 +659,8 @@ def _drop_all_null_rows(batch: pa.RecordBatch) -> pa.RecordBatch:
     keep = pc.is_valid(batch.column(0))
     for ordinal in range(1, batch.num_columns):
         keep = pc.or_(keep, pc.is_valid(batch.column(ordinal)))
+    if pc.all(keep).as_py() is True:
+        return batch
     return batch.filter(keep)
 
 
@@ -654,6 +676,8 @@ def _apply_regex_filter(
         if column_drop is None:
             column_drop = _scalar_regex_mask(column, pattern)
         drop = pc.or_(drop, column_drop)
+    if pc.any(drop).as_py() is not True:
+        return batch
     return batch.filter(pc.invert(drop))
 
 
@@ -661,7 +685,7 @@ def _arrow_regex_mask(
     column: pa.Array,
     pattern: re.Pattern[str],
 ) -> pa.BooleanArray | None:
-    if not _is_arrow_safe_regex(pattern.pattern):
+    if not _is_arrow_safe_regex(pattern):
         return None
     try:
         text = _arrow_regex_text(column)
@@ -680,22 +704,7 @@ def _arrow_regex_text(column: pa.Array) -> pa.Array | None:
     value_type = column.type
     if pa.types.is_string(value_type) or pa.types.is_large_string(value_type):
         return column
-    if pa.types.is_binary(value_type) or pa.types.is_large_binary(value_type):
-        decoded = pc.cast(column, pa.string(), safe=True)
-        printable = pc.fill_null(
-            pc.match_substring_regex(decoded, pattern=r"^[\x20-\x7e]*$"),
-            False,
-        )
-        if pc.all(printable).as_py() is not True:
-            return None
-        return pc.binary_join_element_wise("b'", decoded, "'", "")
-    if (
-        pa.types.is_integer(value_type)
-        or pa.types.is_decimal(value_type)
-        or pa.types.is_date(value_type)
-        or pa.types.is_time(value_type)
-        or pa.types.is_timestamp(value_type)
-    ):
+    if pa.types.is_integer(value_type) or pa.types.is_decimal(value_type):
         return pc.cast(column, pa.string(), safe=True)
     return None
 
@@ -717,7 +726,10 @@ def _scalar_regex_mask(
     return pa.array(drop, type=pa.bool_())
 
 
-def _is_arrow_safe_regex(pattern: str) -> bool:
+def _is_arrow_safe_regex(pattern: re.Pattern[str]) -> bool:
+    source = pattern.pattern
+    if pattern.flags & ~re.UNICODE or not source.isascii() or "(?" in source:
+        return False
     unsafe_tokens = (
         r"\d",
         r"\D",
@@ -733,8 +745,8 @@ def _is_arrow_safe_regex(pattern: str) -> bool:
         "(?P",
         "(?#",
     )
-    return not any(token in pattern for token in unsafe_tokens) and not any(
-        f"\\{index}" in pattern for index in range(1, 10)
+    return not any(token in source for token in unsafe_tokens) and not any(
+        f"\\{index}" in source for index in range(1, 10)
     )
 
 
@@ -744,36 +756,41 @@ def _apply_conditions(
 ) -> pa.RecordBatch:
     result = batch
     for condition in plan.drop_conditions:
-        if condition.mode is ConditionMode.DUPLICATE_SUBSET_ERROR:
-            raise ValueError("cannot reindex on an axis with duplicate labels")
-        if condition.mode is ConditionMode.IGNORE or result.num_rows == 0:
-            continue
-        if condition.mode is ConditionMode.DROP_ROWS:
-            ordinal = condition.ordinals[0]
-            operand = condition.operands[0]
-            if operand is None:
-                continue
-            equal = pc.equal(result.column(ordinal), operand)
-            equal = pc.fill_null(equal, False)
-            result = result.filter(pc.invert(equal))
-            continue
-        arrays = list(result.columns)
-        for ordinal, operand in zip(
-            condition.ordinals,
-            condition.operands,
-            strict=True,
-        ):
-            if operand is None:
-                continue
-            equal = pc.equal(arrays[ordinal], operand)
-            equal = pc.fill_null(equal, False)
-            arrays[ordinal] = pc.if_else(
-                equal,
-                pa.nulls(result.num_rows, type=arrays[ordinal].type),
-                arrays[ordinal],
-            )
-        result = _record_batch(arrays, result.schema, result.num_rows)
+        result = _apply_condition(result, condition)
     return result
+
+
+def _apply_condition(
+    batch: pa.RecordBatch,
+    condition: RowCondition,
+) -> pa.RecordBatch:
+    if condition.mode is ConditionMode.DUPLICATE_SUBSET_ERROR:
+        raise ValueError("cannot reindex on an axis with duplicate labels")
+    if condition.mode is ConditionMode.IGNORE or batch.num_rows == 0:
+        return batch
+    if condition.mode is ConditionMode.DROP_ROWS:
+        ordinal = condition.ordinals[0]
+        operand = condition.operands[0]
+        if operand is None:
+            return batch
+        equal = pc.fill_null(pc.equal(batch.column(ordinal), operand), False)
+        return batch if pc.any(equal).as_py() is not True else batch.filter(pc.invert(equal))
+
+    arrays = list(batch.columns)
+    changed = False
+    for ordinal, operand in zip(condition.ordinals, condition.operands, strict=True):
+        if operand is None:
+            continue
+        equal = pc.fill_null(pc.equal(arrays[ordinal], operand), False)
+        if pc.any(equal).as_py() is not True:
+            continue
+        arrays[ordinal] = pc.if_else(
+            equal,
+            pa.nulls(batch.num_rows, type=arrays[ordinal].type),
+            arrays[ordinal],
+        )
+        changed = True
+    return _record_batch(arrays, batch.schema, batch.num_rows) if changed else batch
 
 
 def _record_batch(
@@ -817,9 +834,12 @@ def _regex_text(value: object) -> str:
 
 
 def _blocked_schema_error(message: str) -> ValueError:
-    return _mark_fallback_blocked(
-        ValueError(message),
-        _FallbackBlockReason.CONFIGURATION,
+    return cast(
+        "ValueError",
+        _mark_fallback_blocked(
+            ValueError(message),
+            _FallbackBlockReason.CONFIGURATION,
+        ),
     )
 
 
