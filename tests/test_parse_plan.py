@@ -1054,6 +1054,23 @@ class _IdentityCondition:
         self.mutable_state = ["initial"]
 
 
+class _HostileIdentityMetaclass(type):
+    hash_calls = 0
+
+    def __hash__(cls) -> int:
+        del cls
+        _HostileIdentityMetaclass.hash_calls += 1
+        return _HostileIdentityMetaclass.hash_calls
+
+    def __eq__(cls, other: object) -> bool:
+        del cls, other
+        raise AssertionError("plan equality must not delegate to a sentinel metaclass")
+
+
+class _HostileMetaclassIdentityCondition(metaclass=_HostileIdentityMetaclass):
+    pass
+
+
 class _CustomNewValue:
     def __new__(cls, value: str) -> _CustomNewValue:
         del value
@@ -1403,6 +1420,32 @@ def test_identity_drop_token_stabilizes_plan_hash_and_equality_against_class_mut
     finally:
         _IdentityCondition.__eq__ = object.__eq__  # type: ignore[method-assign]
         _IdentityCondition.__hash__ = object.__hash__  # type: ignore[assignment]
+
+
+def test_identity_drop_token_uses_nonvirtual_stable_type_identity() -> None:
+    condition = _HostileMetaclassIdentityCondition()
+    first = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": condition}],
+        ),
+        None,
+        "xlsx",
+    )
+    same_reference = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": condition}],
+        ),
+        None,
+        "xlsx",
+    )
+    _HostileIdentityMetaclass.hash_calls = 0
+
+    assert first == same_reference
+    assert hash(first) == hash(same_reference)
+    assert hash(first) == hash(first)
+    assert first.thaw_drop_conditions()[0][1] is condition
 
 
 def test_opaque_c_backed_mutable_callable_is_rejected_before_backend_io() -> None:

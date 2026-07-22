@@ -124,7 +124,9 @@ class _FrozenComplex:
 
 @dataclass(frozen=True, slots=True)
 class _FrozenIdentityReference:
-    value_type: type[Any]
+    type_identity: int
+    type_module: str
+    type_qualname: str
     identity: int
     reference: Any = field(compare=False, hash=False, repr=False)
 
@@ -401,7 +403,15 @@ def _freeze(  # noqa: C901
     is_dataclass_instance = is_dataclass(value) and not isinstance(value, type)
     uses_identity_semantics = _uses_legacy_identity_semantics(value)
     if preserve_identity_reference and uses_identity_semantics:
-        return _FrozenIdentityReference(type(value), id(value), value)
+        value_type = type(value)
+        type_module, type_qualname = _safe_type_description(value_type)
+        return _FrozenIdentityReference(
+            type_identity=id(value_type),
+            type_module=type_module,
+            type_qualname=type_qualname,
+            identity=id(value),
+            reference=value,
+        )
 
     identity = id(value)
     if identity in active:
@@ -622,6 +632,22 @@ def _uses_legacy_identity_semantics(value: Any) -> bool:
     return (
         _raw_mro_attribute(value_type, "__eq__") is object.__eq__
         and _raw_mro_attribute(value_type, "__hash__") is object.__hash__
+    )
+
+
+def _safe_type_description(value_type: type[Any]) -> tuple[str, str]:
+    """Capture type labels without invoking a caller-controlled metaclass."""
+    try:
+        module = type.__getattribute__(value_type, "__module__")
+    except BaseException:
+        module = "<unknown>"
+    try:
+        qualname = type.__getattribute__(value_type, "__qualname__")
+    except BaseException:
+        qualname = "<unknown>"
+    return (
+        module if isinstance(module, str) else "<unknown>",
+        qualname if isinstance(qualname, str) else "<unknown>",
     )
 
 
