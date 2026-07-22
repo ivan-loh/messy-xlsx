@@ -7,6 +7,7 @@ from types import TracebackType
 from typing import NoReturn, TypeVar
 
 _FALLBACK_BLOCK_REASON_KEY = "_messy_xlsx_fallback_block_reason"
+_MAX_FALLBACK_MARKER_SIDECAR = 10_000
 _MAX_EXCEPTION_TREE_NODES = 10_000
 _ErrorT = TypeVar("_ErrorT", bound=BaseException)
 
@@ -18,6 +19,45 @@ class _FallbackBlockReason(Enum):
     SOURCE_OWNERSHIP = auto()
 
 
+class _FallbackMarkerSidecar:
+    """Bounded identity storage when an exception rejects private attributes."""
+
+    __slots__ = ("_entries", "_overflowed")
+
+    def __init__(self) -> None:
+        self._entries: dict[
+            int,
+            tuple[BaseException, _FallbackBlockReason],
+        ] = {}
+        self._overflowed = False
+
+    def store(
+        self,
+        error: BaseException,
+        reason: _FallbackBlockReason,
+    ) -> None:
+        identity = id(error)
+        existing = dict.get(self._entries, identity)
+        if existing is not None and existing[0] is error:
+            dict.__setitem__(self._entries, identity, (error, reason))
+            return
+        if len(self._entries) >= _MAX_FALLBACK_MARKER_SIDECAR:
+            self._overflowed = True
+            return
+        dict.__setitem__(self._entries, identity, (error, reason))
+
+    def get(self, error: BaseException) -> _FallbackBlockReason | None:
+        existing = dict.get(self._entries, id(error))
+        if existing is not None and existing[0] is error:
+            return existing[1]
+        if self._overflowed:
+            return _FallbackBlockReason.SOURCE_OWNERSHIP
+        return None
+
+
+_fallback_marker_sidecar = _FallbackMarkerSidecar()
+
+
 def _mark_fallback_blocked(
     error: _ErrorT,
     reason: _FallbackBlockReason,
@@ -26,11 +66,20 @@ def _mark_fallback_blocked(
     if not isinstance(reason, _FallbackBlockReason):
         return error
     try:
+        BaseException.__setattr__(error, _FALLBACK_BLOCK_REASON_KEY, reason)
+        stored = BaseException.__getattribute__(error, _FALLBACK_BLOCK_REASON_KEY)
+        if stored is reason:
+            return error
+    except BaseException:
+        pass
+    try:
         state = BaseException.__getattribute__(error, "__dict__")
         if type(state) is dict:
             dict.__setitem__(state, _FALLBACK_BLOCK_REASON_KEY, reason)
+            return error
     except BaseException:
         pass
+    _fallback_marker_sidecar.store(error, reason)
     return error
 
 
@@ -53,13 +102,20 @@ def _direct_fallback_block_reason(
 ) -> _FallbackBlockReason | None:
     """Read one exception's private marker without virtual hooks."""
     try:
-        state = BaseException.__getattribute__(error, "__dict__")
-        if type(state) is not dict:
-            return None
-        reason = dict.get(state, _FALLBACK_BLOCK_REASON_KEY)
+        reason = BaseException.__getattribute__(error, _FALLBACK_BLOCK_REASON_KEY)
     except BaseException:
-        return None
-    return reason if isinstance(reason, _FallbackBlockReason) else None
+        pass
+    else:
+        if isinstance(reason, _FallbackBlockReason):
+            return reason
+    try:
+        state = BaseException.__getattribute__(error, "__dict__")
+        reason = dict.get(state, _FALLBACK_BLOCK_REASON_KEY) if type(state) is dict else None
+    except BaseException:
+        reason = None
+    if isinstance(reason, _FallbackBlockReason):
+        return reason
+    return _fallback_marker_sidecar.get(error)
 
 
 def _is_fallback_blocked(error: BaseException) -> bool:
