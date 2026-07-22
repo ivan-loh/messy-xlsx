@@ -1,0 +1,42 @@
+{
+  "invalid_range": {
+    "context": {
+      "attempted_formats": [
+        "XLSXHandler"
+      ],
+      "detected_format": "xlsx",
+      "file_path": "accounts_receivable.xlsx"
+    },
+    "message": "All handlers failed for accounts_receivable.xlsx (file_path='accounts_receivable.xlsx', detected_format=<FormatType.XLSX: 'xlsx'>, attempted_formats=['XLSXHandler'])",
+    "type": "messy_xlsx.exceptions.FormatError"
+  },
+  "malformed_ooxml": {
+    "context": {
+      "file_path": "messy__preset_malformed_missing_workbook_xml__seed_1020__missing_workbook_xml.xlsx"
+    },
+    "message": "Unknown file format: messy__preset_malformed_missing_workbook_xml__seed_1020__missing_workbook_xml.xlsx (file_path='messy__preset_malformed_missing_workbook_xml__seed_1020__missing_workbook_xml.xlsx')",
+    "type": "messy_xlsx.exceptions.FormatError"
+  },
+  "missing_file": {
+    "context": {
+      "file_path": "missing.xlsx"
+    },
+    "message": "File not found: missing.xlsx (file_path='missing.xlsx')",
+    "type": "messy_xlsx.exceptions.FileError"
+  },
+  "missing_sheet": {
+    "context": {
+      "detection_phase": "sheet_lookup",
+      "sheet": "missing-sheet"
+    },
+    "message": "Sheet 'missing-sheet' not found (sheet='missing-sheet', detection_phase='sheet_lookup')",
+    "type": "messy_xlsx.exceptions.StructureError"
+  },
+  "unsupported_format": {
+    "context": {
+      "file_path": "unsupported.bin"
+    },
+    "message": "Unknown file format: unsupported.bin (file_path='unsupported.bin')",
+    "type": "messy_xlsx.exceptions.FormatError"
+  }
+}

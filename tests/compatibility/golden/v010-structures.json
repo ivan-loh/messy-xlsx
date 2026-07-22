@@ -1,0 +1,319 @@
+{
+  "formula": {
+    "analyze_structure": {
+      "blank_rows": [
+        14,
+        15,
+        16,
+        17,
+        24
+      ],
+      "data_end_col": 16,
+      "data_end_row": 27,
+      "data_start_col": 1,
+      "data_start_row": 4,
+      "decimal_separator": ".",
+      "detected_locale": "en_US",
+      "has_formulas": false,
+      "header_confidence": 1.0,
+      "header_row": 4,
+      "header_rows_count": 1,
+      "hidden_columns": [],
+      "hidden_rows": [],
+      "inconsistent_columns": false,
+      "merged_in_data": false,
+      "merged_in_headers": false,
+      "merged_ranges": [],
+      "metadata_rows": [],
+      "metadata_type": "unknown",
+      "num_tables": 2,
+      "sparse_columns": [
+        2,
+        16
+      ],
+      "suggested_overrides": {},
+      "suggested_skip_footer": 2,
+      "suggested_skip_rows": 0,
+      "table_ranges": [
+        {
+          "confidence": 1.0,
+          "end_col": 16,
+          "end_row": 13,
+          "has_header": true,
+          "header_row": null,
+          "start_col": 1,
+          "start_row": 4
+        },
+        {
+          "confidence": 1.0,
+          "end_col": 16,
+          "end_row": 27,
+          "has_header": true,
+          "header_row": null,
+          "start_col": 1,
+          "start_row": 18
+        }
+      ],
+      "thousands_separator": ","
+    },
+    "path": "tests/generated_messy/parseable/messy__preset_cash_flow_offset_formula_multitable__seed_1008__offset_table_formula_noise_multi_table_sheet_footer_noise.xlsx"
+  },
+  "hidden": {
+    "analyze_structure": {
+      "blank_rows": [
+        6
+      ],
+      "data_end_col": 9,
+      "data_end_row": 202,
+      "data_start_col": 1,
+      "data_start_row": 1,
+      "decimal_separator": ".",
+      "detected_locale": "en_US",
+      "has_formulas": false,
+      "header_confidence": 1.0,
+      "header_row": 1,
+      "header_rows_count": 1,
+      "hidden_columns": [
+        1,
+        5
+      ],
+      "hidden_rows": [],
+      "inconsistent_columns": false,
+      "merged_in_data": false,
+      "merged_in_headers": false,
+      "merged_ranges": [],
+      "metadata_rows": [],
+      "metadata_type": "unknown",
+      "num_tables": 1,
+      "sparse_columns": [],
+      "suggested_overrides": {},
+      "suggested_skip_footer": 0,
+      "suggested_skip_rows": 0,
+      "table_ranges": [
+        {
+          "confidence": 1.0,
+          "end_col": 9,
+          "end_row": 202,
+          "has_header": true,
+          "header_row": 1,
+          "start_col": 1,
+          "start_row": 1
+        }
+      ],
+      "thousands_separator": ","
+    },
+    "path": "tests/generated_messy/parseable/messy__preset_expense_reports_date_unicode_hidden__seed_1006__date_noise_unicode_whitespace_noise_hidden_cols_blank_row_noise.xlsx"
+  },
+  "merged": {
+    "analyze_structure": {
+      "blank_rows": [
+        5,
+        9
+      ],
+      "data_end_col": 6,
+      "data_end_row": 25,
+      "data_start_col": 1,
+      "data_start_row": 1,
+      "decimal_separator": ".",
+      "detected_locale": "en_US",
+      "has_formulas": false,
+      "header_confidence": 0.8500000000000001,
+      "header_row": 10,
+      "header_rows_count": 1,
+      "hidden_columns": [],
+      "hidden_rows": [
+        7,
+        17,
+        18
+      ],
+      "inconsistent_columns": false,
+      "merged_in_data": false,
+      "merged_in_headers": true,
+      "merged_ranges": [
+        [
+          10,
+          5,
+          10,
+          6
+        ],
+        [
+          10,
+          3,
+          10,
+          4
+        ],
+        [
+          10,
+          1,
+          10,
+          2
+        ]
+      ],
+      "metadata_rows": [
+        1,
+        2,
+        3,
+        4,
+        6,
+        7,
+        8
+      ],
+      "metadata_type": "unknown",
+      "num_tables": 1,
+      "sparse_columns": [],
+      "suggested_overrides": {},
+      "suggested_skip_footer": 0,
+      "suggested_skip_rows": 7,
+      "table_ranges": [
+        {
+          "confidence": 1.0,
+          "end_col": 6,
+          "end_row": 25,
+          "has_header": true,
+          "header_row": 10,
+          "start_col": 1,
+          "start_row": 1
+        }
+      ],
+      "thousands_separator": ","
+    },
+    "path": "tests/generated_messy/parseable/messy__preset_financial_statements_summary_sheet__seed_1004__metadata_preamble_merged_headers_irrelevant_summary_sheet_hidden_rows.xlsx"
+  },
+  "multi_sheet": {
+    "analyze_excel": [
+      {
+        "col_count": 6,
+        "header_row": 5,
+        "is_empty": false,
+        "is_pivot": false,
+        "name": "Income Statement",
+        "row_count": 20,
+        "skip_reason": null
+      },
+      {
+        "col_count": 3,
+        "header_row": 0,
+        "is_empty": false,
+        "is_pivot": false,
+        "name": "Balance Sheet",
+        "row_count": 20,
+        "skip_reason": null
+      },
+      {
+        "col_count": 3,
+        "header_row": 0,
+        "is_empty": false,
+        "is_pivot": false,
+        "name": "Cash Flow",
+        "row_count": 17,
+        "skip_reason": null
+      }
+    ],
+    "analyze_structure": {
+      "blank_rows": [
+        5
+      ],
+      "data_end_col": 6,
+      "data_end_row": 20,
+      "data_start_col": 1,
+      "data_start_row": 1,
+      "decimal_separator": ".",
+      "detected_locale": "en_US",
+      "has_formulas": false,
+      "header_confidence": 0.8,
+      "header_row": 6,
+      "header_rows_count": 1,
+      "hidden_columns": [],
+      "hidden_rows": [],
+      "inconsistent_columns": false,
+      "merged_in_data": false,
+      "merged_in_headers": false,
+      "merged_ranges": [],
+      "metadata_rows": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "metadata_type": "unknown",
+      "num_tables": 1,
+      "sparse_columns": [],
+      "suggested_overrides": {},
+      "suggested_skip_footer": 0,
+      "suggested_skip_rows": 4,
+      "table_ranges": [
+        {
+          "confidence": 1.0,
+          "end_col": 6,
+          "end_row": 20,
+          "has_header": true,
+          "header_row": 6,
+          "start_col": 1,
+          "start_row": 1
+        }
+      ],
+      "thousands_separator": ","
+    },
+    "path": "tests/samples/financial_statements.xlsx"
+  },
+  "multi_table": {
+    "analyze_structure": {
+      "blank_rows": [
+        10,
+        13,
+        18,
+        629,
+        630,
+        631
+      ],
+      "data_end_col": 10,
+      "data_end_row": 637,
+      "data_start_col": 1,
+      "data_start_row": 1,
+      "decimal_separator": ".",
+      "detected_locale": "en_US",
+      "has_formulas": false,
+      "header_confidence": 1.0,
+      "header_row": 1,
+      "header_rows_count": 1,
+      "hidden_columns": [
+        2,
+        4
+      ],
+      "hidden_rows": [],
+      "inconsistent_columns": false,
+      "merged_in_data": false,
+      "merged_in_headers": false,
+      "merged_ranges": [],
+      "metadata_rows": [],
+      "metadata_type": "unknown",
+      "num_tables": 2,
+      "sparse_columns": [],
+      "suggested_overrides": {},
+      "suggested_skip_footer": 0,
+      "suggested_skip_rows": 0,
+      "table_ranges": [
+        {
+          "confidence": 1.0,
+          "end_col": 10,
+          "end_row": 628,
+          "has_header": true,
+          "header_row": null,
+          "start_col": 1,
+          "start_row": 1
+        },
+        {
+          "confidence": 1.0,
+          "end_col": 10,
+          "end_row": 637,
+          "has_header": true,
+          "header_row": null,
+          "start_col": 1,
+          "start_row": 632
+        }
+      ],
+      "thousands_separator": ","
+    },
+    "path": "tests/generated_messy/parseable/messy__preset_inventory_multitable_ragged_hidden__seed_1010__multi_table_sheet_ragged_rows_hidden_cols_blank_row_noise.xlsx"
+  }
+}

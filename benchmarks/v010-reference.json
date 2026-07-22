@@ -1,0 +1,7 @@
+{
+  "version": "0.10.0",
+  "xlsx_100k": {"elapsed_seconds": 9.99, "peak_rss_mb": 627},
+  "csv_300k_path": {"normalized_seconds": 1.58, "peak_rss_mb": 267},
+  "csv_300k_seekable": {"normalized_seconds": 1.68, "peak_rss_mb": 352},
+  "multi_sheet": {"to_dataframes_openpyxl_loads": 6, "read_all_sheets_openpyxl_loads": 9}
+}

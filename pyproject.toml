@@ -152,4 +152,5 @@ strict_markers = true
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "generated: marks tests that exercise generated messy workbook corpora",
+    "compatibility: v0.10.0 public behavior contract",
 ]
