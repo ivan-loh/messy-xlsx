@@ -69,6 +69,11 @@ class _FingerprintBudget:
         if self._cost > _MAX_FINGERPRINT_COST:
             raise _FingerprintError("fingerprint budget exceeded")
 
+    def _preflight(self, units: int) -> None:
+        """Reject an allocation-sized operation before doing its O(N) work."""
+        if units < 0 or self._cost + units > _MAX_FINGERPRINT_COST:
+            raise _FingerprintError("fingerprint budget exceeded")
+
 
 class _CompositionFingerprinter(_FingerprintBudget):
     """Build a bounded recursive identity-and-state token for owned components."""
@@ -175,15 +180,21 @@ class _CompositionFingerprinter(_FingerprintBudget):
                 value.tobytes(),
             )
 
-        state = dict(vars(value)) if hasattr(value, "__dict__") else {}
+        if hasattr(value, "__dict__"):
+            namespace = vars(value)
+            self._charge(len(namespace))
+            state = dict(namespace)
+        else:
+            state = {}
         for owner in type(value).__mro__:
-            for name, descriptor in vars(owner).items():
+            namespace = vars(owner)
+            self._charge(len(namespace))
+            for name, descriptor in namespace.items():
                 if isinstance(descriptor, MemberDescriptorType):
                     try:
                         state.setdefault(name, descriptor.__get__(value, type(value)))
                     except AttributeError:
                         continue
-        self._charge(len(state))
         return (
             "object",
             node,
@@ -326,6 +337,7 @@ class _BehaviorFingerprinter(_FingerprintBudget):
         """Fingerprint only globals named by this function's bytecode."""
         references: list[tuple[str, object]] = []
         namespace = function.__globals__
+        self._preflight(len(function.__code__.co_names))
         for name in sorted(set(function.__code__.co_names)):
             if name in _FINGERPRINT_BOOTSTRAP_GLOBALS or name not in namespace:
                 continue
@@ -382,6 +394,7 @@ class _BehaviorFingerprinter(_FingerprintBudget):
         self._seen[identity] = node
 
         namespace = vars(value_type)
+        self._preflight(len(namespace))
         attributes: list[tuple[str, object]] = []
         for name, value in sorted(namespace.items()):
             if name in _NON_BEHAVIOR_CLASS_ATTRIBUTES:
@@ -450,6 +463,7 @@ class _BehaviorFingerprinter(_FingerprintBudget):
         """Fingerprint only globals directly named by project-method bytecode."""
         references: list[tuple[str, object]] = []
         namespace = function.__globals__
+        self._preflight(len(function.__code__.co_names))
         for name in sorted(set(function.__code__.co_names)):
             if name in _FINGERPRINT_BOOTSTRAP_GLOBALS or name not in namespace:
                 continue
@@ -494,6 +508,17 @@ class _BehaviorFingerprinter(_FingerprintBudget):
         ):
             return self.token(value)
         return ("global", type(value), id(value))
+
+    def class_behavior_token(self, value_type: type[object]) -> object:
+        """Fingerprint one class only after bounding its raw namespace sort."""
+        namespace = vars(value_type)
+        self._preflight(len(namespace))
+        attributes: list[tuple[str, object]] = []
+        for name, value in sorted(namespace.items()):
+            if name in _NON_BEHAVIOR_CLASS_ATTRIBUTES:
+                continue
+            attributes.append((name, self.token(value)))
+        return tuple(attributes)
 
 
 def _component_token(
@@ -557,11 +582,7 @@ def _class_behavior_token(component_types: tuple[type[object], ...]) -> object:
     return tuple(
         (
             component_type,
-            tuple(
-                (name, fingerprinter.token(value))
-                for name, value in sorted(vars(component_type).items())
-                if name not in _NON_BEHAVIOR_CLASS_ATTRIBUTES
-            ),
+            fingerprinter.class_behavior_token(component_type),
         )
         for component_type in component_types
     )
