@@ -385,6 +385,122 @@ def test_sheet_parser_rejects_duplicate_out_of_order_and_mismatched_coordinates(
     assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
 
 
+@pytest.mark.parametrize(
+    ("implicit_rows", "explicit_rows"),
+    [
+        (
+            '<row><c r="A1"><v>1</v></c></row>',
+            '<row r="1"><c r="A1"><v>1</v></c></row>',
+        ),
+        (
+            '<row r="1"><c r="A1"><v>1</v></c></row><row><c r="A2"><v>2</v></c></row>',
+            '<row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row>',
+        ),
+        (
+            '<row r="4"><c r="A4"><v>1</v></c></row><row><c r="A5"><v>2</v></c></row>',
+            '<row r="4"><c r="A4"><v>1</v></c></row><row r="5"><c r="A5"><v>2</v></c></row>',
+        ),
+        (
+            '<row r="1"><c><v>1</v></c></row>',
+            '<row r="1"><c r="A1"><v>1</v></c></row>',
+        ),
+        (
+            '<row r="1"><c r="A1"><v>1</v></c><c><f>1+1</f><v>2</v></c></row>',
+            '<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f>1+1</f><v>2</v></c></row>',
+        ),
+        (
+            '<row r="1"><c r="B1"><v>1</v></c><c><v>2</v></c>'
+            '<c r="E1"><v>3</v></c><c><v>4</v></c></row>',
+            '<row r="1"><c r="B1"><v>1</v></c><c r="C1"><v>2</v></c>'
+            '<c r="E1"><v>3</v></c><c r="F1"><v>4</v></c></row>',
+        ),
+        (
+            '<row r="3"/><row hidden="1"/>',
+            '<row r="3"/><row r="4" hidden="1"/>',
+        ),
+        (
+            '<row r="1"><c r="C1"><v>1</v></c></row><row><c><v>2</v></c></row>',
+            '<row r="1"><c r="C1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row>',
+        ),
+    ],
+    ids=[
+        "first-row",
+        "later-row",
+        "explicit-gap-then-row",
+        "first-cell",
+        "subsequent-cell",
+        "mixed-cells",
+        "hidden-row",
+        "column-state-reset",
+    ],
+)
+def test_implicit_rows_and_cells_match_fully_explicit_manifest(
+    implicit_rows: str,
+    explicit_rows: str,
+) -> None:
+    prefix = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'
+    )
+    suffix = "</sheetData></worksheet>"
+
+    implicit = _parse_synthetic_sheet(f"{prefix}{implicit_rows}{suffix}")
+    explicit = _parse_synthetic_sheet(f"{prefix}{explicit_rows}{suffix}")
+
+    assert implicit == explicit
+
+
+@pytest.mark.parametrize(
+    ("rows", "coordinate"),
+    [
+        ('<row r="1048576"/><row/>', 1_048_577),
+        ('<row r="1"><c r="XFD1"/><c/></row>', "XFE1"),
+    ],
+    ids=["row", "cell"],
+)
+def test_implicit_coordinate_overflow_is_rejected_with_context(
+    rows: str,
+    coordinate: int | str,
+) -> None:
+    xml = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        f'spreadsheetml/2006/main"><sheetData>{rows}</sheetData></worksheet>'
+    )
+
+    with pytest.raises(FormatError, match="out-of-bounds") as raised:
+        _parse_synthetic_sheet(xml)
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+    assert raised.value.context["coordinate"] == coordinate
+
+
+def test_explicit_cell_outside_row_remains_rejected() -> None:
+    xml = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        'spreadsheetml/2006/main"><sheetData><c r="A1"><v>1</v></c>'
+        "</sheetData></worksheet>"
+    )
+
+    with pytest.raises(FormatError, match="no enclosing row") as raised:
+        _parse_synthetic_sheet(xml)
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+
+
+def test_empty_explicit_cell_reference_is_contextual_format_error() -> None:
+    xml = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        'spreadsheetml/2006/main"><sheetData>'
+        '<row r="1"><c r=""><v>1</v></c></row>'
+        "</sheetData></worksheet>"
+    )
+
+    with pytest.raises(FormatError, match="malformed cell coordinate") as raised:
+        _parse_synthetic_sheet(xml)
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+    assert raised.value.context["coordinate"] == ""
+
+
 def test_sparse_counter_overflow_is_rejected_as_contextual_format_error() -> None:
     counts = array("H", [65_535])
 

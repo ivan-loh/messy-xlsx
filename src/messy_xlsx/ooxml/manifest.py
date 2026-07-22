@@ -14,7 +14,7 @@ from urllib.parse import unquote
 from zipfile import BadZipFile, ZipFile
 
 from openpyxl.styles.numbers import BUILTIN_FORMATS, is_date_format
-from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
+from openpyxl.utils.cell import coordinate_to_tuple, get_column_letter, range_boundaries
 
 from messy_xlsx._source import SourceHandle
 from messy_xlsx.cache import PathIdentity
@@ -838,7 +838,7 @@ def _style_index(value: str | None, member: str) -> int:
 def _coordinate(value: str | None, member: str) -> tuple[int, int]:
     try:
         row, column = coordinate_to_tuple(value or "")
-    except (TypeError, ValueError) as error:
+    except (TypeError, UnboundLocalError, ValueError) as error:
         raise FormatError(
             "OOXML worksheet contains malformed cell coordinate",
             member=member,
@@ -1172,7 +1172,17 @@ class ManifestReader:
                 member,
             )
             if event == "start" and local_name == "row":
-                row = _one_based_int(element.attrib.get("r"), member, "r", _MAX_EXCEL_ROW)
+                row_reference = element.attrib.get("r")
+                if row_reference is None:
+                    row = last_worksheet_row + 1
+                    if row > _MAX_EXCEL_ROW:
+                        raise FormatError(
+                            "OOXML worksheet contains out-of-bounds inferred row coordinate",
+                            member=member,
+                            coordinate=row,
+                        )
+                else:
+                    row = _one_based_int(row_reference, member, "r", _MAX_EXCEL_ROW)
                 if row <= last_worksheet_row:
                     raise FormatError(
                         "OOXML worksheet requires strictly increasing worksheet row coordinates",
@@ -1184,14 +1194,26 @@ class ManifestReader:
                 last_worksheet_row = row
                 last_cell_column = 0
             elif event == "start" and local_name == "c":
-                current_cell = element.attrib.get("r")
-                current_row, current_column = _coordinate(current_cell, member)
                 if enclosing_row == 0:
                     raise FormatError(
                         "OOXML worksheet cell has no enclosing row",
                         member=member,
-                        coordinate=current_cell,
+                        coordinate=element.attrib.get("r"),
                     )
+                cell_reference = element.attrib.get("r")
+                if cell_reference is None:
+                    current_row = enclosing_row
+                    current_column = last_cell_column + 1
+                    current_cell = f"{get_column_letter(current_column)}{current_row}"
+                    if current_column > _MAX_EXCEL_COLUMN:
+                        raise FormatError(
+                            "OOXML worksheet contains out-of-bounds inferred cell coordinate",
+                            member=member,
+                            coordinate=current_cell,
+                        )
+                else:
+                    current_cell = cell_reference
+                    current_row, current_column = _coordinate(current_cell, member)
                 if current_row != enclosing_row:
                     raise FormatError(
                         "OOXML worksheet cell coordinate disagrees with enclosing row",
@@ -1240,8 +1262,7 @@ class ManifestReader:
                 declared_dimension = _range(element.attrib.get("ref"), member)
             elif event == "end" and local_name == "row":
                 if _xml_boolean(element.attrib.get("hidden")):
-                    row = _one_based_int(element.attrib.get("r"), member, "r", _MAX_EXCEL_ROW)
-                    hidden_rows.append(Interval(row, row))
+                    hidden_rows.append(Interval(enclosing_row, enclosing_row))
                 enclosing_row = 0
                 last_cell_column = 0
             elif (

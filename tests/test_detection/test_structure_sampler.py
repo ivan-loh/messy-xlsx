@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from itertools import pairwise
 from pathlib import Path
-from zipfile import ZIP_STORED, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 import openpyxl
 import pandas as pd
@@ -355,6 +355,65 @@ def _differential_results(path: Path) -> tuple[object, object, SheetManifest]:
         with FastexcelSession(source) as session:
             actual = StructureSampler(session, manifest_reader).analyze("Data")
     return expected, actual, manifest
+
+
+def test_implicit_coordinates_match_explicit_sampler_and_legacy_behavior(
+    tmp_path: Path,
+) -> None:
+    explicit_path = tmp_path / "explicit-coordinates.xlsx"
+    implicit_path = tmp_path / "implicit-coordinates.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.append(["name", "amount"])
+    worksheet.cell(row=3, column=1, value="alpha")
+    worksheet.cell(row=3, column=2, value=1)
+    worksheet.cell(row=4, column=1, value="beta")
+    worksheet.cell(row=4, column=2, value=2)
+    worksheet.row_dimensions[4].hidden = True
+    workbook.save(explicit_path)
+    workbook.close()
+
+    with (
+        ZipFile(explicit_path) as source,
+        ZipFile(
+            implicit_path,
+            "w",
+            ZIP_DEFLATED,
+        ) as target,
+    ):
+        for info in source.infolist():
+            content = source.read(info.filename)
+            if info.filename == "xl/worksheets/sheet1.xml":
+                replacements = (
+                    (b'<row r="1"', b"<row"),
+                    (b'<c r="A1"', b"<c"),
+                    (b'<c r="B1"', b"<c"),
+                    (b'<c r="B3"', b"<c"),
+                    (b'<row r="4"', b"<row"),
+                    (b'<c r="A4"', b"<c"),
+                    (b'<c r="B4"', b"<c"),
+                )
+                for old, new in replacements:
+                    assert old in content
+                    content = content.replace(old, new, 1)
+            target.writestr(info, content)
+
+    def sampled(path: Path) -> tuple[SheetManifest, object]:
+        with SourceHandle(path) as source:
+            manifest_reader = ManifestReader(source)
+            manifest = manifest_reader.sheet("Data")
+            with FastexcelSession(source) as session:
+                structure = StructureSampler(session, manifest_reader).analyze("Data")
+        return manifest, structure
+
+    explicit_manifest, explicit_structure = sampled(explicit_path)
+    implicit_manifest, implicit_structure = sampled(implicit_path)
+    explicit_legacy = StructureAnalyzer().analyze(explicit_path, "Data", force=True)
+    implicit_legacy = StructureAnalyzer().analyze(implicit_path, "Data", force=True)
+
+    assert implicit_manifest == explicit_manifest
+    assert implicit_structure == explicit_structure == explicit_legacy == implicit_legacy
 
 
 def test_mixed_cell_types_preserve_numeric_text_boolean_and_date_provenance(
