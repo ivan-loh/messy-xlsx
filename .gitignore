@@ -57,3 +57,6 @@ htmlcov/
 
 # Isolated Superpowers implementation worktrees
 .worktrees/
+
+# Local Superpowers execution ledger and handoff artifacts
+.superpowers/
