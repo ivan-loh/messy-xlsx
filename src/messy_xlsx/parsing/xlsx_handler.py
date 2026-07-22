@@ -1,10 +1,12 @@
 """XLSX/XLSM file handler using fastexcel with openpyxl fallback."""
 
+from __future__ import annotations
+
 # ============================================================================
 # Imports
 # ============================================================================
-
 import logging
+from collections.abc import Callable
 from contextlib import ExitStack, closing
 from typing import Any
 
@@ -12,6 +14,7 @@ import fastexcel
 import numpy as np
 import openpyxl
 import pandas as pd
+import pyarrow as pa
 
 from messy_xlsx._source import SourceHandle
 from messy_xlsx.exceptions import FileError, FormatError
@@ -19,6 +22,15 @@ from messy_xlsx.parsing.base_handler import (
     FileSource,
     FormatHandler,
     ParseOptions,
+)
+from messy_xlsx.parsing.contracts import OutputMode, ParseMetrics
+from messy_xlsx.parsing.fallback import FallbackCoordinator
+from messy_xlsx.parsing.fastexcel_session import FastexcelSession
+from messy_xlsx.parsing.legacy_adapter import LegacyDataFrameAdapter
+from messy_xlsx.parsing.parse_plan import ParsePlan
+from messy_xlsx.parsing.xlsx_materialized import (
+    FastexcelMaterializedReader,
+    _coerce_materialized_table,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +49,160 @@ EXCEL_ERRORS = {
     "#VALUE!",
     "#GETTING_DATA",
 }
+
+_FASTEXCEL_COMPATIBILITY_ERRORS = (
+    fastexcel.UnsupportedColumnTypeCombinationError,
+    fastexcel.CannotRetrieveCellDataError,
+    fastexcel.CalamineCellError,
+)
+
+
+def is_fastexcel_compatibility_error(error: Exception) -> bool:
+    """Return whether openpyxl can safely retry this typed cell limitation."""
+    return isinstance(error, _FASTEXCEL_COMPATIBILITY_ERRORS)
+
+
+def _is_fastexcel_materialized_plan(plan: ParsePlan) -> bool:
+    """Gate features whose shared coordinate transforms arrive in Task 8."""
+    return (
+        plan.output_mode is OutputMode.MATERIALIZED
+        and plan.skip_rows == 0
+        and plan.merge_strategy == "skip"
+        and not plan.ignore_hidden
+        and plan.cell_range is None
+        and plan.data_only
+    )
+
+
+class _FastexcelDataFrameReader:
+    """Own a session while adapting one Arrow result to the legacy frame SPI."""
+
+    def __init__(
+        self,
+        handler: XLSXHandler,
+        source: SourceHandle,
+        sheet: str | None,
+        options: ParseOptions,
+        plan: ParsePlan | None,
+        session_factory: Callable[[], FastexcelSession] | None = None,
+    ) -> None:
+        self._handler = handler
+        self._options = options
+        self._plan = plan
+        self._skip_rows_already_applied = plan is None
+        self._owns_session = session_factory is None
+        if session_factory is None:
+
+            def make_owned_session() -> FastexcelSession:
+                return FastexcelSession(source)
+
+            get_session = make_owned_session
+        else:
+            get_session = session_factory
+        try:
+            session = get_session()
+        except _FASTEXCEL_COMPATIBILITY_ERRORS:
+            raise
+        except PermissionError:
+            raise
+        except MemoryError:
+            raise
+        except Exception as error:
+            raise FormatError(
+                f"Cannot open Excel file: {error}",
+                file_path=source.description,
+            ) from error
+        self._session: FastexcelSession | None = session
+        self._reader: FastexcelMaterializedReader | _LegacyFastexcelArrowReader | None = None
+        try:
+            resolved_sheet = handler._resolve_session_sheet(
+                session,
+                sheet,
+                source.description,
+            )
+            if plan is None:
+                self._reader = _LegacyFastexcelArrowReader(
+                    session,
+                    resolved_sheet,
+                    options.skip_rows,
+                )
+            else:
+                self._reader = FastexcelMaterializedReader(
+                    session,
+                    resolved_sheet,
+                    plan,
+                )
+        except BaseException:
+            if self._owns_session:
+                session.close()
+            self._session = None
+            raise
+
+    def read_table(self) -> pd.DataFrame:
+        """Read Arrow once, bridge once, then apply handler-owned framing."""
+        reader = self._reader
+        if reader is None:
+            raise RuntimeError("Fastexcel materialized operation is closed")
+        table = reader.read_table()
+        frame = LegacyDataFrameAdapter().to_dataframe(table, self._plan)
+        return self._handler._frame_fastexcel_data(
+            frame,
+            self._options,
+            skip_rows_already_applied=self._skip_rows_already_applied,
+        )
+
+    def close(self) -> None:
+        """Release only the session; the SourceHandle retains spill ownership."""
+        session = self._session
+        self._reader = None
+        self._session = None
+        if self._owns_session and session is not None:
+            session.close()
+
+
+class _LegacyFastexcelArrowReader:
+    """Raw operation for the ParseOptions-only legacy handler SPI."""
+
+    def __init__(
+        self,
+        session: FastexcelSession,
+        sheet: str,
+        skip_rows: int,
+    ) -> None:
+        self._session = session
+        self._sheet = sheet
+        self._skip_rows = skip_rows
+
+    def read_table(self) -> pa.Table:
+        materialized = self._session.materialize(
+            self._sheet,
+            skip_rows=self._skip_rows,
+        )
+        return _coerce_materialized_table(materialized)
+
+
+class _OpenpyxlDataFrameReader:
+    """Coordinator adapter for the existing compatibility DataFrame reader."""
+
+    def __init__(
+        self,
+        handler: XLSXHandler,
+        source: SourceHandle,
+        sheet: str | None,
+        options: ParseOptions,
+    ) -> None:
+        self._handler = handler
+        self._source = source
+        self._sheet = sheet
+        self._options = options
+
+    def read_table(self) -> pd.DataFrame:
+        """Return the existing openpyxl compatibility frame unchanged."""
+        return self._handler._parse_openpyxl(
+            self._source,
+            self._sheet,
+            self._options,
+        )
 
 
 # ============================================================================
@@ -70,7 +236,34 @@ class XLSXHandler(FormatHandler):
 
             if needs_openpyxl:
                 return self._parse_openpyxl(source, sheet, options)
-            return self._parse_fastexcel(source, sheet, options)
+            return self._parse_fastexcel(source, sheet, options, plan=None)
+        finally:
+            if source is not file_source:
+                source.close()
+
+    def _parse_materialized_plan(
+        self,
+        file_source: FileSource | SourceHandle,
+        sheet: str | None,
+        plan: ParsePlan,
+        session_factory: Callable[[], FastexcelSession],
+        *,
+        metrics: ParseMetrics | None = None,
+    ) -> pd.DataFrame:
+        """Parse an eligible built-in plan without reconstructing it."""
+        if not _is_fastexcel_materialized_plan(plan):
+            return self.parse(file_source, sheet, plan.to_parse_options())
+
+        source = SourceHandle.coerce(file_source)
+        try:
+            return self._parse_fastexcel(
+                source,
+                sheet,
+                plan.to_parse_options(),
+                plan=plan,
+                metrics=metrics,
+                session_factory=session_factory,
+            )
         finally:
             if source is not file_source:
                 source.close()
@@ -84,48 +277,71 @@ class XLSXHandler(FormatHandler):
         source: SourceHandle,
         sheet: str | None,
         options: ParseOptions,
+        *,
+        plan: ParsePlan | None,
+        metrics: ParseMetrics | None = None,
+        session_factory: Callable[[], FastexcelSession] | None = None,
     ) -> pd.DataFrame:
-        """Fast path using fastexcel."""
+        """Fast Arrow path with one narrowly classified transactional fallback."""
         file_desc = source.description
-
         try:
-            content = source.path if source.path is not None else source.read_bytes()
-            excel_file = fastexcel.read_excel(content)
+            return FallbackCoordinator(
+                is_fastexcel_compatibility_error,
+                metrics=metrics,
+            ).materialize(
+                lambda: _FastexcelDataFrameReader(
+                    self,
+                    source,
+                    sheet,
+                    options,
+                    plan,
+                    session_factory,
+                ),
+                lambda: _OpenpyxlDataFrameReader(self, source, sheet, options),
+            )
         except PermissionError as e:
             raise FileError(
                 f"Permission denied: {file_desc}", file_path=file_desc, operation="open"
             ) from e
-        except Exception as e:
-            raise FormatError(f"Cannot open Excel file: {e}", file_path=file_desc) from e
-
-        try:
-            sheet_idx = self._resolve_sheet_index(excel_file, sheet, file_desc)
-
-            df = excel_file.load_sheet(
-                sheet_idx,
-                skip_rows=options.skip_rows,
-                header_row=None,
-            ).to_pandas()
-
-            if df.empty:
-                return pd.DataFrame()
-
-            df = self._apply_options(df, options)
-            return self._clean_excel_data(df, options)
-
         except FormatError:
+            raise
+        except MemoryError:
             raise
         except Exception as e:
             raise FormatError(f"Error reading Excel file: {e}", file_path=file_desc) from e
 
-    def _resolve_sheet_index(self, excel_file: Any, sheet: str | None, file_desc: str) -> int:
+    def _resolve_session_sheet(
+        self,
+        session: FastexcelSession,
+        sheet: str | None,
+        file_desc: str,
+    ) -> str:
         if not sheet:
-            return 0
-        if sheet not in excel_file.sheet_names:
+            return session.sheet_names[0]
+        if sheet not in session.sheet_names:
             raise FormatError(
-                f"Sheet '{sheet}' not found", file_path=file_desc, detected_format="xlsx"
+                f"Sheet '{sheet}' not found",
+                file_path=file_desc,
+                detected_format="xlsx",
             )
-        return int(excel_file.sheet_names.index(sheet))
+        return sheet
+
+    def _frame_fastexcel_data(
+        self,
+        frame: pd.DataFrame,
+        options: ParseOptions,
+        *,
+        skip_rows_already_applied: bool,
+    ) -> pd.DataFrame:
+        """Apply the legacy handler sequence after raw coordinate materialization."""
+        if frame.empty:
+            return pd.DataFrame()
+        if not skip_rows_already_applied:
+            frame = frame.iloc[options.skip_rows :].reset_index(drop=True)
+            if frame.empty:
+                return pd.DataFrame()
+        frame = self._apply_options(frame, options)
+        return self._clean_excel_data(frame, options)
 
     # -------------------------------------------------------------------------
     # Openpyxl (fallback for advanced features)
@@ -289,9 +505,9 @@ class XLSXHandler(FormatHandler):
         try:
             file_desc = source.description
             try:
-                content = source.path if source.path is not None else source.read_bytes()
-                excel_file = fastexcel.read_excel(content)
-                return list(excel_file.sheet_names)
+                with source.open_path_or_bytes() as content:
+                    excel_file = fastexcel.read_excel(content)
+                    return list(excel_file.sheet_names)
             except (OSError, ValueError, RuntimeError) as e:
                 logger.debug("fastexcel sheet name read failed, falling back to openpyxl: %s", e)
 
@@ -318,8 +534,8 @@ class XLSXHandler(FormatHandler):
         """Validate that file can be parsed."""
         source = SourceHandle.coerce(file_source)
         try:
-            content = source.path if source.path is not None else source.read_bytes()
-            fastexcel.read_excel(content)
+            with source.open_path_or_bytes() as content:
+                fastexcel.read_excel(content)
             return True, None
         except Exception as e:
             return False, str(e)

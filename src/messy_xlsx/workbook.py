@@ -14,6 +14,7 @@ from typing import Any, BinaryIO
 import openpyxl
 import pandas as pd
 
+from messy_xlsx._fallback_signals import _blocks_backend_retry
 from messy_xlsx._source import BackendSource, SourceHandle, describe_source
 from messy_xlsx.cache import get_structure_cache
 from messy_xlsx.detection.structure_analyzer import StructureAnalyzer
@@ -22,10 +23,16 @@ from messy_xlsx.formulas.config import FormulaConfig, FormulaEvaluationMode
 from messy_xlsx.formulas.engine import FormulaEngine
 from messy_xlsx.models import CellValue, SheetConfig, SheetError, StructureInfo
 from messy_xlsx.normalization.pipeline import NormalizationPipeline
+from messy_xlsx.parsing.fastexcel_session import FastexcelSession
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
 from messy_xlsx.parsing.parse_plan import (
+    ParsePlan,
     compile_parse_plan,
     requires_structure_analysis,
+)
+from messy_xlsx.parsing.xlsx_handler import (
+    XLSXHandler,
+    _is_fastexcel_materialized_plan,
 )
 from messy_xlsx.sheet import MessySheet
 from messy_xlsx.warnings import warn_legacy
@@ -35,6 +42,7 @@ from messy_xlsx.warnings import warn_legacy
 # ============================================================================
 
 logger = logging.getLogger(__name__)
+_NO_BUILTIN_MATERIALIZATION = object()
 
 
 class MessyWorkbook:
@@ -78,6 +86,7 @@ class MessyWorkbook:
         self._cached_wb: openpyxl.Workbook | None = None
         self._wb_source: BinaryIO | None = None
         self._cached_wb_source: BinaryIO | None = None
+        self._fastexcel_session: FastexcelSession | None = None
 
         try:
             self._initialize_source()
@@ -348,13 +357,18 @@ class MessyWorkbook:
             structure = self._analyze_structure(sheet, config)
         plan = compile_parse_plan(config, structure, format_type)
 
-        with self._registry_source() as source:
-            df = self._registry.parse(
-                source,
-                sheet=sheet,
-                options=plan.to_parse_options(),
-                format_type=format_type,
-            )
+        built_in = self._parse_builtin_materialized(sheet, format_type, plan)
+        if built_in is _NO_BUILTIN_MATERIALIZATION:
+            with self._registry_source() as source:
+                df = self._registry.parse(
+                    source,
+                    sheet=sheet,
+                    options=plan.to_parse_options(),
+                    format_type=format_type,
+                )
+        else:
+            assert isinstance(built_in, pd.DataFrame)
+            df = built_in
 
         if plan.normalize:
             pipeline = NormalizationPipeline(
@@ -403,6 +417,52 @@ class MessyWorkbook:
                     df = df[df[col] != value].reset_index(drop=True)
 
         return df
+
+    def _parse_builtin_materialized(
+        self,
+        sheet: str,
+        format_type: str,
+        plan: ParsePlan,
+    ) -> pd.DataFrame | object:
+        """Use the bound-plan seam only for the untouched built-in XLSX stack."""
+        if format_type not in {"xlsx", "xlsm"}:
+            return _NO_BUILTIN_MATERIALIZATION
+        if type(self._registry) is not HandlerRegistry:
+            return _NO_BUILTIN_MATERIALIZATION
+        if not self._registry._uses_builtin_components():
+            return _NO_BUILTIN_MATERIALIZATION
+        handler = self._registry.get_handler(format_type)
+        if type(handler) is not XLSXHandler:
+            return _NO_BUILTIN_MATERIALIZATION
+        if not _is_fastexcel_materialized_plan(plan):
+            return _NO_BUILTIN_MATERIALIZATION
+        try:
+            return handler._parse_materialized_plan(
+                self._source_handle,
+                sheet,
+                plan,
+                self._get_fastexcel_session,
+            )
+        except Exception as error:
+            if _blocks_backend_retry(error):
+                raise
+
+        file_desc = self._source_handle.description
+        name = self._source_handle.path.name if self._source_handle.path is not None else file_desc
+        raise FormatError(
+            f"All handlers failed for {name}",
+            file_path=file_desc,
+            detected_format=format_type,
+            attempted_formats=[type(handler).__name__],
+        )
+
+    def _get_fastexcel_session(self) -> FastexcelSession:
+        """Return the workbook-owned session shared by eligible sheet reads."""
+        session = self._fastexcel_session
+        if session is None:
+            session = FastexcelSession(self._source_handle)
+            self._fastexcel_session = session
+        return session
 
     def _analyze_structure(self, sheet: str, config: SheetConfig | None = None) -> StructureInfo:
         """Analyze sheet structure."""
@@ -544,22 +604,36 @@ class MessyWorkbook:
 
     def close(self) -> None:
         """Close the workbook and release resources."""
+        fastexcel_session = getattr(self, "_fastexcel_session", None)
         workbook = self._wb
         cached_workbook = self._cached_wb
         workbook_source = getattr(self, "_wb_source", None)
         cached_workbook_source = getattr(self, "_cached_wb_source", None)
         source_handle = getattr(self, "_source_handle", None)
+        self._fastexcel_session = None
         self._wb = None
         self._cached_wb = None
         self._wb_source = None
         self._cached_wb_source = None
 
         close_error: BaseException | None = None
+        if fastexcel_session is not None:
+            try:
+                fastexcel_session.close()
+            except BaseException as error:
+                close_error = error
+
         if workbook is not None:
             try:
                 workbook.close()
             except BaseException as error:
-                close_error = error
+                if close_error is None:
+                    close_error = error
+                else:
+                    logger.debug(
+                        "Workbook also failed to close",
+                        exc_info=True,
+                    )
 
         if cached_workbook is not None:
             try:

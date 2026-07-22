@@ -3,6 +3,7 @@
 import io
 import xml.etree.ElementTree as ET
 import zipfile
+from types import MethodType
 
 import openpyxl
 import pandas as pd
@@ -10,7 +11,8 @@ from pandas.testing import assert_frame_equal
 
 from messy_xlsx import MessyWorkbook, SheetConfig, read_all_sheets, read_excel
 from messy_xlsx.formulas import FormulaConfig, FormulaEvaluationMode
-from messy_xlsx.parsing import HandlerRegistry
+from messy_xlsx.parsing import HandlerRegistry, XLSXHandler
+from messy_xlsx.parsing.xlsx_materialized import FastexcelMaterializedReader
 
 
 def _set_formula_cache(path, cell_ref, formula, value):
@@ -194,3 +196,104 @@ class TestRegistryContracts:
 
         assert registry.parsed is True
         assert isinstance(result, pd.DataFrame)
+
+    def test_registry_subclass_sentinel_is_never_bypassed(
+        self,
+        sample_xlsx,
+        monkeypatch,
+    ):
+        expected = pd.DataFrame({"registry_sentinel": [101]})
+
+        class SentinelRegistry(HandlerRegistry):
+            def parse(self, *args, **kwargs):
+                return expected.copy()
+
+        registry = SentinelRegistry()
+        with MessyWorkbook(sample_xlsx, registry=registry) as workbook:
+            monkeypatch.setattr(
+                FastexcelMaterializedReader,
+                "read_table",
+                lambda _self: (_ for _ in ()).throw(
+                    AssertionError("registry subclass must stay on its DataFrame SPI")
+                ),
+            )
+            actual = workbook.to_dataframe()
+
+        assert_frame_equal(actual, expected)
+
+    def test_registry_subclass_cannot_claim_builtin_eligibility(
+        self,
+        sample_xlsx,
+        monkeypatch,
+    ):
+        expected = pd.DataFrame({"lying_registry_sentinel": [111]})
+
+        class LyingRegistry(HandlerRegistry):
+            def _uses_builtin_components(self):
+                return True
+
+            def parse(self, *args, **kwargs):
+                return expected.copy()
+
+        registry = LyingRegistry()
+        with MessyWorkbook(sample_xlsx, registry=registry) as workbook:
+            monkeypatch.setattr(
+                FastexcelMaterializedReader,
+                "read_table",
+                lambda _self: (_ for _ in ()).throw(
+                    AssertionError("registry subclasses cannot self-authorize the fast path")
+                ),
+            )
+            actual = workbook.to_dataframe()
+
+        assert_frame_equal(actual, expected)
+
+    def test_custom_handler_sentinel_is_never_bypassed(
+        self,
+        sample_xlsx,
+        monkeypatch,
+    ):
+        expected = pd.DataFrame({"handler_sentinel": [202]})
+
+        class SentinelHandler(XLSXHandler):
+            def parse(self, *args, **kwargs):
+                return expected.copy()
+
+        registry = HandlerRegistry(handlers=[SentinelHandler()])
+        with MessyWorkbook(sample_xlsx, registry=registry) as workbook:
+            monkeypatch.setattr(
+                FastexcelMaterializedReader,
+                "read_table",
+                lambda _self: (_ for _ in ()).throw(
+                    AssertionError("custom handler must stay on its DataFrame SPI")
+                ),
+            )
+            actual = workbook.to_dataframe()
+
+        assert_frame_equal(actual, expected)
+
+    def test_builtin_handler_instance_override_sentinel_is_never_bypassed(
+        self,
+        sample_xlsx,
+        monkeypatch,
+    ):
+        expected = pd.DataFrame({"instance_sentinel": [303]})
+        registry = HandlerRegistry()
+        handler = registry.get_handler("xlsx")
+        assert isinstance(handler, XLSXHandler)
+
+        def sentinel_parse(self, *args, **kwargs):
+            return expected.copy()
+
+        handler.parse = MethodType(sentinel_parse, handler)  # type: ignore[method-assign]
+        with MessyWorkbook(sample_xlsx, registry=registry) as workbook:
+            monkeypatch.setattr(
+                FastexcelMaterializedReader,
+                "read_table",
+                lambda _self: (_ for _ in ()).throw(
+                    AssertionError("instance override must stay on its DataFrame SPI")
+                ),
+            )
+            actual = workbook.to_dataframe()
+
+        assert_frame_equal(actual, expected)

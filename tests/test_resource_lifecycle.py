@@ -304,6 +304,23 @@ def test_workbook_close_preserves_primary_error_when_both_resources_raise() -> N
     assert workbook._cached_wb is None
 
 
+def test_workbook_close_preserves_session_error_before_later_resource_error() -> None:
+    workbook = object.__new__(api.MessyWorkbook)
+    session = _CloseTracker("fastexcel session", fail_on_close=True)
+    primary = _CloseTracker("primary", fail_on_close=True)
+    workbook._fastexcel_session = session  # type: ignore[assignment]
+    workbook._wb = primary  # type: ignore[assignment]
+    workbook._cached_wb = None
+
+    with pytest.raises(_ExpectedFailure, match="fastexcel session close"):
+        workbook.close()
+
+    assert session.close_calls == 1
+    assert primary.close_calls == 1
+    assert workbook._fastexcel_session is None
+    assert workbook._wb is None
+
+
 def test_workbook_close_is_idempotent_for_both_resources() -> None:
     workbook = object.__new__(api.MessyWorkbook)
     primary = _CloseTracker("primary")
