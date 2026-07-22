@@ -1,12 +1,16 @@
 """Unit tests for HandlerRegistry."""
 
+from io import BytesIO
+
 import pandas as pd
 import pytest
 
 from messy_xlsx._fallback_signals import (
+    _fallback_block_reason,
     _FallbackBlockReason,
     _mark_fallback_blocked,
 )
+from messy_xlsx._source import SourceHandle
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.parsing import CSVHandler, HandlerRegistry, XLSXHandler
 from messy_xlsx.parsing.base_handler import FormatHandler, ParseOptions
@@ -210,6 +214,64 @@ class TestHandlerRegistry:
 
         assert captured.value is primary_error
         assert fallback_calls == 0
+
+    def test_wrapped_source_restoration_failure_blocks_legacy_registry_fallback(
+        self,
+    ):
+        class RestoreFailureBytesIO(BytesIO):
+            fail_restoration = False
+
+            def seek(self, position, whence=0):
+                if self.fail_restoration and whence == 0 and position == 5:
+                    raise OSError("restore failed")
+                return super().seek(position, whence)
+
+        source = RestoreFailureBytesIO(b"complete source")
+        source.seek(5)
+        handle = SourceHandle(source)
+        fallback_calls = 0
+        outer_error = None
+
+        class PrimaryHandler(FormatHandler):
+            _accepts_source_handle = True
+
+            def can_handle(self, format_type):
+                return format_type == "xlsx"
+
+            def parse(self, file_source, sheet, options):
+                nonlocal outer_error
+                try:
+                    with file_source.open_binary() as borrowed:
+                        assert borrowed.read(1) == b"c"
+                        source.fail_restoration = True
+                except OSError as restoration_error:
+                    outer_error = FormatError("wrapped restoration failure")
+                    raise outer_error from restoration_error
+
+            def get_sheet_names(self, file_source):
+                return ["Data"]
+
+            def validate(self, file_source):
+                return True, None
+
+        class FallbackHandler(PrimaryHandler):
+            _accepts_source_handle = True
+
+            def parse(self, file_source, sheet, options):
+                nonlocal fallback_calls
+                fallback_calls += 1
+                return pd.DataFrame({"wrong": [True]})
+
+        registry = HandlerRegistry(handlers=[PrimaryHandler(), FallbackHandler()])
+
+        with pytest.raises(FormatError) as captured:
+            registry.parse(handle, format_type="xlsx")
+
+        assert captured.value is outer_error
+        assert fallback_calls == 0
+        cause = BaseException.__getattribute__(captured.value, "__cause__")
+        assert isinstance(cause, OSError)
+        assert _fallback_block_reason(cause) is _FallbackBlockReason.SOURCE_OWNERSHIP
 
     @pytest.mark.parametrize(
         "primary_error",

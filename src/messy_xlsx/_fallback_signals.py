@@ -38,25 +38,13 @@ def _fallback_block_reason(
     error: BaseException,
 ) -> _FallbackBlockReason | None:
     """Read the first valid signal from a bounded nested exception tree."""
-    stack = [error]
-    seen: set[int] = set()
-    while stack:
-        candidate = stack.pop()
-        identity = id(candidate)
-        if identity in seen:
-            continue
-        if len(seen) >= _MAX_EXCEPTION_TREE_NODES:
-            return _FallbackBlockReason.SOURCE_OWNERSHIP
-        seen.add(identity)
+    candidates, complete = _bounded_exception_graph(error)
+    if not complete:
+        return _FallbackBlockReason.SOURCE_OWNERSHIP
+    for candidate in candidates:
         reason = _direct_fallback_block_reason(candidate)
         if reason is not None:
             return reason
-        nested = _nested_exceptions(candidate)
-        if nested is None:
-            if isinstance(candidate, BaseExceptionGroup):
-                return _FallbackBlockReason.SOURCE_OWNERSHIP
-            continue
-        stack.extend(reversed(nested))
     return None
 
 
@@ -81,52 +69,79 @@ def _is_fallback_blocked(error: BaseException) -> bool:
 
 def _contains_process_failure(error: BaseException) -> bool:
     """Return whether a bounded nested tree contains a process-level failure."""
-    stack = [error]
-    seen: set[int] = set()
-    while stack:
-        candidate = stack.pop()
-        identity = id(candidate)
-        if identity in seen:
-            continue
-        if len(seen) >= _MAX_EXCEPTION_TREE_NODES:
-            return True
-        seen.add(identity)
+    candidates, complete = _bounded_exception_graph(error)
+    if not complete:
+        return True
+    for candidate in candidates:
         if isinstance(candidate, MemoryError) or not isinstance(candidate, Exception):
             return True
-        nested = _nested_exceptions(candidate)
-        if nested is None:
-            if isinstance(candidate, BaseExceptionGroup):
-                return True
-            continue
-        stack.extend(reversed(nested))
     return False
 
 
 def _blocks_backend_retry(error: BaseException) -> bool:
     """Find any bounded-tree leaf whose semantics make a retry unsafe."""
-    stack = [error]
-    seen: set[int] = set()
-    while stack:
-        candidate = stack.pop()
-        identity = id(candidate)
-        if identity in seen:
-            continue
-        if len(seen) >= _MAX_EXCEPTION_TREE_NODES:
-            return True
-        seen.add(identity)
+    candidates, complete = _bounded_exception_graph(error)
+    if not complete:
+        return True
+    for candidate in candidates:
         if (
             isinstance(candidate, (PermissionError, FileNotFoundError, MemoryError))
             or not isinstance(candidate, Exception)
             or _direct_fallback_block_reason(candidate) is not None
         ):
             return True
-        nested = _nested_exceptions(candidate)
-        if nested is None:
-            if isinstance(candidate, BaseExceptionGroup):
-                return True
-            continue
-        stack.extend(reversed(nested))
     return False
+
+
+def _bounded_exception_graph(
+    error: BaseException,
+) -> tuple[tuple[BaseException, ...], bool]:
+    """Return a cycle-safe exception graph and whether traversal was complete."""
+    stack = [error]
+    seen: set[int] = set()
+    candidates: list[BaseException] = []
+    while stack:
+        candidate = stack.pop()
+        identity = id(candidate)
+        if identity in seen:
+            continue
+        if len(seen) >= _MAX_EXCEPTION_TREE_NODES:
+            return tuple(candidates), False
+        seen.add(identity)
+        candidates.append(candidate)
+        children = _exception_children(candidate)
+        if children is None:
+            return tuple(candidates), False
+        stack.extend(reversed(children))
+    return tuple(candidates), True
+
+
+def _exception_children(
+    error: BaseException,
+) -> tuple[BaseException, ...] | None:
+    """Read group, cause, and visible context edges without virtual hooks."""
+    nested = _nested_exceptions(error)
+    if nested is None:
+        return None
+    try:
+        cause = BaseException.__getattribute__(error, "__cause__")
+        context = BaseException.__getattribute__(error, "__context__")
+        suppress_context = BaseException.__getattribute__(error, "__suppress_context__")
+    except BaseException:
+        return None
+    if cause is not None and not isinstance(cause, BaseException):
+        return None
+    if context is not None and not isinstance(context, BaseException):
+        return None
+    if type(suppress_context) is not bool:
+        return None
+
+    children = list(nested)
+    if cause is not None:
+        children.append(cause)
+    if not suppress_context and context is not None:
+        children.append(context)
+    return tuple(children)
 
 
 def _failure_summary(error: BaseException) -> dict[str, str]:
