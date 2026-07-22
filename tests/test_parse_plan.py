@@ -1304,7 +1304,35 @@ def test_type_and_function_hints_are_preserved_by_thaw_projection() -> None:
         "xlsx",
     )
 
-    assert plan.thaw_type_hints() == {"type": list, "callable": len}
+    thawed = plan.thaw_type_hints()
+
+    assert thawed == {"type": list, "callable": len}
+    assert thawed["type"] is list
+
+
+def test_hostile_metaclass_type_hint_has_stable_plan_equality_and_hash() -> None:
+    first = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"value": _HostileMetaclassIdentityCondition},  # type: ignore[dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+    second = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"value": _HostileMetaclassIdentityCondition},  # type: ignore[dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+    _HostileIdentityMetaclass.hash_calls = 0
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert hash(first) == hash(first)
+    assert first.thaw_type_hints()["value"] is _HostileMetaclassIdentityCondition
 
 
 def test_dataclass_snapshot_preserves_post_init_state_without_aliases() -> None:

@@ -126,6 +126,14 @@ class _FrozenComplex:
 
 
 @dataclass(frozen=True, slots=True)
+class _FrozenTypeReference:
+    type_identity: int
+    type_module: str
+    type_qualname: str
+    reference: type[Any] = field(compare=False, hash=False, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class _FrozenIdentityReference:
     type_identity: int
     type_module: str
@@ -399,12 +407,15 @@ def _freeze(  # noqa: C901
             _FrozenFloat(value.real.hex()),
             _FrozenFloat(value.imag.hex()),
         )
-    if (
-        isinstance(value, type)
-        or isfunction(value)
-        or isbuiltin(value)
-        or _is_method_descriptor(value)
-    ):
+    if isinstance(value, type):
+        type_module, type_qualname = _safe_type_description(value)
+        return _FrozenTypeReference(
+            type_identity=id(value),
+            type_module=type_module,
+            type_qualname=type_qualname,
+            reference=value,
+        )
+    if isfunction(value) or isbuiltin(value) or _is_method_descriptor(value):
         return value
     is_dataclass_instance = is_dataclass(value) and not isinstance(value, type)
     uses_identity_semantics = _uses_legacy_identity_semantics(value)
@@ -567,6 +578,8 @@ def _thaw(value: Any) -> Any:  # noqa: C901
         return float.fromhex(value.hexadecimal)
     if isinstance(value, _FrozenComplex):
         return complex(_thaw(value.real), _thaw(value.imaginary))
+    if isinstance(value, _FrozenTypeReference):
+        return value.reference
     if isinstance(value, _FrozenIdentityReference):
         return value.reference
     if isinstance(value, FrozenDataclassValue):
@@ -620,6 +633,13 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
         return ("float", value.hexadecimal)
     if isinstance(value, _FrozenComplex):
         return ("complex", _stable_token(value.real), _stable_token(value.imaginary))
+    if isinstance(value, _FrozenTypeReference):
+        return (
+            "type",
+            value.type_module,
+            value.type_qualname,
+            value.type_identity,
+        )
     if isinstance(value, _FrozenIdentityReference):
         return (
             "identity",
@@ -661,12 +681,7 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
             value.type_identity,
             tuple((name, _stable_token(item)) for name, item in value.attribute_values),
         )
-    if (
-        isinstance(value, type)
-        or isfunction(value)
-        or isbuiltin(value)
-        or _is_method_descriptor(value)
-    ):
+    if isfunction(value) or isbuiltin(value) or _is_method_descriptor(value):
         return ("symbol", value.__module__, value.__qualname__)
     raise TypeError(
         f"configuration value cannot be ordered deterministically: {type(value).__name__}"
