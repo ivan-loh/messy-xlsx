@@ -10,7 +10,7 @@ from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 from openpyxl.utils.exceptions import IllegalCharacterError
 
-from messy_xlsx import MessyWorkbook
+from messy_xlsx import MessyWorkbook, SheetConfig
 from messy_xlsx.normalization import MissingValueHandler
 
 
@@ -87,7 +87,7 @@ class TestPropertyBased:
         wb.save(file_path)
         wb.close()
 
-        with MessyWorkbook(file_path) as mwb:
+        with MessyWorkbook(file_path, sheet_config=SheetConfig(auto_detect=False)) as mwb:
             df = mwb.to_dataframe()
             # Empty/blank text values may be cleaned by missing-value normalization,
             # resulting in 0 rows. Non-empty values must produce exactly 1 row.
