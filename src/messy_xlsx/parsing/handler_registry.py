@@ -4,8 +4,18 @@
 # Imports
 # ============================================================================
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from enum import Enum
+from types import (
+    BuiltinFunctionType,
+    FunctionType,
+    MemberDescriptorType,
+    MethodDescriptorType,
+    ModuleType,
+    WrapperDescriptorType,
+)
+from typing import cast
 
 import pandas as pd
 
@@ -19,62 +29,278 @@ from messy_xlsx.parsing.xls_handler import XLSHandler
 from messy_xlsx.parsing.xlsx_handler import XLSXHandler
 
 _BUILTIN_HANDLER_TYPES = (XLSXHandler, XLSHandler, CSVHandler)
-_REGISTRY_OPERATION_NAMES = frozenset(
+_MAX_FINGERPRINT_NODES = 10_000
+_REGISTRY_STATE_NAMES = frozenset(
     {
-        "detect_format",
-        "get_handler",
-        "get_sheet_names",
-        "parse",
-        "register_handler",
-        "validate",
+        "handlers",
+        "detector",
+        "_builtin_handler_instances",
+        "_builtin_detector_instance",
+        "_builtin_component_token",
     }
 )
-_HANDLER_OPERATION_NAMES = frozenset(
-    {
-        "can_handle",
-        "get_sheet_names",
-        "parse",
-        "validate",
-    }
-)
-_DETECTOR_OPERATION_NAMES = frozenset({"detect"})
+_CANONICAL_BEHAVIOR_TYPES: tuple[type[object], ...] = ()
+_CANONICAL_CLASS_BEHAVIOR: object | None = None
+_CANONICAL_COMPONENT_SHAPE: object | None = None
 
 
-def _instance_state(component: object) -> tuple[tuple[str, int], ...]:
-    """Fingerprint instance-owned collaborators without retaining new aliases."""
-    return tuple(sorted((name, id(value)) for name, value in vars(component).items()))
+class _FingerprintError(RuntimeError):
+    """Raised when an extension graph cannot be inspected safely."""
 
 
-def _method_state(
-    component: object,
-    names: frozenset[str],
-) -> tuple[tuple[str, object], ...]:
-    """Fingerprint behavior-defining attributes on an exact component type."""
-    return _method_state_for_type(type(component), names)
+class _CompositionFingerprinter:
+    """Build a bounded recursive identity-and-state token for owned components."""
+
+    def __init__(self, *, include_identity: bool) -> None:
+        self._seen: dict[int, int] = {}
+        self._include_identity = include_identity
+
+    def token(self, value: object) -> object:  # noqa: C901
+        if value is None or isinstance(value, (bool, int, str, bytes)):
+            return (type(value), value)
+        if isinstance(value, float):
+            return (float, value.hex())
+        if isinstance(value, complex):
+            return (complex, value.real.hex(), value.imag.hex())
+        if isinstance(value, Enum):
+            return ("enum", type(value), value.name)
+        if isinstance(value, type):
+            return ("type", value)
+        if isinstance(
+            value,
+            (
+                FunctionType,
+                BuiltinFunctionType,
+                MethodDescriptorType,
+                WrapperDescriptorType,
+            ),
+        ):
+            return ("callable", type(value), id(value))
+
+        identity = id(value)
+        if identity in self._seen:
+            return ("ref", self._seen[identity])
+        if len(self._seen) >= _MAX_FINGERPRINT_NODES:
+            raise _FingerprintError("component graph exceeds fingerprint limit")
+        node = len(self._seen)
+        self._seen[identity] = node
+
+        if type(value) is dict:
+            return (
+                "dict",
+                node,
+                identity if self._include_identity else None,
+                frozenset((self.token(key), self.token(item)) for key, item in value.items()),
+            )
+        if type(value) is list:
+            return (
+                "list",
+                node,
+                identity if self._include_identity else None,
+                tuple(self.token(item) for item in value),
+            )
+        if type(value) is tuple:
+            return (
+                "tuple",
+                node,
+                identity if self._include_identity else None,
+                tuple(self.token(item) for item in value),
+            )
+        if type(value) is set:
+            return (
+                "set",
+                node,
+                identity if self._include_identity else None,
+                frozenset(self.token(item) for item in value),
+            )
+        if type(value) is frozenset:
+            return (
+                "frozenset",
+                node,
+                identity if self._include_identity else None,
+                frozenset(self.token(item) for item in value),
+            )
+        if type(value) is bytearray:
+            return (
+                "bytearray",
+                node,
+                identity if self._include_identity else None,
+                bytes(value),
+            )
+        if type(value) is memoryview:
+            return (
+                "memoryview",
+                node,
+                identity if self._include_identity else None,
+                value.tobytes(),
+            )
+
+        state = dict(vars(value)) if hasattr(value, "__dict__") else {}
+        for owner in type(value).__mro__:
+            for name, descriptor in vars(owner).items():
+                if isinstance(descriptor, MemberDescriptorType):
+                    try:
+                        state.setdefault(name, descriptor.__get__(value, type(value)))
+                    except AttributeError:
+                        continue
+        return (
+            "object",
+            node,
+            identity if self._include_identity else None,
+            type(value),
+            frozenset((name, self.token(item)) for name, item in state.items()),
+        )
 
 
-def _method_state_for_type(
-    component_type: type[object],
-    names: frozenset[str],
-) -> tuple[tuple[str, object], ...]:
-    """Fingerprint selected methods without instantiating their component."""
-    return tuple(sorted((name, getattr(component_type, name, None)) for name in names))
+class _BehaviorFingerprinter:
+    """Snapshot raw class attributes without binding or invoking descriptors."""
+
+    def __init__(self) -> None:
+        self._seen: dict[int, int] = {}
+
+    def token(self, value: object) -> object:  # noqa: C901
+        if value is None or isinstance(value, (bool, int, str, bytes)):
+            return (type(value), value)
+        if isinstance(value, float):
+            return (float, value.hex())
+        if isinstance(value, complex):
+            return (complex, value.real.hex(), value.imag.hex())
+        if isinstance(value, Enum):
+            return ("enum", type(value), value.name)
+        if isinstance(value, FunctionType):
+            return (
+                "function",
+                id(value),
+                id(value.__code__),
+                self.token(value.__defaults__),
+                self.token(value.__kwdefaults__),
+                self.token(value.__annotations__),
+                self.token(vars(value)),
+            )
+        if isinstance(value, staticmethod):
+            return ("staticmethod", self.token(value.__func__))
+        if isinstance(value, classmethod):
+            return ("classmethod", self.token(value.__func__))
+        if isinstance(value, property):
+            return (
+                "property",
+                self.token(value.fget),
+                self.token(value.fset),
+                self.token(value.fdel),
+            )
+        if isinstance(value, type):
+            return ("type", value, id(value))
+        if isinstance(value, ModuleType):
+            return ("module", value.__name__, id(value))
+        if isinstance(
+            value,
+            (
+                BuiltinFunctionType,
+                MethodDescriptorType,
+                WrapperDescriptorType,
+            ),
+        ):
+            return ("callable", type(value), id(value))
+        if hasattr(type(value), "__get__"):
+            return ("descriptor", type(value), id(value))
+
+        identity = id(value)
+        if identity in self._seen:
+            return ("ref", self._seen[identity])
+        if len(self._seen) >= _MAX_FINGERPRINT_NODES:
+            raise _FingerprintError("class behavior exceeds fingerprint limit")
+        node = len(self._seen)
+        self._seen[identity] = node
+
+        if type(value) is dict:
+            return (
+                "dict",
+                node,
+                frozenset((self.token(key), self.token(item)) for key, item in value.items()),
+            )
+        if type(value) is list:
+            return ("list", node, tuple(self.token(item) for item in value))
+        if type(value) is tuple:
+            return ("tuple", node, tuple(self.token(item) for item in value))
+        if type(value) is set:
+            return ("set", node, frozenset(self.token(item) for item in value))
+        if type(value) is frozenset:
+            return ("frozenset", node, frozenset(self.token(item) for item in value))
+        if type(value) is bytearray:
+            return ("bytearray", node, bytes(value))
+        if type(value) is memoryview:
+            return ("memoryview", node, value.tobytes())
+        return ("opaque", type(value), identity)
 
 
-def _has_instance_override(component: object, names: frozenset[str]) -> bool:
-    """Return whether behavior was replaced directly on an instance."""
-    return not names.isdisjoint(vars(component))
+def _component_token(
+    handlers: list[FormatHandler],
+    detector: FormatDetector,
+    *,
+    include_identity: bool = True,
+) -> object:
+    fingerprinter = _CompositionFingerprinter(include_identity=include_identity)
+    return (
+        "components",
+        fingerprinter.token(handlers),
+        fingerprinter.token(detector),
+    )
 
 
-_CANONICAL_HANDLER_METHODS = tuple(
-    _method_state_for_type(handler_type, _HANDLER_OPERATION_NAMES)
-    for handler_type in _BUILTIN_HANDLER_TYPES
-)
-_CANONICAL_DETECTOR_METHODS = _method_state_for_type(
-    FormatDetector,
-    _DETECTOR_OPERATION_NAMES,
-)
-_CANONICAL_REGISTRY_METHODS: tuple[tuple[str, object], ...] | None = None
+def _project_component_types(  # noqa: C901
+    components: tuple[object, ...],
+) -> tuple[type[object], ...]:
+    """Discover project-owned instance types without following class descriptors."""
+    seen: set[int] = set()
+    discovered: set[type[object]] = {HandlerRegistry}
+
+    def visit(value: object) -> None:  # noqa: C901
+        if value is None or isinstance(
+            value,
+            (bool, int, float, complex, str, bytes, Enum, type, FunctionType),
+        ):
+            return
+        identity = id(value)
+        if identity in seen or len(seen) >= _MAX_FINGERPRINT_NODES:
+            return
+        seen.add(identity)
+        if type(value) is dict:
+            for key, item in value.items():
+                visit(key)
+                visit(item)
+            return
+        if type(value) in {list, tuple, set, frozenset}:
+            for item in cast(Iterable[object], value):
+                visit(item)
+            return
+        if type(value) in {bytearray, memoryview}:
+            return
+        value_type = type(value)
+        for owner in value_type.__mro__:
+            if owner.__module__.startswith("messy_xlsx"):
+                discovered.add(owner)
+        if hasattr(value, "__dict__"):
+            for item in vars(value).values():
+                visit(item)
+
+    for component in components:
+        visit(component)
+    return tuple(sorted(discovered, key=lambda item: (item.__module__, item.__qualname__)))
+
+
+def _class_behavior_token(component_types: tuple[type[object], ...]) -> object:
+    """Fingerprint every raw attribute on every built-in project class/MRO."""
+    fingerprinter = _BehaviorFingerprinter()
+    return tuple(
+        (
+            component_type,
+            tuple(
+                (name, fingerprinter.token(value))
+                for name, value in sorted(vars(component_type).items())
+            ),
+        )
+        for component_type in component_types
+    )
 
 
 # ============================================================================
@@ -106,44 +332,56 @@ class HandlerRegistry:
         self.detector = detector or FormatDetector()
         self._builtin_handler_instances: tuple[FormatHandler, ...] | None = None
         self._builtin_detector_instance: FormatDetector | None = None
-        self._builtin_handler_states: tuple[tuple[tuple[str, int], ...], ...] | None = None
-        self._builtin_detector_state: tuple[tuple[str, int], ...] | None = None
+        self._builtin_component_token: object | None = None
         if uses_default_components and type(self) is HandlerRegistry:
-            self._builtin_handler_instances = tuple(self.handlers)
-            self._builtin_detector_instance = self.detector
-            self._builtin_handler_states = tuple(
-                _instance_state(handler) for handler in self.handlers
-            )
-            self._builtin_detector_state = _instance_state(self.detector)
+            try:
+                component_shape = _component_token(
+                    self.handlers,
+                    self.detector,
+                    include_identity=False,
+                )
+                if (
+                    _CANONICAL_COMPONENT_SHAPE is None
+                    or component_shape == _CANONICAL_COMPONENT_SHAPE
+                ):
+                    self._builtin_handler_instances = tuple(self.handlers)
+                    self._builtin_detector_instance = self.detector
+                    self._builtin_component_token = _component_token(
+                        self.handlers,
+                        self.detector,
+                    )
+            except Exception:
+                pass
 
     def _uses_builtin_components(self) -> bool:
         """Return whether no caller extension can be bypassed by new backends."""
-        if self._builtin_handler_instances is None:
+        if (
+            self._builtin_handler_instances is None
+            or self._builtin_component_token is None
+            or _CANONICAL_CLASS_BEHAVIOR is None
+        ):
             return False
-        current_handler_ids = tuple(id(handler) for handler in self.handlers)
-        builtin_handler_ids = tuple(id(handler) for handler in self._builtin_handler_instances)
-        return (
-            type(self) is HandlerRegistry
-            and tuple(type(handler) for handler in self.handlers) == _BUILTIN_HANDLER_TYPES
-            and current_handler_ids == builtin_handler_ids
-            and type(self.detector) is FormatDetector
-            and self.detector is self._builtin_detector_instance
-            and not _has_instance_override(self, _REGISTRY_OPERATION_NAMES)
-            and not any(
-                _has_instance_override(handler, _HANDLER_OPERATION_NAMES)
-                for handler in self.handlers
+        try:
+            return (
+                type(self) is HandlerRegistry
+                and set(vars(self)) == _REGISTRY_STATE_NAMES
+                and tuple(type(handler) for handler in self.handlers) == _BUILTIN_HANDLER_TYPES
+                and len(self.handlers) == len(self._builtin_handler_instances)
+                and all(
+                    current is original
+                    for current, original in zip(
+                        self.handlers,
+                        self._builtin_handler_instances,
+                        strict=True,
+                    )
+                )
+                and type(self.detector) is FormatDetector
+                and self.detector is self._builtin_detector_instance
+                and _component_token(self.handlers, self.detector) == self._builtin_component_token
+                and _class_behavior_token(_CANONICAL_BEHAVIOR_TYPES) == _CANONICAL_CLASS_BEHAVIOR
             )
-            and not _has_instance_override(self.detector, _DETECTOR_OPERATION_NAMES)
-            and tuple(_instance_state(handler) for handler in self.handlers)
-            == self._builtin_handler_states
-            and tuple(_method_state(handler, _HANDLER_OPERATION_NAMES) for handler in self.handlers)
-            == _CANONICAL_HANDLER_METHODS
-            and _instance_state(self.detector) == self._builtin_detector_state
-            and _method_state(self.detector, _DETECTOR_OPERATION_NAMES)
-            == _CANONICAL_DETECTOR_METHODS
-            and _CANONICAL_REGISTRY_METHODS is not None
-            and _method_state(self, _REGISTRY_OPERATION_NAMES) == _CANONICAL_REGISTRY_METHODS
-        )
+        except Exception:
+            return False
 
     def register_handler(self, handler: FormatHandler, priority: int = -1) -> None:
         """Register a custom handler."""
@@ -348,10 +586,17 @@ class HandlerRegistry:
 # Module Entrypoint
 # ============================================================================
 
-_CANONICAL_REGISTRY_METHODS = _method_state_for_type(
-    HandlerRegistry,
-    _REGISTRY_OPERATION_NAMES,
+_behavior_probe = HandlerRegistry()
+_CANONICAL_BEHAVIOR_TYPES = _project_component_types(
+    (HandlerRegistry, _behavior_probe.handlers, _behavior_probe.detector)
 )
+_CANONICAL_CLASS_BEHAVIOR = _class_behavior_token(_CANONICAL_BEHAVIOR_TYPES)
+_CANONICAL_COMPONENT_SHAPE = _component_token(
+    _behavior_probe.handlers,
+    _behavior_probe.detector,
+    include_identity=False,
+)
+del _behavior_probe
 _registry = HandlerRegistry()
 
 

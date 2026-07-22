@@ -10,7 +10,7 @@ import pytest
 
 from messy_xlsx.detection.format_detector import FormatDetector
 from messy_xlsx.parsing.contracts import BackendKind, OutputMode, ParseMetrics
-from messy_xlsx.parsing.csv_handler import CSVHandler
+from messy_xlsx.parsing.csv_handler import CSVHandler, MetadataRowDetector
 from messy_xlsx.parsing.fallback import FallbackCoordinator
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
 from messy_xlsx.parsing.router import BackendRouter, WorkbookContext
@@ -159,6 +159,120 @@ def test_mutating_a_nested_builtin_handler_component_forces_compatibility() -> N
     csv_handler._detector = object()  # type: ignore[assignment]
 
     assert registry._uses_builtin_components() is False
+
+
+def test_nested_csv_detector_instance_override_forces_compatibility() -> None:
+    registry = HandlerRegistry()
+    csv_handler = registry.handlers[2]
+    assert isinstance(csv_handler, CSVHandler)
+
+    csv_handler._detector.detect_skip_rows_from_text = MethodType(  # type: ignore[method-assign]
+        lambda self, *_args, **_kwargs: 0,
+        csv_handler._detector,
+    )
+
+    assert registry._uses_builtin_components() is False
+
+
+def test_nested_component_container_state_and_cycles_force_compatibility() -> None:
+    registry = HandlerRegistry()
+    csv_handler = registry.handlers[2]
+    assert isinstance(csv_handler, CSVHandler)
+    cycle: list[object] = []
+    cycle.append(cycle)
+    detector_state = vars(csv_handler._detector)
+    assert detector_state == {}
+    detector_state["routing_state"] = {
+        "rules": ["metadata", {"enabled": True}],
+        "cycle": cycle,
+    }
+
+    assert [registry._uses_builtin_components() for _ in range(3)] == [False] * 3
+
+
+def test_private_handler_behavior_override_and_restore_is_detected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = HandlerRegistry()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            CSVHandler,
+            "_detect_delimiter_from_text",
+            lambda self, _sample: "|",
+        )
+        assert registry._uses_builtin_components() is False
+
+    assert registry._uses_builtin_components() is True
+
+
+def test_private_handler_behavior_flag_override_is_detected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = HandlerRegistry()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(CSVHandler, "_accepts_source_handle", False)
+        assert registry._uses_builtin_components() is False
+
+    assert registry._uses_builtin_components() is True
+
+
+def test_private_descriptor_override_before_construction_and_restore_is_detected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            HandlerRegistry,
+            "_handler_accepts_source_handle",
+            staticmethod(lambda _handler: False),
+        )
+        registry = HandlerRegistry()
+        assert registry._uses_builtin_components() is False
+
+    assert registry._uses_builtin_components() is True
+
+
+def test_nested_detector_class_override_is_detected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = HandlerRegistry()
+    monkeypatch.setattr(
+        MetadataRowDetector,
+        "_score_as_metadata",
+        lambda self, _profile, _consensus: 0.0,
+    )
+
+    assert registry._uses_builtin_components() is False
+
+
+def test_added_raising_descriptor_is_detected_without_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class RaisingDescriptor:
+        def __get__(self, _instance: object, _owner: type[object]) -> object:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("descriptor must not be invoked while routing")
+
+    monkeypatch.setattr(
+        CSVHandler,
+        "_routing_probe",
+        RaisingDescriptor(),
+        raising=False,
+    )
+
+    registry = HandlerRegistry()
+    assert [registry._uses_builtin_components() for _ in range(3)] == [False] * 3
+    assert calls == 0
+
+
+def test_multiple_ordinary_builtin_registries_remain_fast_path_eligible() -> None:
+    registries = [HandlerRegistry(), HandlerRegistry(), HandlerRegistry()]
+
+    assert all(registry._uses_builtin_components() for registry in registries for _ in range(3))
 
 
 def test_class_level_handler_override_before_registry_construction_is_custom(
