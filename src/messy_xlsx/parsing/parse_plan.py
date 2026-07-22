@@ -391,12 +391,10 @@ def _freeze(  # noqa: C901
         or _is_method_descriptor(value)
     ):
         return value
-    if _uses_legacy_identity_semantics(value) and not (
-        is_dataclass(value) and not isinstance(value, type)
-    ):
-        if preserve_identity_reference:
-            return value
-        raise TypeError(f"opaque mutable configuration value: {type(value).__name__}")
+    is_dataclass_instance = is_dataclass(value) and not isinstance(value, type)
+    uses_identity_semantics = _uses_legacy_identity_semantics(value)
+    if preserve_identity_reference and uses_identity_semantics:
+        return value
 
     identity = id(value)
     if identity in active:
@@ -420,7 +418,9 @@ def _freeze(  # noqa: C901
             return _FrozenBytearray(bytes(value))
         if type(value) is memoryview:
             return _FrozenMemoryview(value.tobytes())
-        if is_dataclass(value) and not isinstance(value, type):
+        if is_dataclass_instance:
+            if not _is_safely_reconstructable_python_object(value):
+                raise TypeError(f"opaque mutable configuration value: {type(value).__name__}")
             attributes = _object_attributes(value)
             return FrozenDataclassValue(
                 dataclass_type=type(value),
@@ -428,6 +428,8 @@ def _freeze(  # noqa: C901
                     (name, _freeze(item, active)) for name, item in sorted(attributes.items())
                 ),
             )
+        if uses_identity_semantics:
+            raise TypeError(f"opaque mutable configuration value: {type(value).__name__}")
 
         attributes = _object_attributes(value)
         if attributes:
@@ -587,9 +589,22 @@ def _object_attributes(value: Any) -> dict[str, Any]:
         if isinstance(slots, str):
             slots = (slots,)
         for name in slots:
-            if name not in {"__dict__", "__weakref__"} and hasattr(value, name):
-                attributes.setdefault(name, getattr(value, name))
+            storage_name = _mangled_slot_name(value_type, name)
+            if storage_name not in {"__dict__", "__weakref__"} and hasattr(
+                value,
+                storage_name,
+            ):
+                attributes.setdefault(storage_name, getattr(value, storage_name))
     return attributes
+
+
+def _mangled_slot_name(owner: type[Any], name: str) -> str:
+    """Return the storage name Python assigns to a slot declared by *owner*."""
+    if name.startswith("__") and not name.endswith("__"):
+        owner_name = owner.__name__.lstrip("_")
+        if owner_name:
+            return f"_{owner_name}{name}"
+    return name
 
 
 def _uses_legacy_identity_semantics(value: Any) -> bool:

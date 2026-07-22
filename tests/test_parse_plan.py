@@ -1025,6 +1025,30 @@ class _IdentityEqualityDataclass:
     labels: list[str]
 
 
+@dataclass
+class _DataclassList(list[str]):
+    label: str
+
+
+class _PrivateSlotBase:
+    __slots__ = ("__cache",)
+
+    def set_cache(self, values: list[str]) -> None:
+        self.__cache = values
+
+    @property
+    def cache(self) -> list[str]:
+        return self.__cache
+
+
+@dataclass(slots=True)
+class _InheritedPrivateSlotDataclass(_PrivateSlotBase):
+    labels: list[str]
+
+    def __post_init__(self) -> None:
+        self.set_cache(list(self.labels))
+
+
 class _IdentityCondition:
     def __init__(self) -> None:
         self.mutable_state = ["initial"]
@@ -1220,6 +1244,63 @@ def test_dataclass_without_generated_equality_still_uses_value_snapshot_policy()
     assert isinstance(thawed, _IdentityEqualityDataclass)
     assert thawed.labels == ["alpha"]
     assert thawed is not payload
+
+
+def test_identity_equal_dataclass_drop_condition_filters_same_object_row() -> None:
+    condition = _IdentityEqualityDataclass(["target"])
+    other = _IdentityEqualityDataclass(["target"])
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": condition}],
+        ),
+        None,
+        "xlsx",
+    )
+
+    comparison_value = plan.thaw_drop_conditions()[0][1]
+    frame = pd.DataFrame({"value": pd.Series([condition, other], dtype=object)})
+    filtered = frame[frame["value"] != comparison_value].reset_index(drop=True)
+
+    assert comparison_value is condition
+    assert plan.drop_conditions[0][1] is condition
+    assert filtered["value"].tolist() == [other]
+
+
+def test_c_backed_dataclass_is_rejected_before_hidden_state_is_lost() -> None:
+    payload = _DataclassList("visible")
+    payload.extend(["hidden", "list", "state"])
+
+    with pytest.raises(TypeError, match="opaque mutable configuration value"):
+        compile_parse_plan(
+            SheetConfig(
+                auto_detect=False,
+                type_hints={"payload": payload},  # type: ignore[dict-item]
+            ),
+            None,
+            "xlsx",
+        )
+
+
+def test_dataclass_snapshot_preserves_inherited_name_mangled_private_slot() -> None:
+    payload = _InheritedPrivateSlotDataclass(["alpha"])
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"payload": payload},  # type: ignore[dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+
+    payload.labels.append("changed")
+    payload.cache.append("changed")
+    thawed = plan.thaw_type_hints()["payload"]
+
+    assert isinstance(thawed, _InheritedPrivateSlotDataclass)
+    assert thawed.labels == ["alpha"]
+    assert thawed.cache == ["alpha"]
+    assert thawed.cache is not payload.cache
 
 
 def test_identity_semantic_drop_condition_preserves_legacy_identity() -> None:
