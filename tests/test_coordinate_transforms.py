@@ -565,6 +565,64 @@ def test_fill_carries_anchor_across_batches() -> None:
     )
 
 
+def test_streaming_fill_preflights_later_incompatible_merge_before_output() -> None:
+    transform = CoordinateTransform(
+        IntervalIndex(()),
+        IntervalIndex(()),
+        (MergeRange(2, 1, 2, 2),),
+    )
+    operation = transform.open(_plan(merge_strategy=MergeStrategy.FILL))
+    raw_schema = pa.schema([pa.field("0", pa.string()), pa.field("1", pa.int64())])
+    first = CoordinateBatch(
+        batch=pa.RecordBatch.from_arrays(
+            [pa.array(["before"], type=pa.string()), pa.array([1], type=pa.int64())],
+            schema=raw_schema,
+        ),
+        row_numbers=pa.array([1], type=pa.int64()),
+        column_numbers=(1, 2),
+    )
+
+    with pytest.raises(CoordinateCompatibilityError):
+        operation.push(first)
+
+
+@pytest.mark.parametrize("later_anchor", [7, 2**53 + 1])
+def test_streaming_fill_preflights_value_dependent_integer_to_float_before_output(
+    later_anchor: int,
+) -> None:
+    transform = CoordinateTransform(
+        IntervalIndex(()),
+        IntervalIndex(()),
+        (MergeRange(2, 1, 2, 2),),
+    )
+    operation = transform.open(_plan(merge_strategy=MergeStrategy.FILL))
+    raw_schema = pa.schema([pa.field("0", pa.int64()), pa.field("1", pa.float64())])
+    batches = (
+        CoordinateBatch(
+            batch=pa.RecordBatch.from_arrays(
+                [pa.array([1], type=pa.int64()), pa.array([1.0], type=pa.float64())],
+                schema=raw_schema,
+            ),
+            row_numbers=pa.array([1], type=pa.int64()),
+            column_numbers=(1, 2),
+        ),
+        CoordinateBatch(
+            batch=pa.RecordBatch.from_arrays(
+                [
+                    pa.array([later_anchor], type=pa.int64()),
+                    pa.array([None], type=pa.float64()),
+                ],
+                schema=raw_schema,
+            ),
+            row_numbers=pa.array([2], type=pa.int64()),
+            column_numbers=(1, 2),
+        ),
+    )
+
+    with pytest.raises(CoordinateCompatibilityError):
+        operation.push(batches[0])
+
+
 def test_fill_keeps_promoted_null_follower_schema_after_merge_ends() -> None:
     transform = CoordinateTransform(
         IntervalIndex(()),
@@ -627,7 +685,7 @@ def test_fill_keeps_projected_synthetic_follower_schema_after_merge_ends() -> No
     assert table.to_pydict() == {"0": [11, None]}
 
 
-def test_fill_rejects_conflicting_null_follower_promotions_before_output() -> None:
+def test_atomic_fill_rejects_conflicting_null_follower_promotions_before_output() -> None:
     transform = CoordinateTransform(
         IntervalIndex(()),
         IntervalIndex(()),
@@ -636,7 +694,6 @@ def test_fill_rejects_conflicting_null_follower_promotions_before_output() -> No
             MergeRange(2, 2, 2, 3),
         ),
     )
-    operation = transform.open(_plan(merge_strategy=MergeStrategy.FILL))
     raw = CoordinateBatch(
         batch=pa.record_batch(
             [
@@ -654,7 +711,7 @@ def test_fill_rejects_conflicting_null_follower_promotions_before_output() -> No
         CoordinateCompatibilityError,
         match=r"^merged-cell fill cannot establish one Arrow schema$",
     ):
-        operation.push(raw)
+        transform.open(_plan(merge_strategy=MergeStrategy.FILL))._materialize_complete(raw)
 
 
 def test_projected_out_anchor_fills_requested_follower() -> None:
@@ -765,7 +822,7 @@ def test_mixed_type_merge_fill_raises_exact_compatibility_signal() -> None:
         operation.push(raw)
 
 
-def test_typed_null_anchor_does_not_preemptively_reject_non_null_follower() -> None:
+def test_atomic_materialized_typed_null_anchor_keeps_value_aware_behavior() -> None:
     transform = CoordinateTransform(
         IntervalIndex(()),
         IntervalIndex(()),
@@ -783,10 +840,62 @@ def test_typed_null_anchor_does_not_preemptively_reject_non_null_follower() -> N
         column_numbers=(1, 2),
     )
 
-    result = _run(transform, _plan(merge_strategy=MergeStrategy.FILL), raw)
+    result = transform.open(_plan(merge_strategy=MergeStrategy.FILL))._materialize_complete(raw)
 
     assert _result_contract(result)[2] == ((None, None),)
-    assert result[0].batch.schema.types == [pa.string(), pa.int64()]
+
+
+def test_atomic_materialized_fill_keeps_safe_integer_to_float_behavior() -> None:
+    transform = CoordinateTransform(
+        IntervalIndex(()),
+        IntervalIndex(()),
+        (MergeRange(2, 1, 2, 2),),
+    )
+    schema = pa.schema([pa.field("0", pa.int64()), pa.field("1", pa.float64())])
+    raw = tuple(
+        CoordinateBatch(
+            batch=pa.RecordBatch.from_arrays(
+                [
+                    pa.array([anchor], type=pa.int64()),
+                    pa.array([follower], type=pa.float64()),
+                ],
+                schema=schema,
+            ),
+            row_numbers=pa.array([row], type=pa.int64()),
+            column_numbers=(1, 2),
+        )
+        for row, anchor, follower in ((1, 1, 1.0), (2, 7, None))
+    )
+
+    result = transform.open(_plan(merge_strategy=MergeStrategy.FILL))._materialize_complete(raw)
+
+    assert _result_contract(result)[2] == ((1, 1), (7, 7))
+
+
+def test_atomic_materialized_incompatible_later_merge_raises_private_signal() -> None:
+    transform = CoordinateTransform(
+        IntervalIndex(()),
+        IntervalIndex(()),
+        (MergeRange(2, 1, 2, 2),),
+    )
+    schema = pa.schema([pa.field("0", pa.string()), pa.field("1", pa.int64())])
+    raw = tuple(
+        CoordinateBatch(
+            batch=pa.RecordBatch.from_arrays(
+                [
+                    pa.array([anchor], type=pa.string()),
+                    pa.array([follower], type=pa.int64()),
+                ],
+                schema=schema,
+            ),
+            row_numbers=pa.array([row], type=pa.int64()),
+            column_numbers=(1, 2),
+        )
+        for row, anchor, follower in ((1, "before", 1), (2, "bad", None))
+    )
+
+    with pytest.raises(CoordinateCompatibilityError):
+        transform.open(_plan(merge_strategy=MergeStrategy.FILL))._materialize_complete(raw)
 
 
 @pytest.mark.parametrize("anchor", [1.0, 1.5])
@@ -833,7 +942,7 @@ def test_large_integer_merge_anchor_does_not_lose_precision_in_float_column() ->
     )
 
     with pytest.raises(CoordinateCompatibilityError):
-        transform.open(_plan(merge_strategy=MergeStrategy.FILL)).push(raw)
+        transform.open(_plan(merge_strategy=MergeStrategy.FILL))._materialize_complete(raw)
 
 
 def test_merge_fill_applies_to_trailing_synthetic_range_coordinates() -> None:

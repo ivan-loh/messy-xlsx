@@ -230,10 +230,10 @@ class CoordinateOperation:
 
     def push(self, batch: CoordinateBatch) -> tuple[CoordinateBatch, ...]:
         """Validate and accept the next original-coordinate batch."""
-        self._validate_batch(batch)
+        self._validate_batch(batch, streaming=True)
         return self._accept_projected(self._project_batch(batch))
 
-    def _validate_batch(self, batch: CoordinateBatch) -> None:
+    def _validate_batch(self, batch: CoordinateBatch, *, streaming: bool) -> None:
         if self._finished:
             raise RuntimeError("coordinate operation is finished")
         if len(batch.row_numbers) != batch.batch.num_rows:
@@ -243,7 +243,10 @@ class CoordinateOperation:
         if self._input_schema is None:
             self._input_column_numbers = batch.column_numbers
             self._input_schema = batch.batch.schema
-            self._merge_output_types = self._compile_merge_output_types(batch)
+            self._merge_output_types = self._compile_merge_output_types(
+                batch,
+                streaming=streaming,
+            )
         elif batch.column_numbers != self._input_column_numbers or not batch.batch.schema.equals(
             self._input_schema, check_metadata=True
         ):
@@ -270,14 +273,16 @@ class CoordinateOperation:
     def _compile_merge_output_types(
         self,
         batch: CoordinateBatch,
+        *,
+        streaming: bool,
     ) -> dict[int, pa.DataType]:
         if self._merge_strategy is not MergeStrategy.FILL or not self._merge_ranges:
             return {}
 
         input_types = dict(zip(batch.column_numbers, batch.batch.schema.types, strict=True))
-        output_columns = set(batch.column_numbers)
-        if self._projection is not None:
-            output_columns.update(self._projection.column_numbers)
+        output_columns = set(
+            batch.column_numbers if self._projection is None else self._projection.column_numbers
+        )
         anchor_types: dict[int, set[pa.DataType]] = {}
         for merged_range in self._merge_ranges:
             anchor_type = input_types.get(merged_range.min_col)
@@ -285,10 +290,14 @@ class CoordinateOperation:
                 continue
             for column in output_columns:
                 source_type = input_types.get(column, pa.null())
-                if merged_range.min_col <= column <= merged_range.max_col and pa.types.is_null(
-                    source_type
-                ):
+                if not merged_range.min_col <= column <= merged_range.max_col:
+                    continue
+                if pa.types.is_null(source_type):
                     anchor_types.setdefault(column, set()).add(anchor_type)
+                elif streaming and anchor_type != source_type:
+                    raise CoordinateCompatibilityError(
+                        "merged-cell fill cannot guarantee lossless streaming output"
+                    )
 
         output_types: dict[int, pa.DataType] = {}
         for column, candidate_types in anchor_types.items():
@@ -330,7 +339,7 @@ class CoordinateOperation:
         raw_batches = (batches,) if isinstance(batches, CoordinateBatch) else batches
         projected_list: list[CoordinateBatch] = []
         for batch in raw_batches:
-            self._validate_batch(batch)
+            self._validate_batch(batch, streaming=False)
             projected_list.extend(self._project_batch(batch))
         projected = (*projected_list, *self._finish_projection())
         self._active_anchors.clear()
