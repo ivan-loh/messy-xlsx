@@ -509,7 +509,7 @@ def _order_mapping_items(items: list[tuple[Any, Any]]) -> tuple[tuple[Any, Any],
     keyed_items = [(_stable_token(key), key, item) for key, item in items]
     keyed_items.sort(key=lambda item: item[0])
     for previous, current in pairwise(keyed_items):
-        if previous[0] == current[0] and previous[1] != current[1]:
+        if previous[0] == current[0]:
             raise TypeError("configuration mapping keys cannot be ordered deterministically")
     return tuple((key, item) for _, key, item in keyed_items)
 
@@ -518,7 +518,7 @@ def _order_set_items(items: tuple[Any, ...]) -> tuple[Any, ...]:
     """Order frozen set entries and reject ambiguous structural values."""
     keyed_items = sorted((_stable_token(item), item) for item in items)
     for previous, current in pairwise(keyed_items):
-        if previous[0] == current[0] and previous[1] != current[1]:
+        if previous[0] == current[0]:
             raise TypeError("configuration set values cannot be ordered deterministically")
     return tuple(item for _, item in keyed_items)
 

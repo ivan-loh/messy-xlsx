@@ -1196,6 +1196,67 @@ def test_tagged_snapshots_distinguish_list_tuple_set_and_frozenset() -> None:
     assert len(set(plans)) == 4
 
 
+@pytest.mark.parametrize("container_kind", ["mapping", "set"])
+def test_distinct_nan_collisions_are_rejected_independent_of_insertion_order(
+    container_kind: str,
+) -> None:
+    positive_nan = float("nan")
+    negative_nan = float("-nan")
+
+    if container_kind == "mapping":
+        first: object = {positive_nan: "positive", negative_nan: "negative"}
+        reversed_value: object = {negative_nan: "negative", positive_nan: "positive"}
+    else:
+        first_set: set[float] = set()
+        first_set.add(positive_nan)
+        first_set.add(negative_nan)
+        reversed_set: set[float] = set()
+        reversed_set.add(negative_nan)
+        reversed_set.add(positive_nan)
+        first = first_set
+        reversed_value = reversed_set
+
+    for value in (first, reversed_value):
+        with pytest.raises(TypeError, match="cannot be ordered deterministically"):
+            compile_parse_plan(
+                SheetConfig(
+                    auto_detect=False,
+                    type_hints={"float-collision": value},  # type: ignore[dict-item]
+                ),
+                None,
+                "xlsx",
+            )
+
+
+def test_signed_and_finite_float_ordering_remains_deterministic() -> None:
+    first_mapping = {-1.5: "negative", 1.5: "positive", -0.0: "zero"}
+    reversed_mapping = {-0.0: "zero", 1.5: "positive", -1.5: "negative"}
+    first_set = {-2.5, -0.0, 1.5}
+    reversed_set: set[float] = set()
+    for value in (1.5, -0.0, -2.5):
+        reversed_set.add(value)
+
+    first = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"mapping": first_mapping, "set": first_set},  # type: ignore[dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+    reversed_plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"mapping": reversed_mapping, "set": reversed_set},  # type: ignore[dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+
+    assert first == reversed_plan
+    assert hash(first) == hash(reversed_plan)
+
+
 def test_mutable_enum_payload_is_rejected_before_a_plan_can_retain_its_alias() -> None:
     with pytest.raises(TypeError, match="mutable Enum configuration value"):
         compile_parse_plan(
