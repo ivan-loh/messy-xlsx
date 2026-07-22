@@ -353,7 +353,9 @@ def _freeze(  # noqa: C901
         or _is_method_descriptor(value)
     ):
         return value
-    if _uses_legacy_identity_semantics(value):
+    if _uses_legacy_identity_semantics(value) and not (
+        is_dataclass(value) and not isinstance(value, type)
+    ):
         if preserve_identity_reference:
             return value
         raise TypeError(f"opaque mutable configuration value: {type(value).__name__}")

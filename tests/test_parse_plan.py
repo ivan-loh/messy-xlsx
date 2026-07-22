@@ -1014,6 +1014,11 @@ class _PostInitPayload:
         self.cache = {"initial": list(self.labels)}
 
 
+@dataclass(eq=False)
+class _IdentityEqualityDataclass:
+    labels: list[str]
+
+
 class _IdentityCondition:
     def __init__(self) -> None:
         self.mutable_state = ["initial"]
@@ -1190,6 +1195,25 @@ def test_dataclass_snapshot_preserves_post_init_state_without_aliases() -> None:
     assert first is not payload
     assert first.cache is not second.cache
     assert hash(plan) == hash(plan)
+
+
+def test_dataclass_without_generated_equality_still_uses_value_snapshot_policy() -> None:
+    payload = _IdentityEqualityDataclass(["alpha"])
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"payload": payload},  # type: ignore[dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+
+    payload.labels.append("changed")
+    thawed = plan.thaw_type_hints()["payload"]
+
+    assert isinstance(thawed, _IdentityEqualityDataclass)
+    assert thawed.labels == ["alpha"]
+    assert thawed is not payload
 
 
 def test_identity_semantic_drop_condition_preserves_legacy_identity() -> None:
