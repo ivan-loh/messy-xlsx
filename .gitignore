@@ -54,3 +54,6 @@ htmlcov/
 
 # Ruff
 .ruff_cache/
+
+# Isolated Superpowers implementation worktrees
+.worktrees/
