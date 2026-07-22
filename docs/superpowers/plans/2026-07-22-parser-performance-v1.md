@@ -93,7 +93,7 @@
 | 4 | OOXML archive security and eager manifest | 3 | [x] |
 | 5 | Lazy sheet metadata, interval indexes, and bounded structure sampling | 4 | [x] |
 | 6 | Immutable plans, reader contracts, and router | 2, 5 | [x] |
-| 7 | Fastexcel materialized Arrow reader | 6 | [ ] |
+| 7 | Fastexcel materialized Arrow reader | 6 | [x] |
 | 8 | Coordinate-aware Arrow transforms | 5, 7 | [ ] |
 | 9 | Closable stream lifecycle | 3, 6 | [ ] |
 | 10 | Openpyxl bounded-row OOXML reader | 8, 9 | [ ] |
@@ -1673,16 +1673,18 @@ git commit -m "refactor: route parsers by output capability"
 - Create: `src/messy_xlsx/parsing/xlsx_materialized.py`
 - Create: `src/messy_xlsx/parsing/legacy_adapter.py`
 - Create: `tests/test_xlsx_materialized.py`
+- Modify: `src/messy_xlsx/parsing/fastexcel_session.py`
 - Modify: `src/messy_xlsx/parsing/xlsx_handler.py`
-- Modify: `tests/test_parsing/test_xlsx_handler.py`
+- Modify: `src/messy_xlsx/workbook.py`
 - Modify: `tests/test_architecture_contracts.py`
+- Modify: `tests/test_resource_lifecycle.py`
 
 **Interfaces:**
 - Produces: `FastexcelMaterializedReader(session, sheet, plan).read_table() -> pa.Table` using the workbook-scoped `FastexcelSession`; the factory binds the immutable `ParsePlan` when it constructs the operation reader.
 - Produces: `LegacyDataFrameAdapter.to_dataframe(table, plan) -> pd.DataFrame`, the only built-in bridge for existing materialized APIs.
 - Preserves: the legacy `XLSXHandler.parse() -> pd.DataFrame` SPI through an adapter.
 
-- [ ] **Step 1: Write a failing zero-openpyxl materialization test**
+- [x] **Step 1: Write a failing zero-openpyxl materialization test**
 
 ```python
 # tests/test_xlsx_materialized.py
@@ -1724,112 +1726,72 @@ def test_ordinary_materialization_never_loads_openpyxl(sample_xlsx, basic_parse_
     assert table.num_rows > 0
 ```
 
-Add a test for a buffer larger than 8 MiB asserting fastexcel receives a temporary `Path` and that the path disappears after the reader closes.
+Add tests for seekable and non-seekable buffers larger than 8 MiB. Fastexcel
+receives the same private spill `Path` during initialization and materialization;
+reader/session closure does not delete the SourceHandle-owned path, and workbook
+or locally owned handler closure deletes it on success and failure.
 
 Run: `.venv/bin/pytest tests/test_xlsx_materialized.py -q`
 
 Expected: collection fails because `xlsx_materialized` does not exist.
 
-- [ ] **Step 2: Implement one whole-sheet fastexcel read**
+- [x] **Step 2: Implement one whole-sheet fastexcel read**
 
 ```python
 # src/messy_xlsx/parsing/xlsx_materialized.py
 from __future__ import annotations
 
-import fastexcel
 import pyarrow as pa
 
 
 class FastexcelMaterializedReader:
-    def __init__(self, session, sheet: str, plan, metrics=None) -> None:
+    def __init__(self, session, sheet: str, plan) -> None:
         self._session = session
         self._sheet = sheet
         self._plan = plan
-        self._metrics = metrics
 
     def read_table(self) -> pa.Table:
-        batch = self._session.materialize(self._sheet)
-        if not isinstance(batch, pa.RecordBatch):
-            batch = batch.to_arrow()
-        if self._metrics is not None:
-            self._metrics.full_materializations += 1
-        return pa.Table.from_batches([batch])
+        value = self._session.materialize(self._sheet, skip_rows=0)
+        return _coerce_materialized_table(value)
 ```
 
-Do not slice this batch and advertise the slices as input streaming. Keep raw worksheet coordinates until Task 8 applies shared transforms.
+The reader accepts a `pa.Table`, wraps a `pa.RecordBatch`, or calls a backend
+wrapper's `to_arrow()` exactly once. It performs no slicing, pandas conversion,
+metric update, or source cleanup. `FallbackCoordinator` owns metrics. A
+workbook-scoped `FastexcelSession` is reused across eligible sheet reads and is
+closed before the workbook's SourceHandle.
 
-- [ ] **Step 3: Adapt the legacy XLSX handler without changing output**
+For a no-range plan with nonzero `skip_rows`, retain backend-pushed fastexcel
+skipping through the legacy handler path. Whole-sheet coercion can turn numeric
+cells below text metadata into strings before pandas slicing can recover their
+types; the mixed `("metadata",), (1,), (2,)` regression test freezes this gate.
+
+- [x] **Step 3: Adapt the legacy XLSX handler without changing output**
 
 ```python
-# src/messy_xlsx/parsing/legacy_adapter.py
-def sanitize_columns_positionally(columns):
-    result = []
-    seen = {}
-    for label in columns:
-        clean = sanitize_column_name(label)
-        count = seen.get(clean, 0)
-        result.append(clean if count == 0 else f"{clean}_{count}")
-        seen[clean] = count + 1
-    return result
-
-
-def combined_drop_mask(frame, drop_regex, drop_conditions):
-    mask = pd.Series(False, index=frame.index)
-    if drop_regex:
-        pattern = re.compile(drop_regex)
-        for ordinal in range(len(frame.columns)):
-            values = frame.iloc[:, ordinal]
-            mask |= values.map(
-                lambda value: False if pd.isna(value) else bool(pattern.search(str(value)))
-            )
-    for column, value in drop_conditions:
-        for ordinal, label in enumerate(frame.columns):
-            if label == column:
-                mask |= frame.iloc[:, ordinal].eq(value)
-    return mask if mask.any() else None
-
-
-def apply_legacy_columns_and_filters(frame, plan):
-    if plan.sanitize_column_names:
-        frame.columns = sanitize_columns_positionally(frame.columns)
-    if plan.column_renames:
-        frame = frame.rename(columns=dict(plan.column_renames))
-    if not plan.normalize:
-        return frame
-    mask = combined_drop_mask(frame, plan.drop_regex, plan.drop_conditions)
-    return frame if mask is None else frame.loc[~mask].reset_index(drop=True)
-
-
 class LegacyDataFrameAdapter:
     def to_dataframe(self, table, plan):
-        frame = table.to_pandas()
-        if plan.normalize:
-            frame = NormalizationPipeline(
-                decimal_separator=plan.decimal_separator,
-                thousands_separator=plan.thousands_separator,
-                use_extended_missing_list=plan.use_extended_missing_list,
-                preserve_types=plan.preserve_types,
-            ).normalize(
-                frame,
-                semantic_hints=dict(plan.type_hints),
-                skip_steps=list(plan.skip_normalization_steps),
-            )
-        frame = apply_legacy_columns_and_filters(frame, plan)
-        return frame
+        del plan
+        return table.to_pandas()
 ```
 
-Make `XLSXHandler.parse()` compile or receive the existing `ParseOptions`, call the materialized reader only for the classified fast path, transform the Arrow table, and delegate through this adapter. `apply_legacy_columns_and_filters()` extracts the existing sanitization, rename, and row-filter code without changing ordering. Formula-expression and classified compatibility cases continue through openpyxl.
+Keep handler framing/cleaning in `XLSXHandler` and keep normalization,
+positional sanitization, thawed renames, `normalize=False`, regex filtering, and
+sequential condition filtering in `MessyWorkbook` in that exact order. The
+private bound-plan seam is available only to the exact untouched built-in
+registry. Custom registries, subclasses, handler mutations, formula-expression,
+merge, hidden, range, and streaming cases retain compatibility routing.
 
-- [ ] **Step 4: Run XLSX, architecture, and golden contracts**
+- [x] **Step 4: Run XLSX, architecture, and golden contracts**
 
 Run: `.venv/bin/pytest tests/test_xlsx_materialized.py tests/test_parsing/test_xlsx_handler.py tests/test_architecture_contracts.py tests/compatibility/test_v010_contract.py -q`
 
 Expected: all tests pass and ordinary materialization records one fastexcel full materialization and zero openpyxl loads.
 
-- [ ] **Step 5: Commit the materialized reader**
+- [x] **Step 5: Commit the materialized reader**
 
 ```bash
-git add src/messy_xlsx/parsing/xlsx_materialized.py src/messy_xlsx/parsing/legacy_adapter.py src/messy_xlsx/parsing/xlsx_handler.py tests/test_xlsx_materialized.py tests/test_parsing/test_xlsx_handler.py tests/test_architecture_contracts.py
+git add src/messy_xlsx/parsing/fastexcel_session.py src/messy_xlsx/parsing/xlsx_materialized.py src/messy_xlsx/parsing/legacy_adapter.py src/messy_xlsx/parsing/xlsx_handler.py src/messy_xlsx/workbook.py tests/test_xlsx_materialized.py tests/test_architecture_contracts.py tests/test_resource_lifecycle.py
 git commit -m "perf: materialize OOXML through fastexcel Arrow"
 ```
 
@@ -1841,11 +1803,40 @@ git commit -m "perf: materialize OOXML through fastexcel Arrow"
 - Create: `src/messy_xlsx/parsing/coordinates.py`
 - Create: `tests/test_coordinate_transforms.py`
 - Modify: `src/messy_xlsx/parsing/xlsx_materialized.py`
-- Modify: `src/messy_xlsx/parsing/parse_plan.py`
+- Modify as required: `src/messy_xlsx/parsing/legacy_adapter.py`
+- Modify as required: `src/messy_xlsx/parsing/router.py`
+- Modify as required: `src/messy_xlsx/parsing/xlsx_handler.py`
+- Modify as required: `src/messy_xlsx/workbook.py`
+- Modify: `tests/test_xlsx_materialized.py`
+- Modify as required: existing configuration, architecture, and compatibility tests
 
 **Interfaces:**
-- Produces: `ColumnIdentity`, `CoordinateBatch`, `CoordinateTransform`, and stateful merge-anchor carry-over.
+- Produces: `ColumnIdentity`, `CoordinateBatch`, immutable
+  `CoordinateTransform`, and a fresh stateful operation with `push()` and
+  idempotent `finish()` for merge-anchor and footer/header carry-over.
 - Consumes: `SheetManifest`, raw Arrow batches, and immutable `ParsePlan`.
+
+**Mandatory corrections:**
+
+- Do not modify `ParsePlan` or add `projection`, `legacy_mode`, or
+  data-derived `display_names`; its existing resolved fields are sufficient.
+- `CoordinateBatch` carries original one-based row/column coordinates plus a
+  positional `column_identities` sidecar. Arrow physical field names remain
+  unique ordinal strings while transforms run.
+- Range, merge, hidden, auxiliary-anchor removal, skip/header/footer, and final
+  identity attachment execute in that order. A range bypasses hidden filtering
+  and `skip_rows`; explicit `skip_footer` still applies.
+- The materialized reader still returns `pa.Table`. It opens one transform
+  operation, pushes raw coordinate batches, calls `finish()`, and assembles the
+  final table before the single pandas conversion.
+- A no-range plan with nonzero effective `skip_rows` remains on Task 7's
+  backend-pushed legacy fastexcel path. The coordinate path must not broaden
+  this gate until the mixed metadata/numeric dtype contract can be matched
+  exactly.
+- A mixed-type merge fill that Arrow cannot represent exactly raises only a
+  private `CoordinateCompatibilityError` before output. Add only that exact
+  signal to transactional fallback; never classify generic Arrow, type, range,
+  configuration, source, permission, memory, or process failures.
 
 - [ ] **Step 1: Write failing coordinate-precedence tests**
 
@@ -1865,14 +1856,15 @@ def _batch() -> CoordinateBatch:
     )
 
 
-def test_range_does_not_filter_hidden_coordinates_in_legacy_mode() -> None:
+def test_range_does_not_filter_hidden_coordinates() -> None:
     transform = CoordinateTransform(
         hidden_rows=IntervalIndex((Interval(2, 2),)),
         hidden_columns=IntervalIndex(()),
         merged_ranges=(),
     )
-    result = transform.apply(_batch(), cell_range="A1:B2", legacy_mode=True)
-    assert result.batch.num_rows == 2
+    operation = transform.open(range_plan("A1:B2"))
+    result = (*operation.push(_batch()), *operation.finish())
+    assert sum(batch.batch.num_rows for batch in result) == 2
 
 
 def test_merge_anchor_is_carried_across_batches() -> None:
@@ -1881,13 +1873,16 @@ def test_merge_anchor_is_carried_across_batches() -> None:
         hidden_columns=IntervalIndex(()),
         merged_ranges=(MergeRange(1, 1, 2, 1),),
     )
-    first = transform.apply(_batch().slice_rows(0, 1), merge_strategy="fill")
-    second = transform.apply(_batch().slice_rows(1, 1), merge_strategy="fill")
-    assert first.batch.column(0)[0].as_py() == "anchor"
-    assert second.batch.column(0)[0].as_py() == "anchor"
+    operation = transform.open(merge_plan("fill"))
+    first = operation.push(_batch().slice_rows(0, 1))
+    second = (*operation.push(_batch().slice_rows(1, 1)), *operation.finish())
+    assert first[0].batch.column(0)[0].as_py() == "anchor"
+    assert second[0].batch.column(0)[0].as_py() == "anchor"
 ```
 
 Add parameterized fixtures for range × hidden rows/columns, explicit/detected skips, every merge strategy, hidden anchors, projected-out anchors, and merges crossing boundaries.
+Also retain the Task 7 mixed `("metadata",), (1,), (2,)` regression and
+forbid the coordinate reader when effective no-range `skip_rows != 0`.
 
 Run: `.venv/bin/pytest tests/test_coordinate_transforms.py -q`
 
@@ -1907,12 +1902,14 @@ class CoordinateBatch:
     batch: pa.RecordBatch
     row_numbers: pa.Int64Array
     column_numbers: tuple[int, ...]
+    column_identities: tuple[ColumnIdentity, ...] = ()
 
     def slice_rows(self, offset: int, length: int) -> "CoordinateBatch":
         return CoordinateBatch(
             self.batch.slice(offset, length),
             self.row_numbers.slice(offset, length),
             self.column_numbers,
+            self.column_identities,
         )
 ```
 
@@ -1934,24 +1931,22 @@ Use Arrow arrays and boolean masks; never build a complete row list.
 
 ```python
 class CoordinateTransform:
-    def apply_raw(self, raw, row_numbers, plan):
-        projected, auxiliary = self._project_with_merge_anchors(raw, plan.projection)
-        merged = self._apply_merges(projected, row_numbers, plan.merge_strategy)
-        visible = (
-            merged
-            if plan.legacy_mode and plan.cell_range is not None
-            else self._filter_hidden(merged, row_numbers, plan)
-        )
-        visible = self._drop_auxiliary_columns(visible, auxiliary)
-        visible = self._apply_row_precedence(visible, row_numbers, plan)
-        return self._attach_column_identities(visible, plan.display_names)
+    def open(self, plan: ParsePlan) -> CoordinateOperation:
+        return CoordinateOperation(self, plan)
+
+
+class CoordinateOperation:
+    def push(self, batch: CoordinateBatch) -> tuple[CoordinateBatch, ...]: ...
+
+    def finish(self) -> tuple[CoordinateBatch, ...]: ...
 ```
 
-`_apply_row_precedence()` receives the immutable plan flags rather than
-re-reading `SheetConfig`: with a range it disables detected footer removal and
-does not apply `skip_rows`; explicit `skip_footer` still applies. Without a
-range it applies explicit values first, then detected values only where no
-explicit override exists. Tests enumerate this matrix before implementation.
+The operation interprets `plan.cell_range` in original coordinates, retains
+any intersecting merge anchor, applies merge semantics, filters hidden
+coordinates only without a range, removes all auxiliary rows/columns/cells,
+and finalizes footer/header state before attaching positional identities. The
+compiler has already resolved explicit versus detected values; do not reread
+`SheetConfig`. Tests enumerate the complete precedence matrix first.
 
 - [ ] **Step 4: Run transform, merge, header, and range regression tests**
 
@@ -1962,7 +1957,7 @@ Expected: all precedence cases and existing configuration tests pass.
 - [ ] **Step 5: Commit coordinate transforms**
 
 ```bash
-git add src/messy_xlsx/parsing/coordinates.py src/messy_xlsx/parsing/xlsx_materialized.py src/messy_xlsx/parsing/parse_plan.py tests/test_coordinate_transforms.py
+git add src/messy_xlsx/parsing/coordinates.py src/messy_xlsx/parsing/xlsx_materialized.py src/messy_xlsx/parsing/legacy_adapter.py src/messy_xlsx/parsing/router.py src/messy_xlsx/parsing/xlsx_handler.py src/messy_xlsx/workbook.py tests/test_coordinate_transforms.py tests/test_xlsx_materialized.py
 git commit -m "feat: transform Arrow batches by worksheet coordinates"
 ```
 
