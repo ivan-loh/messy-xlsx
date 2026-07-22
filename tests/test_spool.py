@@ -3,12 +3,43 @@ from __future__ import annotations
 import io
 import os
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, NoReturn
 
 import pytest
 
 import messy_xlsx._spool as spool_module
 from messy_xlsx._spool import ReplaySpool
+
+
+def _descriptor_is_closed(descriptor: int) -> bool:
+    try:
+        os.fstat(descriptor)
+    except OSError:
+        return True
+    return False
+
+
+def _remove_test_resources(descriptor: int, path: Path) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+    path.unlink(missing_ok=True)
+
+
+def _track_temp_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[int, Path]]:
+    created: list[tuple[int, Path]] = []
+    original_mkstemp = spool_module.tempfile.mkstemp
+
+    def tracking_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        descriptor, raw_path = original_mkstemp(*args, **kwargs)
+        created.append((descriptor, Path(raw_path)))
+        return descriptor, raw_path
+
+    monkeypatch.setattr(spool_module.tempfile, "mkstemp", tracking_mkstemp)
+    return created
 
 
 def test_small_spool_stays_in_memory_and_restores_cursor() -> None:
@@ -144,3 +175,77 @@ def test_spill_file_is_removed_when_a_write_fails(
     assert source.tell() == 4
     assert len(created_paths) == 1
     assert not created_paths[0].exists()
+
+
+@pytest.mark.parametrize("operation", ["chmod", "fdopen"])
+def test_spill_resources_are_removed_when_setup_raises_non_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    created = _track_temp_creation(monkeypatch)
+    primary_error = RuntimeError(f"injected {operation} failure")
+
+    def fail_operation(*_args: object) -> NoReturn:
+        raise primary_error
+
+    monkeypatch.setattr(spool_module.os, operation, fail_operation)
+    source = io.BytesIO(b"x" * 32)
+    source.seek(5)
+
+    try:
+        with pytest.raises(RuntimeError, match=f"injected {operation} failure") as captured:
+            ReplaySpool.from_stream(source, memory_limit=8)
+
+        assert captured.value is primary_error
+        assert source.tell() == 5
+        assert len(created) == 1
+        descriptor, path = created[0]
+        assert _descriptor_is_closed(descriptor)
+        assert not path.exists()
+    finally:
+        if created:
+            _remove_test_resources(*created[0])
+
+
+def test_non_oserror_remains_primary_when_spill_cleanup_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _track_temp_creation(monkeypatch)
+    original_close = os.close
+    original_unlink = os.unlink
+    primary_error = RuntimeError("injected fdopen failure")
+
+    def fail_fdopen(_descriptor: int, _mode: str) -> BinaryIO:
+        raise primary_error
+
+    def fail_close(_descriptor: int) -> None:
+        raise RuntimeError("injected descriptor cleanup failure")
+
+    def fail_unlink(_path: str) -> None:
+        raise RuntimeError("injected path cleanup failure")
+
+    monkeypatch.setattr(spool_module.os, "fdopen", fail_fdopen)
+    monkeypatch.setattr(spool_module.os, "close", fail_close)
+    monkeypatch.setattr(spool_module.os, "unlink", fail_unlink)
+
+    try:
+        with pytest.raises(RuntimeError, match="injected fdopen failure") as captured:
+            ReplaySpool.from_stream(io.BytesIO(b"x" * 32), memory_limit=8)
+
+        assert captured.value is primary_error
+        assert captured.value.__notes__ == [
+            "temporary descriptor close also failed: "
+            "RuntimeError('injected descriptor cleanup failure')",
+            "temporary file removal also failed: RuntimeError('injected path cleanup failure')",
+        ]
+    finally:
+        if created:
+            descriptor, path = created[0]
+            try:
+                original_close(descriptor)
+            except OSError:
+                pass
+            try:
+                original_unlink(path)
+            except FileNotFoundError:
+                pass

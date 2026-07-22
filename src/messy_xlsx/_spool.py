@@ -8,7 +8,7 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 DEFAULT_MEMORY_LIMIT = 8 * 1024 * 1024
 COPY_CHUNK_SIZE = 1024 * 1024
@@ -61,30 +61,51 @@ def _capture_position(stream: BinaryIO) -> tuple[bool, int]:
     return False, 0
 
 
+def _cleanup_pending_spill(
+    descriptor: int | None,
+    opened: BinaryIO | None,
+    raw_path: str,
+    error: BaseException,
+) -> None:
+    if opened is not None:
+        try:
+            opened.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"temporary file close also failed: {cleanup_error!r}")
+    elif descriptor is not None:
+        try:
+            os.close(descriptor)
+        except BaseException as cleanup_error:
+            error.add_note(f"temporary descriptor close also failed: {cleanup_error!r}")
+    try:
+        os.unlink(raw_path)
+    except BaseException as cleanup_error:
+        error.add_note(f"temporary file removal also failed: {cleanup_error!r}")
+
+
 def _create_spill() -> tuple[Path, BinaryIO]:
     try:
-        descriptor, raw_path = tempfile.mkstemp(
+        raw_descriptor, raw_path = tempfile.mkstemp(
             prefix="messy-xlsx-",
             suffix=".spool",
         )
     except OSError as error:
         raise _storage_error(error) from error
 
-    path = Path(raw_path)
+    descriptor_owner: int | None = raw_descriptor
+    opened: BinaryIO | None = None
     try:
-        os.chmod(path, 0o600)
-        return path, os.fdopen(descriptor, "wb")
-    except OSError as error:
-        storage_error = _storage_error(error)
-        try:
-            os.close(descriptor)
-        except OSError as cleanup_error:
-            storage_error.add_note(f"temporary descriptor close also failed: {cleanup_error!r}")
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as cleanup_error:
-            storage_error.add_note(f"temporary file removal also failed: {cleanup_error!r}")
-        raise storage_error from error
+        os.chmod(raw_path, 0o600)
+        opened = cast(BinaryIO, os.fdopen(raw_descriptor, "wb"))
+        descriptor_owner = None
+        return Path(raw_path), opened
+    except BaseException as error:
+        if isinstance(error, OSError):
+            storage_error = _storage_error(error)
+            _cleanup_pending_spill(descriptor_owner, opened, raw_path, storage_error)
+            raise storage_error from error
+        _cleanup_pending_spill(descriptor_owner, opened, raw_path, error)
+        raise
 
 
 def _write_spill(stream: BinaryIO, content: bytes | bytearray) -> None:
