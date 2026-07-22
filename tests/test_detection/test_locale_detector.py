@@ -61,3 +61,14 @@ class TestLocaleDetector:
 
         # Should return default locale
         assert locale_info is not None
+
+    def test_detect_from_evidence_prioritizes_manifest_format_codes(self):
+        detector = LocaleDetector()
+
+        locale_info = detector.detect_from_evidence(
+            ["1,234.56"],
+            ["#.##0,00"],
+        )
+
+        assert locale_info.locale == "de_DE"
+        assert locale_info.decimal_separator == ","

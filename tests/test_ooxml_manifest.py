@@ -194,6 +194,7 @@ def test_manifest_preserves_order_state_and_metadata_without_cell_values() -> No
     assert manifest.styles == StyleManifest(
         custom_number_formats=((165, "yyyy-mm-dd"), (166, "0.00")),
         date_style_ids=(1, 2),
+        number_format_codes=("General", "yyyy-mm-dd", "mm-dd-yy"),
     )
     assert manifest.external_relationships == ("externalLinks/externalLink1.xml",)
     assert not hasattr(manifest, "dataframe")
@@ -469,8 +470,11 @@ def test_missing_sheet_relationship_is_rejected() -> None:
     "target",
     [
         "../../escape.xml",
-        "/xl/worksheets/sheet1.xml",
+        "//server/share/sheet1.xml",
+        "/../escape.xml",
         "C:/escape.xml",
+        "/C:/escape.xml",
+        "https://example.invalid/sheet1.xml",
         "worksheets\\sheet1.xml",
         "worksheets/%2e%2e/%2e%2e/escape.xml",
     ],
@@ -482,6 +486,18 @@ def test_unsafe_internal_relationship_targets_are_rejected(target: str) -> None:
         _build(_entries(relationships=relationships))
 
     assert raised.value.context["target"] == target
+
+
+def test_package_absolute_internal_relationship_target_is_resolved() -> None:
+    relationships = _relationships(
+        first_target="/xl/worksheets/sheet1.xml",
+        second_target="worksheets/sheet2.xml",
+    )
+
+    manifest = _build(_entries(relationships=relationships))
+
+    first = next(sheet for sheet in manifest.sheets if sheet.name == "First")
+    assert first.target == "xl/worksheets/sheet1.xml"
 
 
 def test_relationship_target_must_name_an_archive_member() -> None:

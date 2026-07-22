@@ -5,21 +5,26 @@ from __future__ import annotations
 import lzma
 import posixpath
 import zlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import IO
+from typing import IO, cast
 from urllib.parse import unquote
 from zipfile import BadZipFile, ZipFile
 
 from openpyxl.styles.numbers import BUILTIN_FORMATS, is_date_format
+from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
 from messy_xlsx._source import SourceHandle
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.ooxml.models import (
     DEFAULT_LIMITS,
+    Interval,
+    IntervalIndex,
+    MergeRange,
     OoxmlLimits,
     SheetDescriptor,
+    SheetManifest,
     StyleManifest,
     WorkbookManifest,
 )
@@ -189,7 +194,7 @@ def _content_type_part_name(part_name: str, member: str) -> str:
             part_name=part_name,
         )
     try:
-        return canonical_archive_name(part_name[1:])
+        return cast(str, canonical_archive_name(part_name[1:]))
     except ValueError as error:
         raise FormatError(
             "OOXML content type declaration has unsafe part name",
@@ -306,7 +311,9 @@ def _decode_relationship_target(target: str) -> str:
 def _internal_target(target: str, *, source_part: str = _WORKBOOK_MEMBER) -> str:
     decoded = _decode_relationship_target(target)
     target_path = PurePosixPath(decoded)
-    drive_like = bool(target_path.parts and ":" in target_path.parts[0])
+    package_absolute = decoded.startswith("/") and not decoded.startswith("//")
+    first_part = decoded.lstrip("/").split("/", 1)[0]
+    drive_like = ":" in first_part
     unsafe = (
         not decoded
         or "\x00" in decoded
@@ -314,7 +321,7 @@ def _internal_target(target: str, *, source_part: str = _WORKBOOK_MEMBER) -> str
         or "?" in decoded
         or "#" in decoded
         or drive_like
-        or target_path.is_absolute()
+        or decoded.startswith("//")
         or ".." in target_path.parts
     )
     if unsafe:
@@ -323,10 +330,18 @@ def _internal_target(target: str, *, source_part: str = _WORKBOOK_MEMBER) -> str
             target=target,
         )
 
-    source_directory = PurePosixPath(source_part).parent.as_posix()
-    resolved = posixpath.normpath(posixpath.join(source_directory, decoded))
+    if package_absolute:
+        resolved = posixpath.normpath(decoded[1:])
+    else:
+        source_directory = PurePosixPath(source_part).parent.as_posix()
+        resolved = posixpath.normpath(posixpath.join(source_directory, decoded))
     resolved_path = PurePosixPath(resolved)
-    if resolved_path.is_absolute() or ".." in resolved_path.parts:
+    if (
+        not resolved
+        or resolved == "."
+        or resolved_path.is_absolute()
+        or ".." in resolved_path.parts
+    ):
         raise FormatError(
             "OOXML package contains unsafe relationship target",
             target=target,
@@ -656,6 +671,7 @@ def _read_styles(
 
     custom: dict[int, str] = {}
     date_styles: list[int] = []
+    number_format_codes: list[str] = []
     in_cell_xfs = False
     style_index = 0
     namespace: str | None = None
@@ -686,6 +702,7 @@ def _read_styles(
                     number_format_id,
                     BUILTIN_FORMATS.get(number_format_id, ""),
                 )
+                number_format_codes.append(format_code)
                 if format_code and is_date_format(format_code):
                     date_styles.append(style_index)
                 style_index += 1
@@ -693,7 +710,11 @@ def _read_styles(
                 in_cell_xfs = False
             if event == "end":
                 element.clear()
-    return StyleManifest(tuple(sorted(custom.items())), tuple(date_styles))
+    return StyleManifest(
+        tuple(sorted(custom.items())),
+        tuple(date_styles),
+        tuple(number_format_codes),
+    )
 
 
 def _manifest_from_package(package: ZipFile, limits: OoxmlLimits) -> WorkbookManifest:
@@ -741,3 +762,227 @@ def build_manifest(
             file_path=source.description,
         ) from error
     return manifest
+
+
+def _one_based_int(value: str | None, member: str, attribute: str) -> int:
+    try:
+        parsed = int(value or "")
+    except ValueError as error:
+        raise FormatError(
+            "OOXML worksheet contains malformed coordinate metadata",
+            member=member,
+            attribute=attribute,
+            value=value,
+        ) from error
+    if parsed < 1:
+        raise FormatError(
+            "OOXML worksheet contains malformed coordinate metadata",
+            member=member,
+            attribute=attribute,
+            value=value,
+        )
+    return parsed
+
+
+def _style_index(value: str | None, member: str) -> int:
+    try:
+        parsed = int(value or "0")
+    except ValueError as error:
+        raise FormatError(
+            "OOXML worksheet contains malformed style metadata",
+            member=member,
+            style=value,
+        ) from error
+    if parsed < 0:
+        raise FormatError(
+            "OOXML worksheet contains malformed style metadata",
+            member=member,
+            style=value,
+        )
+    return parsed
+
+
+def _coordinate(value: str | None, member: str) -> tuple[int, int]:
+    try:
+        row, column = coordinate_to_tuple(value or "")
+    except (TypeError, ValueError) as error:
+        raise FormatError(
+            "OOXML worksheet contains malformed cell coordinate",
+            member=member,
+            coordinate=value,
+        ) from error
+    return row, column
+
+
+def _range(value: str | None, member: str) -> tuple[int, int, int, int]:
+    try:
+        min_col, min_row, max_col, max_row = range_boundaries(value or "")
+    except (TypeError, ValueError) as error:
+        raise FormatError(
+            "OOXML worksheet contains malformed range coordinate",
+            member=member,
+            coordinate=value,
+        ) from error
+    if None in {min_col, min_row, max_col, max_row}:
+        raise FormatError(
+            "OOXML worksheet contains malformed range coordinate",
+            member=member,
+            coordinate=value,
+        )
+    return int(min_row), int(min_col), int(max_row), int(max_col)
+
+
+def _xml_boolean(value: str | None) -> bool:
+    return value is not None and value.casefold() in {"1", "true"}
+
+
+class ManifestReader:
+    """Build workbook metadata eagerly and sheet metadata on first request."""
+
+    def __init__(
+        self,
+        source: SourceHandle,
+        limits: OoxmlLimits = DEFAULT_LIMITS,
+        on_member_open: Callable[[str], None] | None = None,
+    ) -> None:
+        self._source = source
+        self._limits = limits
+        self._on_member_open = on_member_open
+        self.workbook = build_manifest(source, limits)
+        self._sheets: dict[str, SheetManifest] = {}
+
+    def sheet(self, name: str) -> SheetManifest:
+        """Return one cached sheet index, parsing its XML at most once."""
+        cached = self._sheets.get(name)
+        if cached is not None:
+            return cached
+        try:
+            descriptor = next(sheet for sheet in self.workbook.sheets if sheet.name == name)
+        except StopIteration as error:
+            raise KeyError(name) from error
+        parsed = self._parse_sheet(descriptor)
+        self._sheets[name] = parsed
+        return parsed
+
+    def _parse_sheet(self, descriptor: SheetDescriptor) -> SheetManifest:
+        member = descriptor.target
+        try:
+            with self._source.open_binary() as binary, ZipFile(binary) as package:
+                validate_archive(package, self._limits)
+                _required_member(package, member)
+                if self._on_member_open is not None:
+                    self._on_member_open(member)
+                with _open_archive_member(package, member) as xml_source:
+                    return self._parse_sheet_xml(descriptor, xml_source)
+        except BadZipFile as error:
+            raise FormatError(
+                "Source is not a valid OOXML archive",
+                file_path=self._source.description,
+            ) from error
+
+    def _parse_sheet_xml(  # noqa: C901 - one bounded dispatch over worksheet XML tags
+        self,
+        descriptor: SheetDescriptor,
+        source: IO[bytes],
+    ) -> SheetManifest:
+        member = descriptor.target
+        declared_dimension: tuple[int, int, int, int] | None = None
+        observed_max_row = 0
+        observed_max_col = 0
+        hidden_rows: list[Interval] = []
+        hidden_columns: list[Interval] = []
+        merged_ranges: list[MergeRange] = []
+        formula_samples: list[str] = []
+        number_format_codes: list[str] = []
+        seen_number_format_codes: set[str] = set()
+        has_formulas = False
+        current_cell: str | None = None
+        namespace: str | None = None
+        namespaced_elements = frozenset(
+            {"worksheet", "dimension", "row", "col", "c", "f", "mergeCell"}
+        )
+
+        for event, element in safe_iterparse(source, member, self._limits):
+            if event == "start" and namespace is None:
+                namespace = _root_namespace(
+                    element.tag,
+                    "worksheet",
+                    _SPREADSHEET_NAMESPACES,
+                    member,
+                )
+            local_name = _validated_local_name(
+                element.tag,
+                namespace,
+                namespaced_elements,
+                member,
+            )
+            if event == "start" and local_name == "c":
+                current_cell = element.attrib.get("r")
+                row, column = _coordinate(current_cell, member)
+                observed_max_row = max(observed_max_row, row)
+                observed_max_col = max(observed_max_col, column)
+                style_index = _style_index(element.attrib.get("s"), member)
+                style_codes = self.workbook.styles.number_format_codes
+                if style_index < len(style_codes):
+                    format_code = style_codes[style_index]
+                    if (
+                        format_code
+                        and format_code != "General"
+                        and format_code not in seen_number_format_codes
+                    ):
+                        seen_number_format_codes.add(format_code)
+                        number_format_codes.append(format_code)
+                elif style_index:
+                    raise FormatError(
+                        "OOXML worksheet references an unknown style",
+                        member=member,
+                        style=style_index,
+                    )
+            elif event == "end" and local_name == "dimension":
+                declared_dimension = _range(element.attrib.get("ref"), member)
+            elif (
+                event == "end"
+                and local_name == "row"
+                and _xml_boolean(element.attrib.get("hidden"))
+            ):
+                row = _one_based_int(element.attrib.get("r"), member, "r")
+                hidden_rows.append(Interval(row, row))
+            elif (
+                event == "end"
+                and local_name == "col"
+                and _xml_boolean(element.attrib.get("hidden"))
+            ):
+                hidden_columns.append(
+                    Interval(
+                        _one_based_int(element.attrib.get("min"), member, "min"),
+                        _one_based_int(element.attrib.get("max"), member, "max"),
+                    )
+                )
+            elif event == "end" and local_name == "mergeCell":
+                min_row, min_col, max_row, max_col = _range(element.attrib.get("ref"), member)
+                merged_ranges.append(MergeRange(min_row, min_col, max_row, max_col))
+            elif event == "end" and local_name == "f":
+                has_formulas = True
+                if (
+                    current_cell is not None
+                    and len(formula_samples) < self._limits.max_formula_samples
+                ):
+                    formula_samples.append(current_cell)
+            elif event == "end" and local_name == "c":
+                current_cell = None
+            if event == "end":
+                element.clear()
+
+        return SheetManifest(
+            name=descriptor.name,
+            target=member,
+            declared_dimension=declared_dimension,
+            observed_max_row=observed_max_row,
+            observed_max_col=observed_max_col,
+            hidden_rows=IntervalIndex(tuple(hidden_rows)),
+            hidden_columns=IntervalIndex(tuple(hidden_columns)),
+            merged_ranges=tuple(merged_ranges),
+            has_formulas=has_formulas,
+            formula_samples=tuple(formula_samples),
+            number_format_codes=tuple(number_format_codes),
+        )

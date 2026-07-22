@@ -82,6 +82,14 @@ class LocaleDetector:
                     logger.debug("Locale detection skipped cell (%d, %d): %s", row, col, e)
                     continue
 
+        return self.detect_from_evidence(text_values, format_codes)
+
+    def detect_from_evidence(
+        self,
+        text_values: list[str],
+        format_codes: list[str],
+    ) -> LocaleInfo:
+        """Detect locale from bounded text values and manifest format codes."""
         european_from_formats = self._check_format_codes(format_codes)
 
         if european_from_formats:

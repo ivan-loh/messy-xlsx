@@ -1,10 +1,13 @@
 """Unit tests for StructureAnalyzer."""
 
+import os
+
 import openpyxl
 
 from messy_xlsx import MessyWorkbook
 from messy_xlsx.cache import StructureCache
 from messy_xlsx.detection import StructureAnalyzer
+from messy_xlsx.models import StructureInfo
 
 
 class TestStructureAnalyzer:
@@ -109,3 +112,28 @@ class TestStructureAnalyzer:
 
             assert structure1.header_row == structure2.header_row
             assert structure1.num_tables == structure2.num_tables
+
+    def test_file_changed_during_analysis_is_not_cached(self, sample_xlsx, monkeypatch):
+        cache = StructureCache()
+        cache.put(
+            sample_xlsx,
+            "Sentinel",
+            StructureInfo(1, 1, 1, 1, None, 0, 0.0),
+        )
+        analyzer = StructureAnalyzer(cache)
+        original = analyzer._detect_data_region
+
+        def change_path_during_analysis(worksheet):
+            result = original(worksheet)
+            stat = sample_xlsx.stat()
+            os.utime(
+                sample_xlsx,
+                ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+            )
+            return result
+
+        monkeypatch.setattr(analyzer, "_detect_data_region", change_path_during_analysis)
+
+        analyzer.analyze(sample_xlsx, "Data", force=True)
+
+        assert len(cache) == 1

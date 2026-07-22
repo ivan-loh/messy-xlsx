@@ -10,7 +10,7 @@ from typing import Any
 import openpyxl
 
 from messy_xlsx._source import SourceHandle, SourceInput
-from messy_xlsx.cache import StructureCache, get_structure_cache
+from messy_xlsx.cache import PathIdentity, StructureCache, get_structure_cache
 from messy_xlsx.detection.locale_detector import LocaleDetector
 from messy_xlsx.exceptions import StructureError
 from messy_xlsx.models import StructureInfo, TableInfo
@@ -35,7 +35,7 @@ class StructureAnalyzer:
 
     def __init__(self, cache: StructureCache | None = None):
         """Initialize analyzer."""
-        self.cache = cache or get_structure_cache()
+        self.cache = cache if cache is not None else get_structure_cache()
         self.locale_detector = LocaleDetector()
 
     def analyze(
@@ -72,6 +72,12 @@ class StructureAnalyzer:
         """Analyze one sheet through a repeatable source handle."""
         cache_variant = "\x1f".join(header_patterns or [])
         file_path = handle.path
+        path_identity: PathIdentity | None = None
+        if file_path is not None:
+            try:
+                path_identity = PathIdentity.before(file_path)
+            except OSError:
+                pass
 
         # Only use cache for file paths (not file-like objects)
         if file_path is not None and not force:
@@ -154,8 +160,14 @@ class StructureAnalyzer:
         )
 
         # Only cache for file paths
-        if file_path:
-            self.cache.put(file_path, sheet, result, variant=cache_variant)
+        if file_path is not None and path_identity is not None:
+            self.cache.put(
+                file_path,
+                sheet,
+                result,
+                variant=cache_variant,
+                identity=path_identity,
+            )
 
         return result
 

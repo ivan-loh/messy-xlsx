@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 
 
@@ -23,6 +24,79 @@ class OoxmlLimits:
 DEFAULT_LIMITS = OoxmlLimits()
 
 
+@dataclass(frozen=True, order=True)
+class Interval:
+    """Inclusive, one-based coordinate interval."""
+
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        if self.start < 1 or self.end < self.start:
+            raise ValueError("invalid one-based interval")
+
+
+@dataclass(frozen=True)
+class IntervalIndex:
+    """Normalized compact intervals with logarithmic coordinate lookup."""
+
+    intervals: tuple[Interval, ...]
+    starts: tuple[int, ...] = field(init=False)
+
+    def __post_init__(self) -> None:
+        normalized: list[Interval] = []
+        for interval in sorted(self.intervals):
+            if normalized and interval.start <= normalized[-1].end + 1:
+                previous = normalized[-1]
+                normalized[-1] = Interval(previous.start, max(previous.end, interval.end))
+            else:
+                normalized.append(interval)
+        compact = tuple(normalized)
+        object.__setattr__(self, "intervals", compact)
+        object.__setattr__(self, "starts", tuple(interval.start for interval in compact))
+
+    def contains(self, value: int) -> bool:
+        """Return whether a one-based coordinate is covered."""
+        position = bisect_right(self.starts, value) - 1
+        return position >= 0 and value <= self.intervals[position].end
+
+
+@dataclass(frozen=True)
+class MergeRange:
+    """Inclusive one-based rectangular merged-cell range."""
+
+    min_row: int
+    min_col: int
+    max_row: int
+    max_col: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.min_row < 1
+            or self.min_col < 1
+            or self.max_row < self.min_row
+            or self.max_col < self.min_col
+        ):
+            raise ValueError("invalid one-based merge range")
+
+
+@dataclass(frozen=True)
+class SheetManifest:
+    """Metadata-only index from one worksheet XML pass."""
+
+    name: str
+    target: str
+    declared_dimension: tuple[int, int, int, int] | None
+    observed_max_row: int
+    observed_max_col: int
+    hidden_rows: IntervalIndex
+    hidden_columns: IntervalIndex
+    merged_ranges: tuple[MergeRange, ...]
+    has_formulas: bool
+    formula_samples: tuple[str, ...]
+    number_format_codes: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class SheetDescriptor:
     """Ordered workbook-level metadata for one worksheet."""
@@ -39,6 +113,7 @@ class StyleManifest:
 
     custom_number_formats: tuple[tuple[int, str], ...]
     date_style_ids: tuple[int, ...]
+    number_format_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

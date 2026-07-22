@@ -4,7 +4,10 @@
 # Imports
 # ============================================================================
 
+from __future__ import annotations
+
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Generic, TypeVar
@@ -87,6 +90,39 @@ class LRUCache(Generic[T]):
 # ============================================================================
 
 
+@dataclass(frozen=True)
+class PathIdentity:
+    """Stable filesystem identity captured around structure analysis."""
+
+    resolved: str
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+    @classmethod
+    def before(cls, path: Path) -> PathIdentity:
+        """Capture all path and stat fields used by the global cache."""
+        resolved_path = path.resolve()
+        stat = resolved_path.stat()
+        return cls(
+            resolved=str(resolved_path),
+            device=stat.st_dev,
+            inode=stat.st_ino,
+            size=stat.st_size,
+            mtime_ns=stat.st_mtime_ns,
+            ctime_ns=stat.st_ctime_ns,
+        )
+
+    def unchanged(self, path: Path) -> bool:
+        """Return whether the path still has this exact identity."""
+        try:
+            return self == type(self).before(path)
+        except OSError:
+            return False
+
+
 class StructureCache:
     """Specialized cache for StructureInfo results."""
 
@@ -97,16 +133,20 @@ class StructureCache:
         self,
         file_path: Path,
         sheet: str,
-        mtime: float | None = None,
+        identity: PathIdentity | None = None,
         variant: str | None = None,
     ) -> str:
-        """Create cache key from file path, sheet, mtime, and analysis variant."""
-        if mtime is None:
-            try:
-                mtime = file_path.stat().st_mtime
-            except OSError:
-                mtime = 0.0
-        return f"{file_path.resolve()}:{sheet}:{mtime}:{variant or ''}"
+        """Create a key from exact path identity, sheet, and analysis variant."""
+        if identity is None:
+            identity = PathIdentity.before(file_path)
+        stat_key = (
+            identity.device,
+            identity.inode,
+            identity.size,
+            identity.mtime_ns,
+            identity.ctime_ns,
+        )
+        return f"{identity.resolved}:{sheet}:{stat_key}:{variant or ''}"
 
     def get(
         self,
@@ -116,11 +156,11 @@ class StructureCache:
     ) -> StructureInfo | None:
         """Get cached structure info for a sheet."""
         try:
-            mtime = file_path.stat().st_mtime
+            identity = PathIdentity.before(file_path)
         except OSError:
             return None
 
-        key = self._make_key(file_path, sheet, mtime, variant)
+        key = self._make_key(file_path, sheet, identity, variant)
         return self._cache.get(key)
 
     def put(
@@ -129,15 +169,20 @@ class StructureCache:
         sheet: str,
         info: StructureInfo,
         variant: str | None = None,
-    ) -> None:
+        identity: PathIdentity | None = None,
+    ) -> bool:
         """Cache structure info for a sheet."""
         try:
-            mtime = file_path.stat().st_mtime
+            before = identity or PathIdentity.before(file_path)
         except OSError:
-            return
+            return False
 
-        key = self._make_key(file_path, sheet, mtime, variant)
+        if not before.unchanged(file_path):
+            return False
+
+        key = self._make_key(file_path, sheet, before, variant)
         self._cache.put(key, info)
+        return True
 
     def invalidate(self, file_path: Path) -> int:
         """Invalidate all cached entries for a file."""

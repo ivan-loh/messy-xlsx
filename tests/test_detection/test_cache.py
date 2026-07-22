@@ -1,11 +1,12 @@
 """Tests for LRUCache and StructureCache."""
 
+import os
 import time
 from pathlib import Path
 
 import openpyxl
 
-from messy_xlsx.cache import LRUCache, StructureCache
+from messy_xlsx.cache import LRUCache, PathIdentity, StructureCache
 from messy_xlsx.models import StructureInfo
 
 # ============================================================================
@@ -273,3 +274,51 @@ class TestStructureCache:
         cache.put(file_path, "Sheet1", _make_structure_info())
         cache.clear()
         assert len(cache) == 0
+
+    def test_equal_size_and_restored_mtime_do_not_reuse_replaced_file(self, temp_dir):
+        cache = StructureCache(maxsize=10)
+        file_path = temp_dir / "identity.xlsx"
+        file_path.write_bytes(b"first")
+        original = PathIdentity.before(file_path)
+        cache.put(file_path, "Sheet1", _make_structure_info(), identity=original)
+
+        replacement = temp_dir / "replacement.xlsx"
+        replacement.write_bytes(b"other")
+        os.utime(replacement, ns=(original.mtime_ns, original.mtime_ns))
+        replacement.replace(file_path)
+        os.utime(file_path, ns=(original.mtime_ns, original.mtime_ns))
+
+        current = PathIdentity.before(file_path)
+        assert current.size == original.size
+        assert current.mtime_ns == original.mtime_ns
+        assert (current.inode, current.ctime_ns) != (original.inode, original.ctime_ns)
+        assert cache.get(file_path, "Sheet1") is None
+
+    def test_put_skips_insertion_when_pre_analysis_identity_changed(self, temp_dir):
+        cache = StructureCache(maxsize=10)
+        file_path = temp_dir / "changing.xlsx"
+        file_path.write_bytes(b"before")
+        before = PathIdentity.before(file_path)
+
+        file_path.write_bytes(b"after!")
+        inserted = cache.put(
+            file_path,
+            "Sheet1",
+            _make_structure_info(),
+            identity=before,
+        )
+
+        assert inserted is False
+        assert len(cache) == 0
+
+    def test_path_identity_uses_resolved_stat_fields(self, temp_dir):
+        file_path = temp_dir / "identity.xlsx"
+        file_path.write_bytes(b"identity")
+
+        identity = PathIdentity.before(file_path)
+
+        assert identity.resolved == str(file_path.resolve())
+        assert identity.device == file_path.stat().st_dev
+        assert identity.inode == file_path.stat().st_ino
+        assert identity.size == len(b"identity")
+        assert identity.unchanged(file_path)
