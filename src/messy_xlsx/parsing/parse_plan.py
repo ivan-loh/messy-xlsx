@@ -455,11 +455,11 @@ def _freeze(  # noqa: C901
     if isinstance(value, Enum):
         _validate_enum(value)
         return value
-    if value is None or isinstance(value, (bool, int, str, bytes)):
+    if value is None or type(value) in {bool, int, str, bytes}:
         return value
-    if isinstance(value, float):
+    if type(value) is float:
         return _FrozenFloat(value.hex())
-    if isinstance(value, complex):
+    if type(value) is complex:
         return _FrozenComplex(
             _FrozenFloat(value.real.hex()),
             _FrozenFloat(value.imag.hex()),
@@ -760,13 +760,13 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
     if isinstance(value, Enum):
         value_type = type(value)
         return ("enum", value_type.__module__, value_type.__qualname__, value.name)
-    if isinstance(value, bool):
+    if type(value) is bool:
         return ("bool", int(value))
-    if isinstance(value, int):
+    if type(value) is int:
         return ("int", str(value))
-    if isinstance(value, str):
+    if type(value) is str:
         return ("str", value)
-    if isinstance(value, bytes):
+    if type(value) is bytes:
         return ("bytes", value.hex())
     if isinstance(value, _FrozenFloat):
         return ("float", value.hexadecimal)
@@ -886,9 +886,9 @@ def _validate_enum(value: Enum) -> None:
 
 
 def _is_deeply_immutable(value: Any) -> bool:
-    if value is None or isinstance(value, (bool, int, float, complex, str, bytes, type)):
+    if value is None or type(value) in {bool, int, float, complex, str, bytes, type}:
         return True
-    if isinstance(value, tuple | frozenset):
+    if type(value) in {tuple, frozenset}:
         return all(_is_deeply_immutable(item) for item in value)
     return isfunction(value) or isbuiltin(value) or _is_method_descriptor(value)
 

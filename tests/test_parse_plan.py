@@ -1015,6 +1015,55 @@ class _MutablePayloadEnum(Enum):
     ITEM: ClassVar[list[str]] = ["initial"]
 
 
+class _MutableInt(int):
+    def __new__(cls, value: int) -> _MutableInt:
+        instance = super().__new__(cls, value)
+        instance.labels = ["initial"]
+        return instance
+
+
+class _MutableStr(str):
+    def __new__(cls, value: str) -> _MutableStr:
+        instance = super().__new__(cls, value)
+        instance.labels = ["initial"]
+        return instance
+
+
+class _MutableBytes(bytes):
+    def __new__(cls, value: bytes) -> _MutableBytes:
+        instance = super().__new__(cls, value)
+        instance.labels = ["initial"]
+        return instance
+
+
+class _MutableFloat(float):
+    def __new__(cls, value: float) -> _MutableFloat:
+        instance = super().__new__(cls, value)
+        instance.labels = ["initial"]
+        return instance
+
+
+class _MutableComplex(complex):
+    def __new__(cls, value: complex) -> _MutableComplex:
+        instance = super().__new__(cls, value)
+        instance.labels = ["initial"]
+        return instance
+
+
+class _MutableHashInt(int):
+    hash_offset = 0
+
+    def __hash__(self) -> int:
+        return int(self) + type(self).hash_offset
+
+
+class _NestedMutablePayloadEnum(Enum):
+    ITEM = (("nested", frozenset({_MutableHashInt(1)})),)
+
+    def __hash__(self) -> int:
+        return hash(self.value)
+
+
 @dataclass
 class _PostInitPayload:
     labels: list[str]
@@ -1289,6 +1338,41 @@ def test_mutable_enum_payload_is_rejected_before_a_plan_can_retain_its_alias() -
             SheetConfig(
                 auto_detect=False,
                 type_hints={"enum": _MutablePayloadEnum.ITEM},  # type: ignore[dict-item]
+            ),
+            None,
+            "xlsx",
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        _MutableInt(1),
+        _MutableStr("value"),
+        _MutableBytes(b"value"),
+        _MutableFloat(1.5),
+        _MutableComplex(1 + 2j),
+    ],
+    ids=["int", "str", "bytes", "float", "complex"],
+)
+def test_mutable_primitive_subclass_is_not_retained_by_fast_path(value: object) -> None:
+    with pytest.raises(TypeError, match="opaque mutable configuration value"):
+        compile_parse_plan(
+            SheetConfig(
+                auto_detect=False,
+                type_hints={"value": value},  # type: ignore[dict-item]
+            ),
+            None,
+            "xlsx",
+        )
+
+
+def test_nested_enum_payload_rejects_mutable_scalar_subclass() -> None:
+    with pytest.raises(TypeError, match="mutable Enum configuration value"):
+        compile_parse_plan(
+            SheetConfig(
+                auto_detect=False,
+                type_hints={"enum": _NestedMutablePayloadEnum.ITEM},  # type: ignore[dict-item]
             ),
             None,
             "xlsx",
