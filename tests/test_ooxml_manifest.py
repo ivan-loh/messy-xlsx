@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import io
+import lzma
+import struct
 import zipfile
+import zlib
 from dataclasses import FrozenInstanceError
 from typing import Final
 
@@ -31,6 +34,15 @@ STRICT_CONTENT_TYPES_NS: Final = "http://purl.oclc.org/ooxml/package/content-typ
 STRICT_PACKAGE_RELATIONSHIPS_NS: Final = "http://purl.oclc.org/ooxml/package/relationships"
 STRICT_SPREADSHEET_NS: Final = "http://purl.oclc.org/ooxml/spreadsheetml/main"
 STRICT_OFFICE_RELATIONSHIPS_NS: Final = "http://purl.oclc.org/ooxml/officeDocument/relationships"
+WORKSHEET_CONTENT_TYPE: Final = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+)
+STYLES_CONTENT_TYPE: Final = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"
+)
+SHARED_STRINGS_CONTENT_TYPE: Final = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
+)
 
 
 def _content_types(workbook_type: str = "xlsx") -> bytes:
@@ -40,6 +52,10 @@ def _content_types(workbook_type: str = "xlsx") -> bytes:
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/xl/workbook.xml" ContentType="{content_type}"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="{WORKSHEET_CONTENT_TYPE}"/>
+  <Override PartName="/xl/worksheets/sheet2.xml" ContentType="{WORKSHEET_CONTENT_TYPE}"/>
+  <Override PartName="/xl/styles.xml" ContentType="{STYLES_CONTENT_TYPE}"/>
+  <Override PartName="/xl/sharedStrings.xml" ContentType="{SHARED_STRINGS_CONTENT_TYPE}"/>
 </Types>
 """.encode()
 
@@ -123,12 +139,31 @@ def _entries(
     }
 
 
-def _package(entries: dict[str, bytes]) -> bytes:
+def _package(
+    entries: dict[str, bytes],
+    compression: int = zipfile.ZIP_DEFLATED,
+) -> bytes:
     raw = io.BytesIO()
-    with zipfile.ZipFile(raw, "w", zipfile.ZIP_DEFLATED) as package:
+    with zipfile.ZipFile(raw, "w", compression) as package:
         for name, value in entries.items():
             package.writestr(name, value)
     return raw.getvalue()
+
+
+def _corrupt_compressed_member(content: bytes, member: str) -> bytes:
+    corrupted = bytearray(content)
+    with zipfile.ZipFile(io.BytesIO(content)) as package:
+        member_info = package.getinfo(member)
+    filename_size, extra_size = struct.unpack_from(
+        "<HH",
+        corrupted,
+        member_info.header_offset + 26,
+    )
+    payload_offset = member_info.header_offset + 30 + filename_size + extra_size
+    corrupted[payload_offset : payload_offset + member_info.compress_size] = (
+        b"\x00" * member_info.compress_size
+    )
+    return bytes(corrupted)
 
 
 def _build(entries: dict[str, bytes], limits: OoxmlLimits | None = None):
@@ -265,6 +300,33 @@ def test_spoofed_worksheet_relationship_type_is_rejected() -> None:
     assert raised.value.context["relationship_type"] == ("https://attacker.invalid/types/worksheet")
 
 
+def test_https_purl_spreadsheet_namespace_is_rejected() -> None:
+    entries = _entries()
+    entries["xl/workbook.xml"] = entries["xl/workbook.xml"].replace(
+        SPREADSHEET_NS.encode(),
+        b"https://purl.oclc.org/ooxml/spreadsheetml/main",
+    )
+
+    with pytest.raises(FormatError, match="namespace") as raised:
+        _build(entries)
+
+    assert raised.value.context["member"] == "xl/workbook.xml"
+
+
+def test_https_purl_critical_relationship_type_is_rejected() -> None:
+    relationships = _relationships().replace(
+        f"{OFFICE_RELATIONSHIPS_NS}/worksheet".encode(),
+        b"https://purl.oclc.org/ooxml/officeDocument/relationships/worksheet",
+    )
+
+    with pytest.raises(FormatError, match="relationship type") as raised:
+        _build(_entries(relationships=relationships))
+
+    assert raised.value.context["relationship_type"] == (
+        "https://purl.oclc.org/ooxml/officeDocument/relationships/worksheet"
+    )
+
+
 def test_strict_ooxml_namespaces_and_relationship_types_are_supported() -> None:
     entries = _entries()
     replacements = {
@@ -291,6 +353,10 @@ def test_strict_ooxml_namespaces_and_relationship_types_are_supported() -> None:
 
 def test_percent_encoded_legitimate_part_name_resolves_to_archive_member() -> None:
     entries = _entries(relationships=_relationships(first_target="worksheets/sheet%201.xml"))
+    entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+        b"/xl/worksheets/sheet1.xml",
+        b"/xl/worksheets/sheet%201.xml",
+    )
     entries["xl/worksheets/sheet%201.xml"] = entries.pop("xl/worksheets/sheet1.xml")
 
     manifest = _build(entries)
@@ -430,6 +496,56 @@ def test_relationship_target_must_name_an_archive_member() -> None:
     assert raised.value.context["member"] == "xl/worksheets/missing.xml"
 
 
+@pytest.mark.parametrize(
+    ("styles_target", "forbidden_member"),
+    [
+        ("worksheets/sheet1.xml", "xl/worksheets/sheet1.xml"),
+        ("sharedStrings.xml", "xl/sharedStrings.xml"),
+    ],
+)
+def test_styles_relationship_cannot_alias_value_bearing_part(
+    monkeypatch: pytest.MonkeyPatch,
+    styles_target: str,
+    forbidden_member: str,
+) -> None:
+    relationships = _relationships().replace(
+        b'Target="styles.xml"',
+        f'Target="{styles_target}"'.encode(),
+    )
+    content = _package(_entries(relationships=relationships))
+    opened: list[str] = []
+    original_open = zipfile.ZipFile.open
+
+    def recording_open(
+        package: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        mode: str = "r",
+        pwd: bytes | None = None,
+        *,
+        force_zip64: bool = False,
+    ):
+        member = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        opened.append(member)
+        return original_open(
+            package,
+            name,
+            mode=mode,
+            pwd=pwd,
+            force_zip64=force_zip64,
+        )
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", recording_open)
+
+    with (
+        SourceHandle(io.BytesIO(content), filename="book.xlsx") as source,
+        pytest.raises(FormatError, match="content type") as raised,
+    ):
+        build_manifest(source)
+
+    assert raised.value.context["member"] == forbidden_member
+    assert forbidden_member not in opened
+
+
 def test_external_sheet_relationship_is_never_accepted_as_internal() -> None:
     relationships = _relationships().replace(
         b'Target="worksheets/sheet1.xml"/',
@@ -488,6 +604,10 @@ def test_build_manifest_opens_source_once(monkeypatch: pytest.MonkeyPatch) -> No
         NotImplementedError("unsupported compression"),
         RuntimeError("encrypted member"),
         zipfile.BadZipFile("bad CRC"),
+        zlib.error("corrupt DEFLATE stream"),
+        lzma.LZMAError("corrupt LZMA stream"),
+        EOFError("truncated compressed stream"),
+        OSError("corrupt BZIP2 stream"),
     ],
 )
 def test_archive_member_read_errors_become_contextual_format_errors(
@@ -526,3 +646,45 @@ def test_archive_member_read_errors_become_contextual_format_errors(
 
     assert raised.value.context["member"] == "[Content_Types].xml"
     assert raised.value.__cause__ is read_error
+
+
+def test_corrupt_deflate_payload_becomes_contextual_format_error() -> None:
+    content = _corrupt_compressed_member(
+        _package(_entries()),
+        "[Content_Types].xml",
+    )
+
+    with (
+        SourceHandle(io.BytesIO(content), filename="broken.xlsx") as source,
+        pytest.raises(FormatError, match="archive member") as raised,
+    ):
+        build_manifest(source)
+
+    assert raised.value.context["member"] == "[Content_Types].xml"
+    assert isinstance(raised.value.__cause__, zlib.error)
+
+
+@pytest.mark.parametrize(
+    ("compression", "error_type"),
+    [
+        (zipfile.ZIP_BZIP2, OSError),
+        (zipfile.ZIP_LZMA, lzma.LZMAError),
+    ],
+)
+def test_corrupt_supported_compression_becomes_contextual_format_error(
+    compression: int,
+    error_type: type[Exception],
+) -> None:
+    content = _corrupt_compressed_member(
+        _package(_entries(), compression),
+        "[Content_Types].xml",
+    )
+
+    with (
+        SourceHandle(io.BytesIO(content), filename="broken.xlsx") as source,
+        pytest.raises(FormatError, match="archive member") as raised,
+    ):
+        build_manifest(source)
+
+    assert raised.value.context["member"] == "[Content_Types].xml"
+    assert isinstance(raised.value.__cause__, error_type)

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import lzma
 import re
 import xml.etree.ElementTree as ElementTree
 import zipfile
+import zlib
 from collections.abc import Iterator
 from pathlib import PurePosixPath
 from typing import IO, NoReturn
@@ -215,7 +217,15 @@ def safe_iterparse(
             "OOXML XML declarations are not allowed",
             member=member,
         ) from error
-    except (zipfile.BadZipFile, NotImplementedError, RuntimeError, OSError) as error:
+    except (
+        zipfile.BadZipFile,
+        zlib.error,
+        lzma.LZMAError,
+        EOFError,
+        NotImplementedError,
+        RuntimeError,
+        OSError,
+    ) as error:
         raise FormatError(
             "OOXML archive member cannot be read",
             member=member,

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import lzma
 import posixpath
+import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -34,28 +36,24 @@ _CONTENT_TYPES_NAMESPACES = frozenset(
     {
         "http://schemas.openxmlformats.org/package/2006/content-types",
         "http://purl.oclc.org/ooxml/package/content-types",
-        "https://purl.oclc.org/ooxml/package/content-types",
     }
 )
 _PACKAGE_RELATIONSHIPS_NAMESPACES = frozenset(
     {
         "http://schemas.openxmlformats.org/package/2006/relationships",
         "http://purl.oclc.org/ooxml/package/relationships",
-        "https://purl.oclc.org/ooxml/package/relationships",
     }
 )
 _SPREADSHEET_NAMESPACES = frozenset(
     {
         "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
         "http://purl.oclc.org/ooxml/spreadsheetml/main",
-        "https://purl.oclc.org/ooxml/spreadsheetml/main",
     }
 )
 _OFFICE_RELATIONSHIPS_NAMESPACES = frozenset(
     {
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
         "http://purl.oclc.org/ooxml/officeDocument/relationships",
-        "https://purl.oclc.org/ooxml/officeDocument/relationships",
     }
 )
 _CRITICAL_RELATIONSHIP_TYPES = {
@@ -69,6 +67,15 @@ _WORKBOOK_TYPES = {
     "application/vnd.ms-excel.sheet.macroEnabled.main+xml": "xlsm",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml": "xltx",
     "application/vnd.ms-excel.template.macroEnabled.main+xml": "xltm",
+}
+_CRITICAL_PART_CONTENT_TYPES = {
+    "worksheet": frozenset(
+        {"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"}
+    ),
+    "styles": frozenset({"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"}),
+    "sharedStrings": frozenset(
+        {"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"}
+    ),
 }
 
 
@@ -92,6 +99,13 @@ class _WorkbookSheet:
 class _WorkbookMetadata:
     date_system: str
     sheets: tuple[_WorkbookSheet, ...]
+
+
+@dataclass(frozen=True)
+class _ContentTypes:
+    workbook_type: str
+    overrides: tuple[tuple[str, str], ...]
+    defaults: tuple[tuple[str, str], ...]
 
 
 def _qualified_name(tag: str) -> tuple[str, str]:
@@ -142,7 +156,15 @@ def _validated_local_name(
 def _open_archive_member(package: ZipFile, member: str) -> IO[bytes]:
     try:
         return package.open(member)
-    except (BadZipFile, NotImplementedError, RuntimeError, OSError) as error:
+    except (
+        BadZipFile,
+        zlib.error,
+        lzma.LZMAError,
+        EOFError,
+        NotImplementedError,
+        RuntimeError,
+        OSError,
+    ) as error:
         raise FormatError(
             "OOXML archive member cannot be read",
             member=member,
@@ -159,14 +181,76 @@ def _required_member(package: ZipFile, member: str) -> None:
         ) from error
 
 
-def _read_workbook_type(package: ZipFile, limits: OoxmlLimits) -> str:
+def _content_type_part_name(part_name: str, member: str) -> str:
+    if not part_name.startswith("/") or part_name.startswith("//"):
+        raise FormatError(
+            "OOXML content type declaration has unsafe part name",
+            member=member,
+            part_name=part_name,
+        )
+    try:
+        return canonical_archive_name(part_name[1:])
+    except ValueError as error:
+        raise FormatError(
+            "OOXML content type declaration has unsafe part name",
+            member=member,
+            part_name=part_name,
+        ) from error
+
+
+def _add_default_content_type(
+    attributes: Mapping[str, str],
+    defaults: dict[str, str],
+    member: str,
+) -> None:
+    extension = attributes.get("Extension")
+    content_type = attributes.get("ContentType")
+    if not extension or not content_type:
+        raise FormatError(
+            "OOXML default content type is malformed",
+            member=member,
+        )
+    extension_key = extension.casefold()
+    if extension_key in defaults:
+        raise FormatError(
+            "OOXML package contains duplicate content type declarations",
+            member=member,
+            extension=extension,
+        )
+    defaults[extension_key] = content_type
+
+
+def _add_override_content_type(
+    attributes: Mapping[str, str],
+    overrides: dict[str, str],
+    member: str,
+) -> None:
+    part_name = attributes.get("PartName")
+    content_type = attributes.get("ContentType")
+    if not part_name or not content_type:
+        raise FormatError(
+            "OOXML override content type is malformed",
+            member=member,
+        )
+    part_key = _content_type_part_name(part_name, member)
+    if part_key in overrides:
+        raise FormatError(
+            "OOXML package contains duplicate content type declarations",
+            member=member,
+            part_name=part_name,
+        )
+    overrides[part_key] = content_type
+
+
+def _read_content_types(package: ZipFile, limits: OoxmlLimits) -> _ContentTypes:
     member = _CONTENT_TYPES_MEMBER
     _required_member(package, member)
-    workbook_types: list[str] = []
+    overrides: dict[str, str] = {}
+    defaults: dict[str, str] = {}
     namespace: str | None = None
+    namespaced_elements = frozenset({"Types", "Default", "Override"})
     with _open_archive_member(package, member) as source:
         for event, element in safe_iterparse(source, member, limits):
-            element_namespace, local_name = _qualified_name(element.tag)
             if event == "start" and namespace is None:
                 namespace = _root_namespace(
                     element.tag,
@@ -174,37 +258,39 @@ def _read_workbook_type(package: ZipFile, limits: OoxmlLimits) -> str:
                     _CONTENT_TYPES_NAMESPACES,
                     member,
                 )
-            elif local_name == "Override" and element_namespace != namespace:
-                _raise_namespace_error(member, element.tag)
-            if (
-                event == "end"
-                and local_name == "Override"
-                and (element.attrib.get("PartName") == "/xl/workbook.xml")
-            ):
-                content_type = element.attrib.get("ContentType")
-                if content_type is None:
-                    raise FormatError(
-                        "OOXML workbook content type is malformed",
-                        member=member,
-                    )
-                workbook_types.append(content_type)
+            local_name = _validated_local_name(
+                element.tag,
+                namespace,
+                namespaced_elements,
+                member,
+            )
+            if event == "end" and local_name == "Default":
+                _add_default_content_type(element.attrib, defaults, member)
+            elif event == "end" and local_name == "Override":
+                _add_override_content_type(element.attrib, overrides, member)
             if event == "end":
                 element.clear()
 
-    if len(workbook_types) != 1:
+    workbook_content_type = overrides.get(_WORKBOOK_MEMBER)
+    if workbook_content_type is None:
         raise FormatError(
             "OOXML package must declare one workbook content type",
             member=member,
-            declarations=len(workbook_types),
+            declarations=0,
         )
     try:
-        return _WORKBOOK_TYPES[workbook_types[0]]
+        workbook_type = _WORKBOOK_TYPES[workbook_content_type]
     except KeyError as error:
         raise FormatError(
             "OOXML workbook content type is unsupported",
             member=member,
-            content_type=workbook_types[0],
+            content_type=workbook_content_type,
         ) from error
+    return _ContentTypes(
+        workbook_type=workbook_type,
+        overrides=tuple(overrides.items()),
+        defaults=tuple(defaults.items()),
+    )
 
 
 def _decode_relationship_target(target: str) -> str:
@@ -345,6 +431,62 @@ def _read_relationships(
             if event == "end":
                 element.clear()
     return relationships, tuple(external_targets)
+
+
+def _content_type_for_member(content_types: _ContentTypes, member: str) -> str | None:
+    member_key = canonical_archive_name(member)
+    overrides = dict(content_types.overrides)
+    if member_key in overrides:
+        return overrides[member_key]
+    _, separator, extension = member_key.rpartition(".")
+    if not separator:
+        return None
+    return dict(content_types.defaults).get(extension.casefold())
+
+
+def _validate_critical_relationship_targets(
+    relationships: dict[str, _Relationship],
+    content_types: _ContentTypes,
+) -> None:
+    target_kinds: dict[str, str] = {}
+    for relationship in relationships.values():
+        critical_kinds = [
+            kind
+            for kind in _CRITICAL_PART_CONTENT_TYPES
+            if _relationship_has_type(relationship.relationship_type, kind)
+        ]
+        if not critical_kinds or relationship.external:
+            continue
+        target = relationship.resolved_target
+        if target is None:
+            raise FormatError(
+                "OOXML critical relationship has no internal target",
+                relationship_id=relationship.relationship_id,
+                relationship_type=relationship.relationship_type,
+            )
+        kind = critical_kinds[0]
+        content_type = _content_type_for_member(content_types, target)
+        if content_type not in _CRITICAL_PART_CONTENT_TYPES[kind]:
+            raise FormatError(
+                "OOXML critical relationship target has unexpected content type",
+                member=target,
+                relationship_id=relationship.relationship_id,
+                relationship_type=relationship.relationship_type,
+                content_type=content_type,
+                expected_part_kind=kind,
+            )
+        previous_kind = target_kinds.get(target)
+        if previous_kind is not None and previous_kind != kind:
+            raise FormatError(
+                "OOXML critical relationships assign conflicting content types",
+                member=target,
+                relationship_id=relationship.relationship_id,
+                relationship_type=relationship.relationship_type,
+                content_type=content_type,
+                expected_part_kind=kind,
+                conflicting_part_kind=previous_kind,
+            )
+        target_kinds[target] = kind
 
 
 def _relationship_for_type(
@@ -556,12 +698,13 @@ def _read_styles(
 
 def _manifest_from_package(package: ZipFile, limits: OoxmlLimits) -> WorkbookManifest:
     validate_archive(package, limits)
-    workbook_type = _read_workbook_type(package, limits)
+    content_types = _read_content_types(package, limits)
     relationships, external_targets = _read_relationships(
         package,
         _WORKBOOK_RELATIONSHIPS_MEMBER,
         limits,
     )
+    _validate_critical_relationship_targets(relationships, content_types)
     workbook = _read_workbook_xml(package, _WORKBOOK_MEMBER, limits)
     sheets = _build_sheet_descriptors(workbook, relationships)
 
@@ -574,7 +717,7 @@ def _manifest_from_package(package: ZipFile, limits: OoxmlLimits) -> WorkbookMan
     styles = _read_styles(package, styles_target, limits)
 
     return WorkbookManifest(
-        workbook_type=workbook_type,
+        workbook_type=content_types.workbook_type,
         date_system=workbook.date_system,
         sheets=sheets,
         has_shared_strings=shared_info is not None,
