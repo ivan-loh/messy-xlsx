@@ -105,19 +105,27 @@ def _workbook_to_dataframe_compat(
     workbook: MessyWorkbook,
     sheet: str | None,
 ) -> pd.DataFrame:
-    if getattr(type(workbook), "to_dataframe", None) is _MESSY_WORKBOOK_TO_DATAFRAME:
+    to_dataframe = workbook.to_dataframe
+    if (
+        getattr(to_dataframe, "__func__", None) is _MESSY_WORKBOOK_TO_DATAFRAME
+        and getattr(to_dataframe, "__self__", None) is workbook
+    ):
         return workbook._to_dataframe_compat(sheet=sheet)
     with _warnings.catch_warnings():
         _warnings.simplefilter("ignore", LegacyAPIWarning)
-        return workbook.to_dataframe(sheet=sheet)
+        return to_dataframe(sheet=sheet)
 
 
 def _table_to_dataframe_compat(table: _MessyTable) -> pd.DataFrame:
-    if getattr(type(table), "to_dataframe", None) is _MESSY_TABLE_TO_DATAFRAME:
+    to_dataframe = table.to_dataframe
+    if (
+        getattr(to_dataframe, "__func__", None) is _MESSY_TABLE_TO_DATAFRAME
+        and getattr(to_dataframe, "__self__", None) is table
+    ):
         return table._to_dataframe_compat()
     with _warnings.catch_warnings():
         _warnings.simplefilter("ignore", LegacyAPIWarning)
-        return table.to_dataframe()
+        return to_dataframe()
 
 
 def read_excel(file_path: str, sheet: str | None = None, **config_kwargs: Any) -> pd.DataFrame:

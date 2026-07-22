@@ -1,4 +1,5 @@
 import warnings
+from types import MethodType
 
 import messy_xlsx as api
 import messy_xlsx.multi_sheet as multi_sheet_module
@@ -148,5 +149,106 @@ def test_read_all_sheets_honors_override_without_duplicate_warning(
     records = _legacy_records(lambda: read_all_sheets(sample_xlsx))
 
     assert OverridingParser.called is True
+    assert len(records) == 1
+    assert records[0].filename == __file__
+
+
+def test_read_excel_honors_instance_override_without_duplicate_warning(
+    monkeypatch, sample_xlsx
+) -> None:
+    called = False
+
+    def overridden(workbook, sheet=None, config=None):
+        nonlocal called
+        called = True
+        return MessyWorkbook.to_dataframe(workbook, sheet, config)
+
+    class InstanceOverriddenWorkbook(MessyWorkbook):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.to_dataframe = MethodType(overridden, self)
+
+    monkeypatch.setattr(api, "MessyWorkbook", InstanceOverriddenWorkbook)
+
+    records = _legacy_records(lambda: read_excel(str(sample_xlsx)))
+
+    assert called is True
+    assert len(records) == 1
+    assert records[0].filename == __file__
+
+
+def test_read_excel_tables_honors_instance_override_without_duplicate_warning(
+    monkeypatch, sample_xlsx
+) -> None:
+    original_init = MessyTable.__init__
+    called = False
+
+    def overridden(table, config=None):
+        nonlocal called
+        called = True
+        return MessyTable.to_dataframe(table, config)
+
+    def instance_overriding_init(table, *args, **kwargs):
+        original_init(table, *args, **kwargs)
+        table.to_dataframe = MethodType(overridden, table)
+
+    monkeypatch.setattr(MessyTable, "__init__", instance_overriding_init)
+
+    records = _legacy_records(lambda: read_excel_tables(str(sample_xlsx)))
+
+    assert called is True
+    assert len(records) == 1
+    assert records[0].filename == __file__
+
+
+def test_read_all_sheets_honors_instance_override_without_duplicate_warning(
+    monkeypatch, sample_xlsx
+) -> None:
+    called = False
+
+    def overridden(parser):
+        nonlocal called
+        called = True
+        return MultiSheetParser.parse_all(parser)
+
+    class InstanceOverriddenParser(MultiSheetParser):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.parse_all = MethodType(overridden, self)
+
+    monkeypatch.setattr(
+        multi_sheet_module,
+        "MultiSheetParser",
+        InstanceOverriddenParser,
+    )
+
+    records = _legacy_records(lambda: read_all_sheets(sample_xlsx))
+
+    assert called is True
+    assert len(records) == 1
+    assert records[0].filename == __file__
+
+
+def test_read_excel_honors_dynamic_getattribute_dispatch_without_duplicate_warning(
+    monkeypatch, sample_xlsx
+) -> None:
+    called = False
+
+    def dynamic_to_dataframe(workbook, sheet=None, config=None):
+        nonlocal called
+        called = True
+        return MessyWorkbook.to_dataframe(workbook, sheet, config)
+
+    class DynamicWorkbook(MessyWorkbook):
+        def __getattribute__(self, name):
+            if name == "to_dataframe":
+                return MethodType(dynamic_to_dataframe, self)
+            return super().__getattribute__(name)
+
+    monkeypatch.setattr(api, "MessyWorkbook", DynamicWorkbook)
+
+    records = _legacy_records(lambda: read_excel(str(sample_xlsx)))
+
+    assert called is True
     assert len(records) == 1
     assert records[0].filename == __file__

@@ -307,11 +307,15 @@ _MULTI_SHEET_PARSER_PARSE_ALL = MultiSheetParser.parse_all
 
 
 def _parse_all_compat(parser: MultiSheetParser) -> dict[str, pd.DataFrame]:
-    if getattr(type(parser), "parse_all", None) is _MULTI_SHEET_PARSER_PARSE_ALL:
+    parse_all = parser.parse_all
+    if (
+        getattr(parse_all, "__func__", None) is _MULTI_SHEET_PARSER_PARSE_ALL
+        and getattr(parse_all, "__self__", None) is parser
+    ):
         return parser._parse_all_compat()
     with _warnings.catch_warnings():
         _warnings.simplefilter("ignore", LegacyAPIWarning)
-        return parser.parse_all()
+        return parse_all()
 
 
 def read_all_sheets(
