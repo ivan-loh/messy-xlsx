@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Generic, TypeVar
 
 import openpyxl
 import pandas as pd
@@ -70,23 +70,50 @@ def _operation_error(message: str) -> _ActiveOperationError:
     return error
 
 
+_OwnedResourceT = TypeVar("_OwnedResourceT")
+
+
+class _CloseOnceOwner(Generic[_OwnedResourceT]):
+    """Proxy one closeable reader through a shared close-once boundary."""
+
+    def __init__(self, resource: _OwnedResourceT) -> None:
+        self._resource: _OwnedResourceT | None = resource
+        self._closed = False
+
+    def __getattr__(self, name: str) -> Any:
+        resource = self._resource
+        if resource is None:
+            raise AttributeError(name)
+        return getattr(resource, name)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        resource = self._resource
+        self._resource = None
+        if resource is not None:
+            _close_if_present(resource)
+
+
 class _StreamOperationLease:
     """Weak workbook lease used while constructing and owning one child stream."""
 
     def __init__(self, workbook: "MessyWorkbook", token: object) -> None:
         self._workbook_ref = weakref.ref(workbook)
         self._token = token
-        self._partial: object | None = None
+        self._partial: _CloseOnceOwner[Any] | None = None
         self._stream_ref: weakref.ReferenceType[Any] | None = None
         self._bound = False
         self._released = False
 
-    def own(self, partial: object) -> object:
+    def own(self, partial: _OwnedResourceT) -> _CloseOnceOwner[_OwnedResourceT]:
         """Register a partially opened reader for construction-failure cleanup."""
         if self._released or self._bound or self._partial is not None:
             raise RuntimeError("Stream operation lease already owns a resource")
-        self._partial = partial
-        return partial
+        owner = _CloseOnceOwner(partial)
+        self._partial = owner
+        return owner
 
     def bind(self, stream: Any) -> Any:
         """Register a stream while retaining lease-owned reader cleanup."""

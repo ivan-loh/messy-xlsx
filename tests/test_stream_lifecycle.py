@@ -89,6 +89,20 @@ class _EventResource:
             raise self._error
 
 
+class _SecondCloseFailureReader:
+    def __init__(self) -> None:
+        self._batches = iter([_batch()])
+        self.close_calls = 0
+
+    def read_next_batch(self) -> pa.RecordBatch | None:
+        return next(self._batches, None)
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_calls > 1:
+            raise AssertionError("reader closed more than once")
+
+
 def _batch() -> pa.RecordBatch:
     return pa.record_batch([[1, 2]], names=["value"])
 
@@ -603,14 +617,14 @@ def test_failed_stale_bind_closes_unstarted_adapter_and_distinct_owned_reader_on
     monkeypatch.setattr(workbook, "_end_operation", record_end)
     lease = workbook._stream_operation()
     reader = _EventResource("reader", [])
+    owned_reader = lease.own(reader)
 
     def reader_batches() -> Iterator[pa.RecordBatch]:
         try:
             yield _batch()
         finally:
-            reader.close()
+            owned_reader.close()
 
-    lease.own(reader)
     stream = BatchStream(reader_batches(), _batch().schema, lease.release)
     workbook._end_operation(lease._token)
     new_token = workbook._begin_operation()
@@ -635,14 +649,15 @@ def test_explicit_close_before_first_adapter_read_closes_owned_reader_once(
     workbook = MessyWorkbook(sample_xlsx)
     reader = _EventResource("reader", [])
 
-    def reader_batches() -> Iterator[pa.RecordBatch]:
-        try:
-            yield _batch()
-        finally:
-            reader.close()
-
     with workbook._stream_operation() as lease:
-        lease.own(reader)
+        owned_reader = lease.own(reader)
+
+        def reader_batches() -> Iterator[pa.RecordBatch]:
+            try:
+                yield _batch()
+            finally:
+                owned_reader.close()
+
         stream = BatchStream(reader_batches(), _batch().schema, lease.release)
         lease.bind(stream)
 
@@ -652,6 +667,42 @@ def test_explicit_close_before_first_adapter_read_closes_owned_reader_once(
     assert reader.calls == 1
     assert workbook._active_operation_token is None
     assert workbook._active_stream is None
+    workbook.close()
+
+
+@pytest.mark.parametrize("termination", ["exhaust", "early"])
+def test_started_adapter_and_lease_share_one_underlying_reader_close(
+    sample_xlsx: Any,
+    termination: str,
+) -> None:
+    workbook = MessyWorkbook(sample_xlsx)
+    reader = _SecondCloseFailureReader()
+
+    with workbook._stream_operation() as lease:
+        owned_reader = lease.own(reader)
+
+        def reader_batches() -> Iterator[pa.RecordBatch]:
+            try:
+                while True:
+                    batch = owned_reader.read_next_batch()
+                    if batch is None:
+                        return
+                    yield batch
+            finally:
+                owned_reader.close()
+
+        stream = BatchStream(reader_batches(), _batch().schema, lease.release)
+        lease.bind(stream)
+
+    assert next(stream).equals(_batch())
+    if termination == "exhaust":
+        with pytest.raises(StopIteration):
+            next(stream)
+    else:
+        stream.close()
+
+    assert reader.close_calls == 1
+    assert workbook._active_operation_token is None
     workbook.close()
 
 
