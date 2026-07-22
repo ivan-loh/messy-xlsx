@@ -16,6 +16,7 @@ from openpyxl.styles.numbers import BUILTIN_FORMATS, is_date_format
 from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
 from messy_xlsx._source import SourceHandle
+from messy_xlsx.cache import PathIdentity
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.ooxml.models import (
     DEFAULT_LIMITS,
@@ -82,6 +83,8 @@ _CRITICAL_PART_CONTENT_TYPES = {
         {"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"}
     ),
 }
+_MAX_EXCEL_ROW = 1_048_576
+_MAX_EXCEL_COLUMN = 16_384
 
 
 @dataclass(frozen=True)
@@ -599,7 +602,15 @@ def _build_sheet_descriptors(
     relationships: dict[str, _Relationship],
 ) -> tuple[SheetDescriptor, ...]:
     descriptors: list[SheetDescriptor] = []
+    seen_names: set[str] = set()
     for sheet in workbook.sheets:
+        if sheet.name in seen_names:
+            raise FormatError(
+                "OOXML workbook contains duplicate sheet name",
+                member=_WORKBOOK_MEMBER,
+                sheet=sheet.name,
+            )
+        seen_names.add(sheet.name)
         try:
             relationship = relationships[sheet.relationship_id]
         except KeyError as error:
@@ -764,7 +775,12 @@ def build_manifest(
     return manifest
 
 
-def _one_based_int(value: str | None, member: str, attribute: str) -> int:
+def _one_based_int(
+    value: str | None,
+    member: str,
+    attribute: str,
+    maximum: int,
+) -> int:
     try:
         parsed = int(value or "")
     except ValueError as error:
@@ -774,9 +790,9 @@ def _one_based_int(value: str | None, member: str, attribute: str) -> int:
             attribute=attribute,
             value=value,
         ) from error
-    if parsed < 1:
+    if parsed < 1 or parsed > maximum:
         raise FormatError(
-            "OOXML worksheet contains malformed coordinate metadata",
+            "OOXML worksheet contains out-of-bounds coordinate metadata",
             member=member,
             attribute=attribute,
             value=value,
@@ -811,6 +827,12 @@ def _coordinate(value: str | None, member: str) -> tuple[int, int]:
             member=member,
             coordinate=value,
         ) from error
+    if row > _MAX_EXCEL_ROW or column > _MAX_EXCEL_COLUMN:
+        raise FormatError(
+            "OOXML worksheet contains out-of-bounds cell coordinate",
+            member=member,
+            coordinate=value,
+        )
     return row, column
 
 
@@ -829,7 +851,14 @@ def _range(value: str | None, member: str) -> tuple[int, int, int, int]:
             member=member,
             coordinate=value,
         )
-    return int(min_row), int(min_col), int(max_row), int(max_col)
+    parsed = int(min_row), int(min_col), int(max_row), int(max_col)
+    if parsed[2] > _MAX_EXCEL_ROW or parsed[3] > _MAX_EXCEL_COLUMN:
+        raise FormatError(
+            "OOXML worksheet contains out-of-bounds range coordinate",
+            member=member,
+            coordinate=value,
+        )
+    return parsed
 
 
 def _xml_boolean(value: str | None) -> bool:
@@ -837,7 +866,12 @@ def _xml_boolean(value: str | None) -> bool:
 
 
 class ManifestReader:
-    """Build workbook metadata eagerly and sheet metadata on first request."""
+    """Build workbook metadata eagerly and sheet metadata on first request.
+
+    Path-backed readers reject identity changes across their lifetime. Caller-owned
+    seekable streams remain live views and must not be mutated while this reader is
+    in use; non-seekable streams are snapshotted by :class:`SourceHandle`.
+    """
 
     def __init__(
         self,
@@ -849,10 +883,14 @@ class ManifestReader:
         self._limits = limits
         self._on_member_open = on_member_open
         self.workbook = build_manifest(source, limits)
+        self._path_identity = (
+            PathIdentity.before(source.path) if source.path is not None else None
+        )
         self._sheets: dict[str, SheetManifest] = {}
 
     def sheet(self, name: str) -> SheetManifest:
         """Return one cached sheet index, parsing its XML at most once."""
+        self._assert_source_unchanged()
         cached = self._sheets.get(name)
         if cached is not None:
             return cached
@@ -861,8 +899,19 @@ class ManifestReader:
         except StopIteration as error:
             raise KeyError(name) from error
         parsed = self._parse_sheet(descriptor)
+        self._assert_source_unchanged()
         self._sheets[name] = parsed
         return parsed
+
+    def _assert_source_unchanged(self) -> None:
+        identity = self._path_identity
+        path = self._source.path
+        if identity is not None and path is not None and not identity.unchanged(path):
+            raise FormatError(
+                "OOXML source changed during lazy metadata access",
+                file_path=self._source.description,
+                operation="read worksheet metadata",
+            )
 
     def _parse_sheet(self, descriptor: SheetDescriptor) -> SheetManifest:
         member = descriptor.target
@@ -945,7 +994,9 @@ class ManifestReader:
                 and local_name == "row"
                 and _xml_boolean(element.attrib.get("hidden"))
             ):
-                row = _one_based_int(element.attrib.get("r"), member, "r")
+                row = _one_based_int(
+                    element.attrib.get("r"), member, "r", _MAX_EXCEL_ROW
+                )
                 hidden_rows.append(Interval(row, row))
             elif (
                 event == "end"
@@ -954,8 +1005,12 @@ class ManifestReader:
             ):
                 hidden_columns.append(
                     Interval(
-                        _one_based_int(element.attrib.get("min"), member, "min"),
-                        _one_based_int(element.attrib.get("max"), member, "max"),
+                        _one_based_int(
+                            element.attrib.get("min"), member, "min", _MAX_EXCEL_COLUMN
+                        ),
+                        _one_based_int(
+                            element.attrib.get("max"), member, "max", _MAX_EXCEL_COLUMN
+                        ),
                     )
                 )
             elif event == "end" and local_name == "mergeCell":

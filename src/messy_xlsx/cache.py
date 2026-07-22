@@ -161,7 +161,10 @@ class StructureCache:
             return None
 
         key = self._make_key(file_path, sheet, identity, variant)
-        return self._cache.get(key)
+        cached = self._cache.get(key)
+        if cached is None or not identity.unchanged(file_path):
+            return None
+        return cached
 
     def put(
         self,

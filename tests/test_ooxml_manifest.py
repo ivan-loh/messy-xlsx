@@ -201,6 +201,15 @@ def test_manifest_preserves_order_state_and_metadata_without_cell_values() -> No
     assert not hasattr(manifest, "shared_strings")
 
 
+def test_manifest_rejects_duplicate_sheet_names_before_name_lookup() -> None:
+    workbook = _workbook().replace(b'name="First"', b'name="Second"')
+
+    with pytest.raises(FormatError, match="duplicate sheet name") as raised:
+        _build(_entries(workbook=workbook))
+
+    assert raised.value.context["sheet"] == "Second"
+
+
 def test_manifest_models_are_frozen_after_source_borrow_closes() -> None:
     raw = io.BytesIO(_package(_entries()))
     raw.seek(7)

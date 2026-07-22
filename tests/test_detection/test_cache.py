@@ -294,6 +294,25 @@ class TestStructureCache:
         assert (current.inode, current.ctime_ns) != (original.inode, original.ctime_ns)
         assert cache.get(file_path, "Sheet1") is None
 
+    def test_get_rechecks_identity_after_cache_lookup(self, temp_dir, monkeypatch):
+        cache = StructureCache(maxsize=10)
+        file_path = temp_dir / "changing-during-get.xlsx"
+        file_path.write_bytes(b"before")
+        info = _make_structure_info()
+        assert cache.put(file_path, "Sheet1", info)
+        original_get = cache._cache.get
+
+        def replace_during_lookup(key):
+            cached = original_get(key)
+            replacement = temp_dir / "replacement.xlsx"
+            replacement.write_bytes(b"after!")
+            replacement.replace(file_path)
+            return cached
+
+        monkeypatch.setattr(cache._cache, "get", replace_during_lookup)
+
+        assert cache.get(file_path, "Sheet1") is None
+
     def test_put_skips_insertion_when_pre_analysis_identity_changed(self, temp_dir):
         cache = StructureCache(maxsize=10)
         file_path = temp_dir / "changing.xlsx"
