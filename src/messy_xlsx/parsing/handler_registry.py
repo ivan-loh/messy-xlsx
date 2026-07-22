@@ -566,15 +566,28 @@ class _BehaviorFingerprinter(_FingerprintBudget):
         return ("global", type(value), id(value))
 
     def class_behavior_token(self, value_type: type[object]) -> object:
-        """Fingerprint one class only after bounding its raw namespace sort."""
-        namespace = vars(value_type)
-        self._preflight(len(namespace))
+        """Fingerprint one class's exact MRO and bounded raw behavior."""
+        try:
+            type_namespace = type.__dict__
+            value_metaclass = type(value_type)
+            namespace = type_namespace["__dict__"].__get__(value_type, value_metaclass)
+            bases = type_namespace["__bases__"].__get__(value_type, value_metaclass)
+            mro = type_namespace["__mro__"].__get__(value_type, value_metaclass)
+        except BaseException as error:
+            raise _FingerprintError("class behavior cannot be inspected safely") from error
+        self._preflight(len(namespace) + len(bases) + len(mro))
+        self._charge(len(bases) + len(mro))
         attributes: list[tuple[str, object]] = []
         for name, value in sorted(namespace.items()):
             if name in _NON_BEHAVIOR_CLASS_ATTRIBUTES:
                 continue
             attributes.append((name, self.token(value)))
-        return tuple(attributes)
+        return (
+            "class-behavior",
+            tuple(id(base) for base in bases),
+            tuple(id(owner) for owner in mro),
+            tuple(attributes),
+        )
 
 
 def _component_token(
@@ -697,29 +710,47 @@ class HandlerRegistry:
 
     def _uses_builtin_components(self) -> bool:
         """Return whether no caller extension can be bypassed by new backends."""
-        if (
-            self._builtin_handler_instances is None
-            or self._builtin_component_token is None
-            or _CANONICAL_CLASS_BEHAVIOR is None
-        ):
-            return False
         try:
+            if type(self) is not HandlerRegistry:
+                return False
+            state = vars(self)
+            if (
+                type(state) is not dict
+                or len(state) != len(_REGISTRY_STATE_NAMES)
+                or any(name not in state for name in _REGISTRY_STATE_NAMES)
+            ):
+                return False
+            handlers = dict.__getitem__(state, "handlers")
+            if type(handlers) is not list or len(handlers) != len(_BUILTIN_HANDLER_TYPES):
+                return False
+            builtin_handlers = dict.__getitem__(state, "_builtin_handler_instances")
+            if type(builtin_handlers) is not tuple or len(builtin_handlers) != len(handlers):
+                return False
+            detector = dict.__getitem__(state, "detector")
+            builtin_detector = dict.__getitem__(state, "_builtin_detector_instance")
+            builtin_component_token = dict.__getitem__(state, "_builtin_component_token")
+            if builtin_component_token is None or _CANONICAL_CLASS_BEHAVIOR is None:
+                return False
             return (
-                type(self) is HandlerRegistry
-                and set(vars(self)) == _REGISTRY_STATE_NAMES
-                and tuple(type(handler) for handler in self.handlers) == _BUILTIN_HANDLER_TYPES
-                and len(self.handlers) == len(self._builtin_handler_instances)
-                and all(
-                    current is original
-                    for current, original in zip(
-                        self.handlers,
-                        self._builtin_handler_instances,
+                all(
+                    type(handler) is expected
+                    for handler, expected in zip(
+                        handlers,
+                        _BUILTIN_HANDLER_TYPES,
                         strict=True,
                     )
                 )
-                and type(self.detector) is FormatDetector
-                and self.detector is self._builtin_detector_instance
-                and _component_token(self.handlers, self.detector) == self._builtin_component_token
+                and all(
+                    current is original
+                    for current, original in zip(
+                        handlers,
+                        builtin_handlers,
+                        strict=True,
+                    )
+                )
+                and type(detector) is FormatDetector
+                and detector is builtin_detector
+                and _component_token(handlers, detector) == builtin_component_token
                 and _class_behavior_token(_CANONICAL_BEHAVIOR_TYPES) == _CANONICAL_CLASS_BEHAVIOR
             )
         except Exception:

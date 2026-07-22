@@ -159,3 +159,103 @@ def test_oversized_transitive_project_type_fails_closed_before_sort(
 
     with pytest.raises(registry_module._FingerprintError, match="budget exceeded"):
         registry_module._BehaviorFingerprinter()._project_global_reference_token(value_type)
+
+
+def test_canonical_class_fingerprint_bypasses_hostile_metaclass_hooks() -> None:
+    virtual_hook_calls: list[str] = []
+
+    class HostileMeta(type):
+        def __getattribute__(cls, name: str) -> object:
+            if name in {"__bases__", "__dict__", "__mro__"}:
+                virtual_hook_calls.append(name)
+                raise AssertionError("fingerprint invoked a virtual metaclass hook")
+            return type.__getattribute__(cls, name)
+
+        @property
+        def __dict__(cls) -> object:
+            virtual_hook_calls.append("__dict__ property")
+            raise AssertionError("fingerprint invoked a metaclass property")
+
+        @property
+        def __bases__(cls) -> object:
+            virtual_hook_calls.append("__bases__ property")
+            raise AssertionError("fingerprint invoked a metaclass property")
+
+        @property
+        def __mro__(cls) -> object:
+            virtual_hook_calls.append("__mro__ property")
+            raise AssertionError("fingerprint invoked a metaclass property")
+
+    cycle: list[object] = []
+    cycle.append(cycle)
+
+    class HostileBehavior(metaclass=HostileMeta):
+        behavior = cycle
+
+    virtual_hook_calls.clear()
+    registry_module._class_behavior_token((HostileBehavior,))
+
+    assert virtual_hook_calls == []
+
+
+def test_non_exact_handler_list_fails_closed_without_iteration() -> None:
+    class TrackingHandlerList(list[object]):
+        def __init__(self, values: list[object]) -> None:
+            super().__init__(values)
+            self.iter_calls = 0
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.iter_calls += 1
+            return super().__iter__()
+
+    registry = registry_module.HandlerRegistry()
+    handlers = TrackingHandlerList(registry.handlers)
+    registry.handlers = handlers  # type: ignore[assignment]
+
+    assert registry._uses_builtin_components() is False
+    assert handlers.iter_calls == 0
+
+
+def test_oversized_handler_list_fails_closed_before_scanning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = registry_module.HandlerRegistry()
+    handler = registry.handlers[0]
+    registry.handlers = [handler] * (registry_module._MAX_FINGERPRINT_NODES + 1)
+    handler_type_calls = 0
+
+    def tracking_type(value: object) -> type[object]:
+        nonlocal handler_type_calls
+        if value is handler:
+            handler_type_calls += 1
+        return builtins.type(value)
+
+    monkeypatch.setattr(registry_module, "type", tracking_type, raising=False)
+
+    assert registry._uses_builtin_components() is False
+    assert handler_type_calls == 0
+
+
+def test_oversized_registry_state_fails_closed_before_key_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = registry_module.HandlerRegistry()
+    state = vars(registry)
+    state.update(
+        {
+            f"unexpected_state_{index}": None
+            for index in range(registry_module._MAX_FINGERPRINT_NODES + 1)
+        }
+    )
+    state_set_calls = 0
+
+    def tracking_set(*args: object) -> set[object]:
+        nonlocal state_set_calls
+        if args and args[0] is state:
+            state_set_calls += 1
+        return builtins.set(*args)
+
+    monkeypatch.setattr(registry_module, "set", tracking_set, raising=False)
+
+    assert registry._uses_builtin_components() is False
+    assert state_set_calls == 0
