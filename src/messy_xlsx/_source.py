@@ -397,7 +397,7 @@ class SourceHandle:
                         _FallbackBlockReason.SOURCE_OWNERSHIP,
                     )
                     raise
-                if _cleanup_takes_precedence(restore_error):
+                if _cleanup_takes_precedence(restore_error, consumer_error):
                     _mark_fallback_blocked(
                         restore_error,
                         _FallbackBlockReason.SOURCE_OWNERSHIP,
@@ -455,7 +455,7 @@ class SourceHandle:
                     f"source cleanup failed: {_type_name(cleanup_error)}",
                 )
                 raise
-            if _contains_process_failure(cleanup_error):
+            if _contains_process_failure(cleanup_error, exclude=exc_value):
                 _attach_operation_failure(cleanup_error, exc_value)
                 _safe_add_note(
                     cleanup_error,
@@ -473,6 +473,9 @@ class SourceHandle:
             )
 
 
-def _cleanup_takes_precedence(error: BaseException) -> bool:
+def _cleanup_takes_precedence(
+    error: BaseException,
+    primary_error: BaseException,
+) -> bool:
     """Return whether source teardown must replace an operation failure."""
-    return _contains_process_failure(error)
+    return _contains_process_failure(error, exclude=primary_error)

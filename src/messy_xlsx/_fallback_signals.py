@@ -67,9 +67,13 @@ def _is_fallback_blocked(error: BaseException) -> bool:
     return _fallback_block_reason(error) is not None
 
 
-def _contains_process_failure(error: BaseException) -> bool:
+def _contains_process_failure(
+    error: BaseException,
+    *,
+    exclude: BaseException | None = None,
+) -> bool:
     """Return whether a bounded nested tree contains a process-level failure."""
-    candidates, complete = _bounded_exception_graph(error)
+    candidates, complete = _bounded_exception_graph(error, exclude=exclude)
     if not complete:
         return True
     for candidate in candidates:
@@ -95,14 +99,19 @@ def _blocks_backend_retry(error: BaseException) -> bool:
 
 def _bounded_exception_graph(
     error: BaseException,
+    *,
+    exclude: BaseException | None = None,
 ) -> tuple[tuple[BaseException, ...], bool]:
     """Return a cycle-safe exception graph and whether traversal was complete."""
     stack = [error]
     seen: set[int] = set()
     candidates: list[BaseException] = []
+    excluded_identity = id(exclude) if exclude is not None else None
     while stack:
         candidate = stack.pop()
         identity = id(candidate)
+        if identity == excluded_identity:
+            continue
         if identity in seen:
             continue
         if len(seen) >= _MAX_EXCEPTION_TREE_NODES:

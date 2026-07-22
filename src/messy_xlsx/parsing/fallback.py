@@ -389,7 +389,7 @@ def _close_reader(
                 traceback=cleanup_traceback,
                 cleanup_failed=True,
             )
-        if cleanup_overrides or _cleanup_takes_precedence(cleanup_error):
+        if cleanup_overrides or _cleanup_takes_precedence(cleanup_error, primary_error):
             _safe_add_note(
                 cleanup_error,
                 f"backend operation also failed: {_type_name(primary_error)}",
@@ -417,9 +417,12 @@ def _close_reader(
     return _Attempt(suppressed=suppressed and primary_error is not None)
 
 
-def _cleanup_takes_precedence(error: BaseException) -> bool:
+def _cleanup_takes_precedence(
+    error: BaseException,
+    primary_error: BaseException,
+) -> bool:
     """Return whether teardown must replace an operation failure."""
-    return _contains_process_failure(error)
+    return _contains_process_failure(error, exclude=primary_error)
 
 
 def _is_suppressible_parse_failure(error: BaseException) -> bool:

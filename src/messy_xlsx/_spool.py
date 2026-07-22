@@ -53,9 +53,12 @@ def _storage_error(error: OSError) -> _SpoolStorageError:
     return _SpoolStorageError(str(error))
 
 
-def _cleanup_takes_precedence(error: BaseException) -> bool:
+def _cleanup_takes_precedence(
+    error: BaseException,
+    primary_error: BaseException,
+) -> bool:
     """Return whether source teardown must replace an operation failure."""
-    return _contains_process_failure(error)
+    return _contains_process_failure(error, exclude=primary_error)
 
 
 _CleanupWinner = tuple[BaseException, TracebackType | None]
@@ -71,7 +74,7 @@ def _record_cleanup_failure(
     if winner is not None:
         _safe_add_note(winner[0], f"{label}: {_type_name(cleanup_error)}")
         return winner
-    if _contains_process_failure(cleanup_error):
+    if _contains_process_failure(cleanup_error, exclude=primary_error):
         _mark_fallback_blocked(
             cleanup_error,
             _FallbackBlockReason.SOURCE_OWNERSHIP,
@@ -237,7 +240,7 @@ def _restore_position(
         stream.seek(entry)
     except BaseException as restore_error:
         if primary_error is not None:
-            if _cleanup_takes_precedence(restore_error):
+            if _cleanup_takes_precedence(restore_error, primary_error):
                 _mark_fallback_blocked(
                     restore_error,
                     _FallbackBlockReason.SOURCE_OWNERSHIP,
@@ -266,7 +269,7 @@ def _restore_position(
             try:
                 completed.close()
             except BaseException as cleanup_error:
-                if _cleanup_takes_precedence(cleanup_error):
+                if _cleanup_takes_precedence(cleanup_error, restore_error):
                     _mark_fallback_blocked(
                         cleanup_error,
                         _FallbackBlockReason.SOURCE_OWNERSHIP,
