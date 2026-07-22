@@ -95,7 +95,7 @@
 | 6 | Immutable plans, reader contracts, and router | 2, 5 | [x] |
 | 7 | Fastexcel materialized Arrow reader | 6 | [x] |
 | 8 | Coordinate-aware Arrow transforms | 5, 7 | [x] |
-| 9 | Closable stream lifecycle | 3, 6 | [ ] |
+| 9 | Closable stream lifecycle | 3, 6 | [x] |
 | 10 | Openpyxl bounded-row OOXML reader | 8, 9 | [ ] |
 | 11 | Streaming normalization and schema enforcement | 9, 10 | [ ] |
 | 12 | Public Arrow, batch, and pandas-chunk APIs | 7, 9, 11 | [ ] |
@@ -1975,7 +1975,7 @@ git commit -m "feat: transform Arrow batches by worksheet coordinates"
 - Produces: public `BatchStream`, `DataFrameChunkStream`, and `SheetStream`.
 - Each stream is one-shot, context-managed, idempotently closable, owner-aware, and registered as the workbook's sole active operation.
 
-- [ ] **Step 1: Write failing lifecycle contract tests**
+- [x] **Step 1: Write failing lifecycle contract tests**
 
 ```python
 # tests/test_stream_lifecycle.py
@@ -2022,7 +2022,7 @@ Run: `.venv/bin/pytest tests/test_stream_lifecycle.py -q`
 
 Expected: collection fails because public stream types do not exist.
 
-- [ ] **Step 2: Implement one generic lifecycle core and typed wrappers**
+- [x] **Step 2: Implement one generic lifecycle core and typed wrappers**
 
 ```python
 # src/messy_xlsx/parsing/streams.py
@@ -2112,17 +2112,17 @@ class SheetStream(_ResultStream["SheetResult"]):
     """One-shot stream of ordered sheet results with deterministic cleanup."""
 ```
 
-- [ ] **Step 3: Add workbook active-operation ownership**
+- [x] **Step 3: Add workbook active-operation ownership**
 
 Add `_active_stream`, `_closed`, `_begin_operation()`, and `_end_operation()` to `MessyWorkbook`. Validate configuration and reserve the operation before returning a stream. `MessyWorkbook.close()` calls `invalidate_from_owner()` on the child stream first. A child manually closed returns the reservation exactly once. A stream invalidated by parent closure raises `RuntimeError("MessyWorkbook is closed")` on further reads; an explicitly closed stream raises `StopIteration`.
 
-- [ ] **Step 4: Run lifecycle and failure injection tests**
+- [x] **Step 4: Run lifecycle and failure injection tests**
 
 Run: `.venv/bin/pytest tests/test_stream_lifecycle.py tests/test_resource_lifecycle.py tests/test_source_handle.py -q`
 
 Expected: all tests pass, including early close and primary-exception preservation.
 
-- [ ] **Step 5: Commit the stream lifecycle**
+- [x] **Step 5: Commit the stream lifecycle**
 
 ```bash
 git add src/messy_xlsx/parsing/streams.py src/messy_xlsx/workbook.py tests/test_stream_lifecycle.py tests/test_resource_lifecycle.py
