@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections import deque
 from copy import deepcopy
-from dataclasses import FrozenInstanceError, fields, replace
+from dataclasses import FrozenInstanceError, dataclass, fields, replace
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -983,6 +985,174 @@ def test_recursive_snapshots_are_deterministic_across_mapping_and_set_order() ->
         None,
         "xlsx",
     )
+
+
+@dataclass
+class _MutablePayload:
+    labels: list[str]
+    metadata: dict[str, set[int]]
+
+
+class _MutableObject:
+    def __init__(self, values: list[str]) -> None:
+        self.values = values
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _MutableObject) and self.values == other.values
+
+
+class _MutablePayloadEnum(Enum):
+    ITEM: ClassVar[list[str]] = ["initial"]
+
+
+def test_plan_thaws_fresh_values_with_original_supported_container_kinds() -> None:
+    dataclass_value = _MutablePayload(["alpha"], {"codes": {1, 2}})
+    object_value = _MutableObject(["original"])
+    nested = {
+        "list": [1, {"nested": [2]}],
+        "tuple": (3, [4]),
+        "set": {5, 6},
+        "frozenset": frozenset({7, 8}),
+        "bytearray": bytearray(b"mutable"),
+        "memoryview": memoryview(bytearray(b"view")),
+        "dataclass": dataclass_value,
+        "object": object_value,
+    }
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"payload": nested},  # type: ignore[dict-item]
+            drop_conditions=[{"column": "value", "value": object_value}],
+        ),
+        None,
+        "xlsx",
+    )
+    hash(plan)
+
+    nested["list"][1]["nested"].append(99)
+    nested["tuple"][1].append(99)
+    nested["set"].add(99)
+    nested["bytearray"].extend(b"!")
+    nested["memoryview"][0] = ord("X")
+    dataclass_value.labels.append("changed")
+    dataclass_value.metadata["codes"].add(99)
+    object_value.values.append("changed")
+
+    first = plan.thaw_type_hints()["payload"]
+    second = plan.thaw_type_hints()["payload"]
+    assert isinstance(first, dict)
+    assert isinstance(first["list"], list)
+    assert isinstance(first["tuple"], tuple)
+    assert isinstance(first["set"], set)
+    assert isinstance(first["frozenset"], frozenset)
+    assert isinstance(first["bytearray"], bytearray)
+    assert isinstance(first["memoryview"], memoryview)
+    assert first["dataclass"] == _MutablePayload(["alpha"], {"codes": {1, 2}})
+    assert first["object"] == _MutableObject(["original"])
+    assert first["object"] is not object_value
+    assert first["object"] is not second["object"]
+    assert plan.thaw_drop_conditions()[0][1] == _MutableObject(["original"])
+
+    first["list"].append("consumer mutation")
+    first["dataclass"].labels.append("consumer mutation")
+    assert second["list"] == [1, {"nested": [2]}]
+    assert second["dataclass"].labels == ["alpha"]
+
+
+def test_mixed_mapping_keys_have_deterministic_plan_equality_and_hash() -> None:
+    first_hints = {
+        1: "integer",
+        "1": "string",
+        (1, frozenset({2, 3})): "nested tuple",
+        frozenset({4, 5}): "frozenset",
+        None: "none",
+    }
+    second_hints = dict(reversed(tuple(first_hints.items())))
+
+    first = compile_parse_plan(
+        SheetConfig(auto_detect=False, type_hints=first_hints),  # type: ignore[arg-type]
+        None,
+        "xlsx",
+    )
+    second = compile_parse_plan(
+        SheetConfig(auto_detect=False, type_hints=second_hints),  # type: ignore[arg-type]
+        None,
+        "xlsx",
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first.thaw_type_hints() == first_hints
+
+
+def test_streaming_plan_is_stable_when_configuration_mutates_after_creation() -> None:
+    nested_hint = {"labels": ["gross"], "codes": {1, 2}}
+    config = SheetConfig(
+        auto_detect=False,
+        type_hints={"amount": nested_hint},  # type: ignore[dict-item]
+    )
+    plan = compile_parse_plan(
+        config,
+        None,
+        "xlsx",
+        output_mode=OutputMode.STREAMING,
+        batch_size=100,
+    )
+
+    nested_hint["labels"].append("net")
+    nested_hint["codes"].add(3)
+
+    assert plan.thaw_type_hints() == {"amount": {"labels": ["gross"], "codes": {1, 2}}}
+
+
+def test_tagged_snapshots_distinguish_list_tuple_set_and_frozenset() -> None:
+    plans = [
+        compile_parse_plan(
+            SheetConfig(auto_detect=False, type_hints={"value": value}),  # type: ignore[dict-item]
+            None,
+            "xlsx",
+        )
+        for value in ([1], (1,), {1}, frozenset({1}))
+    ]
+
+    assert len(set(plans)) == 4
+
+
+def test_mutable_enum_payload_is_rejected_before_a_plan_can_retain_its_alias() -> None:
+    with pytest.raises(TypeError, match="mutable Enum configuration value"):
+        compile_parse_plan(
+            SheetConfig(
+                auto_detect=False,
+                type_hints={"enum": _MutablePayloadEnum.ITEM},  # type: ignore[dict-item]
+            ),
+            None,
+            "xlsx",
+        )
+
+
+def test_unknown_unsupported_mutable_value_is_rejected_before_backend_io() -> None:
+    with pytest.raises(TypeError, match="unsupported mutable configuration value"):
+        compile_parse_plan(
+            SheetConfig(
+                auto_detect=False,
+                type_hints={"queue": deque([1, 2])},  # type: ignore[dict-item]
+            ),
+            None,
+            "xlsx",
+        )
+
+
+def test_type_and_function_hints_are_preserved_by_thaw_projection() -> None:
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"type": list, "callable": len},  # type: ignore[dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+
+    assert plan.thaw_type_hints() == {"type": list, "callable": len}
 
 
 def test_parse_plan_preserves_identity_sensitive_drop_condition_values() -> None:

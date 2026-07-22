@@ -7,9 +7,11 @@ projections consumed by the existing parsing and normalization layers.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Set
+from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
+from inspect import isbuiltin, isfunction, ismethoddescriptor
+from itertools import pairwise
 from typing import Any, Final
 
 from messy_xlsx.enums import (
@@ -65,8 +67,60 @@ _COMMA_DECIMAL_SPACE_THOUSANDS: Final = frozenset(
 class FrozenDataclassValue:
     """Deterministic immutable projection of a supported dataclass value."""
 
-    type_name: str
+    dataclass_type: type[Any]
     field_values: tuple[tuple[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenMapping:
+    items: tuple[tuple[Any, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenList:
+    items: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenTuple:
+    items: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenSet:
+    items: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenFrozenSet:
+    items: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenBytearray:
+    value: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenMemoryview:
+    value: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenFloat:
+    hexadecimal: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenComplex:
+    real: _FrozenFloat
+    imaginary: _FrozenFloat
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenObject:
+    object_type: type[Any]
+    attribute_values: tuple[tuple[str, Any], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,13 +146,25 @@ class ConfigSnapshot:
             ),
         )
 
+    def thaw_type_hints(self) -> dict[Any, Any]:
+        """Return a fresh deep mutable projection for legacy normalization."""
+        return {_thaw(key): _thaw(value) for key, value in self.type_hints}
+
+    def thaw_column_renames(self) -> dict[Any, Any]:
+        """Return a fresh deep mutable projection for pandas rename."""
+        return {_thaw(key): _thaw(value) for key, value in self.column_renames}
+
+    def thaw_drop_conditions(self) -> list[tuple[Any, Any]]:
+        """Return fresh comparison values for legacy row filtering."""
+        return [(_thaw(column), _thaw(value)) for column, value in self.drop_conditions]
+
 
 @dataclass(frozen=True, slots=True)
 class ParsePlan:
     """Frozen internal decisions for one sheet parse.
 
-    Configuration containers are projected to tuples. Arbitrary condition
-    payload objects retain their identity so comparison behavior is unchanged.
+    Configuration values are projected to immutable tagged snapshots. Legacy
+    consumers receive fresh deep projections through the ``thaw_*`` methods.
     """
 
     # Projection for format handlers.
@@ -143,6 +209,18 @@ class ParsePlan:
             data_only=self.data_only,
             auto_detect_header=self.auto_detect_header,
         )
+
+    def thaw_type_hints(self) -> dict[Any, Any]:
+        """Return fresh type-hint values in their legacy container kinds."""
+        return {_thaw(key): _thaw(value) for key, value in self.type_hints}
+
+    def thaw_column_renames(self) -> dict[Any, Any]:
+        """Return fresh column rename values for the legacy pandas path."""
+        return {_thaw(key): _thaw(value) for key, value in self.column_renames}
+
+    def thaw_drop_conditions(self) -> list[tuple[Any, Any]]:
+        """Return fresh condition values for the legacy pandas path."""
+        return [(_thaw(column), _thaw(value)) for column, value in self.drop_conditions]
 
 
 def requires_structure_analysis(
@@ -238,39 +316,223 @@ def _validated_batch_size(
 def _freeze_mapping(value: Mapping[Any, Any]) -> tuple[tuple[Any, Any], ...]:
     """Return a deterministic immutable mapping projection."""
     frozen_items = [(_freeze(key), _freeze(item)) for key, item in value.items()]
-    return tuple(sorted(frozen_items, key=lambda pair: _ordering_key(pair[0])))
+    return _order_mapping_items(frozen_items)
 
 
-def _freeze(value: Any) -> Any:
+def _freeze(value: Any, active: set[int] | None = None) -> Any:  # noqa: C901
     """Recursively snapshot supported mutable values without retaining aliases."""
-    if isinstance(value, Mapping):
-        return _freeze_mapping(value)
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    if isinstance(value, Set) and not isinstance(value, (str, bytes, bytearray)):
-        frozen_items = (_freeze(item) for item in value)
-        return tuple(sorted(frozen_items, key=_ordering_key))
-    if is_dataclass(value) and not isinstance(value, type):
-        value_type = type(value)
-        return FrozenDataclassValue(
-            type_name=f"{value_type.__module__}.{value_type.__qualname__}",
-            field_values=tuple(
-                (field.name, _freeze(getattr(value, field.name))) for field in fields(value)
-            ),
+    if active is None:
+        active = set()
+    if isinstance(value, Enum):
+        _validate_enum(value)
+        return value
+    if value is None or isinstance(value, (bool, int, str, bytes)):
+        return value
+    if isinstance(value, float):
+        return _FrozenFloat(value.hex())
+    if isinstance(value, complex):
+        return _FrozenComplex(
+            _FrozenFloat(value.real.hex()),
+            _FrozenFloat(value.imag.hex()),
         )
-    if isinstance(value, (bytearray, memoryview)):
-        return bytes(value)
+    if (
+        isinstance(value, type)
+        or isfunction(value)
+        or isbuiltin(value)
+        or ismethoddescriptor(value)
+    ):
+        return value
+
+    identity = id(value)
+    if identity in active:
+        raise TypeError("cyclic configuration values are not supported")
+    active.add(identity)
+    try:
+        if type(value) is dict:
+            items = [(_freeze(key, active), _freeze(item, active)) for key, item in value.items()]
+            return _FrozenMapping(_order_mapping_items(items))
+        if type(value) is list:
+            return _FrozenList(tuple(_freeze(item, active) for item in value))
+        if type(value) is tuple:
+            return _FrozenTuple(tuple(_freeze(item, active) for item in value))
+        if type(value) is set:
+            set_items = tuple(_freeze(item, active) for item in value)
+            return _FrozenSet(_order_set_items(set_items))
+        if type(value) is frozenset:
+            frozenset_items = tuple(_freeze(item, active) for item in value)
+            return _FrozenFrozenSet(_order_set_items(frozenset_items))
+        if type(value) is bytearray:
+            return _FrozenBytearray(bytes(value))
+        if type(value) is memoryview:
+            return _FrozenMemoryview(value.tobytes())
+        if is_dataclass(value) and not isinstance(value, type):
+            return FrozenDataclassValue(
+                dataclass_type=type(value),
+                field_values=tuple(
+                    (field.name, _freeze(getattr(value, field.name), active))
+                    for field in fields(value)
+                ),
+            )
+
+        attributes = _object_attributes(value)
+        if attributes:
+            return _FrozenObject(
+                object_type=type(value),
+                attribute_values=tuple(
+                    (name, _freeze(item, active)) for name, item in sorted(attributes.items())
+                ),
+            )
+        try:
+            hash(value)
+        except TypeError as error:
+            raise TypeError(
+                f"unsupported mutable configuration value: {type(value).__name__}"
+            ) from error
+        return value
+    finally:
+        active.remove(identity)
+
+
+def _thaw(value: Any) -> Any:  # noqa: C901
+    """Return a fresh legacy value from a tagged immutable snapshot."""
+    if isinstance(value, _FrozenMapping):
+        return {_thaw(key): _thaw(item) for key, item in value.items}
+    if isinstance(value, _FrozenList):
+        return [_thaw(item) for item in value.items]
+    if isinstance(value, _FrozenTuple):
+        return tuple(_thaw(item) for item in value.items)
+    if isinstance(value, _FrozenSet):
+        return {_thaw(item) for item in value.items}
+    if isinstance(value, _FrozenFrozenSet):
+        return frozenset(_thaw(item) for item in value.items)
+    if isinstance(value, _FrozenBytearray):
+        return bytearray(value.value)
+    if isinstance(value, _FrozenMemoryview):
+        return memoryview(bytearray(value.value))
+    if isinstance(value, _FrozenFloat):
+        return float.fromhex(value.hexadecimal)
+    if isinstance(value, _FrozenComplex):
+        return complex(_thaw(value.real), _thaw(value.imaginary))
+    if isinstance(value, FrozenDataclassValue):
+        instance = object.__new__(value.dataclass_type)
+        for name, item in value.field_values:
+            object.__setattr__(instance, name, _thaw(item))
+        return instance
+    if isinstance(value, _FrozenObject):
+        instance = object.__new__(value.object_type)
+        for name, item in value.attribute_values:
+            object.__setattr__(instance, name, _thaw(item))
+        return instance
     return value
 
 
-def _ordering_key(value: Any) -> tuple[str, str]:
-    """Order supported frozen values without requiring cross-type comparison."""
-    value_type = type(value)
+def _order_mapping_items(items: list[tuple[Any, Any]]) -> tuple[tuple[Any, Any], ...]:
+    """Order frozen mapping entries and reject ambiguous structural keys."""
+    keyed_items = [(_stable_token(key), key, item) for key, item in items]
+    keyed_items.sort(key=lambda item: item[0])
+    for previous, current in pairwise(keyed_items):
+        if previous[0] == current[0] and previous[1] != current[1]:
+            raise TypeError("configuration mapping keys cannot be ordered deterministically")
+    return tuple((key, item) for _, key, item in keyed_items)
+
+
+def _order_set_items(items: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Order frozen set entries and reject ambiguous structural values."""
+    keyed_items = sorted((_stable_token(item), item) for item in items)
+    for previous, current in pairwise(keyed_items):
+        if previous[0] == current[0] and previous[1] != current[1]:
+            raise TypeError("configuration set values cannot be ordered deterministically")
+    return tuple(item for _, item in keyed_items)
+
+
+def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
+    """Build a deterministic structural ordering token without repr or ids."""
+    if value is None:
+        return ("none",)
     if isinstance(value, Enum):
-        representation = f"{value_type.__module__}.{value_type.__qualname__}:{value.value!r}"
-    else:
-        representation = repr(value)
-    return f"{value_type.__module__}.{value_type.__qualname__}", representation
+        value_type = type(value)
+        return ("enum", value_type.__module__, value_type.__qualname__, value.name)
+    if isinstance(value, bool):
+        return ("bool", int(value))
+    if isinstance(value, int):
+        return ("int", str(value))
+    if isinstance(value, str):
+        return ("str", value)
+    if isinstance(value, bytes):
+        return ("bytes", value.hex())
+    if isinstance(value, _FrozenFloat):
+        return ("float", value.hexadecimal)
+    if isinstance(value, _FrozenComplex):
+        return ("complex", _stable_token(value.real), _stable_token(value.imaginary))
+    if isinstance(value, _FrozenMapping):
+        return (
+            "mapping",
+            tuple((_stable_token(key), _stable_token(item)) for key, item in value.items),
+        )
+    if isinstance(value, _FrozenList):
+        return ("list", tuple(_stable_token(item) for item in value.items))
+    if isinstance(value, _FrozenTuple):
+        return ("tuple", tuple(_stable_token(item) for item in value.items))
+    if isinstance(value, _FrozenSet):
+        return ("set", tuple(_stable_token(item) for item in value.items))
+    if isinstance(value, _FrozenFrozenSet):
+        return ("frozenset", tuple(_stable_token(item) for item in value.items))
+    if isinstance(value, _FrozenBytearray):
+        return ("bytearray", value.value.hex())
+    if isinstance(value, _FrozenMemoryview):
+        return ("memoryview", value.value.hex())
+    if isinstance(value, _FrozenObject):
+        return (
+            "object",
+            value.object_type.__module__,
+            value.object_type.__qualname__,
+            tuple((name, _stable_token(item)) for name, item in value.attribute_values),
+        )
+    if isinstance(value, FrozenDataclassValue):
+        return (
+            "dataclass",
+            value.dataclass_type.__module__,
+            value.dataclass_type.__qualname__,
+            tuple((name, _stable_token(item)) for name, item in value.field_values),
+        )
+    if (
+        isinstance(value, type)
+        or isfunction(value)
+        or isbuiltin(value)
+        or ismethoddescriptor(value)
+    ):
+        return ("symbol", value.__module__, value.__qualname__)
+    raise TypeError(
+        f"configuration value cannot be ordered deterministically: {type(value).__name__}"
+    )
+
+
+def _validate_enum(value: Enum) -> None:
+    """Allow only state-free enum members whose payload is deeply immutable."""
+    state_names = set(vars(value)) - {"_name_", "_value_", "__objclass__", "_sort_order_"}
+    if state_names or not _is_deeply_immutable(value.value):
+        raise TypeError(f"mutable Enum configuration value: {type(value).__name__}.{value.name}")
+
+
+def _is_deeply_immutable(value: Any) -> bool:
+    if value is None or isinstance(value, (bool, int, float, complex, str, bytes, type)):
+        return True
+    if isinstance(value, tuple | frozenset):
+        return all(_is_deeply_immutable(item) for item in value)
+    return isfunction(value) or isbuiltin(value) or ismethoddescriptor(value)
+
+
+def _object_attributes(value: Any) -> dict[str, Any]:
+    """Collect mutable instance state without consulting value representations."""
+    attributes = dict(vars(value)) if hasattr(value, "__dict__") else {}
+    for value_type in type(value).__mro__:
+        slots = value_type.__dict__.get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for name in slots:
+            if name not in {"__dict__", "__weakref__"} and hasattr(value, name):
+                attributes.setdefault(name, getattr(value, name))
+    return attributes
 
 
 def _resolve_header_rows(

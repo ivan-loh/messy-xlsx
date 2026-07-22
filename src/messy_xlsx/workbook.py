@@ -366,7 +366,7 @@ class MessyWorkbook:
 
             df = pipeline.normalize(
                 df,
-                semantic_hints=dict(plan.type_hints),
+                semantic_hints=plan.thaw_type_hints(),
                 skip_steps=list(plan.skip_normalization_steps),
             )
 
@@ -376,7 +376,7 @@ class MessyWorkbook:
 
         # Apply user renames (user overrides take precedence)
         if plan.column_renames:
-            df = df.rename(columns=dict(plan.column_renames))
+            df = df.rename(columns=plan.thaw_column_renames())
 
         # Preserve the legacy behavior where disabling normalization also
         # bypasses row filters. S15 owns any change to that public contract.
@@ -398,7 +398,7 @@ class MessyWorkbook:
 
         # Drop rows matching column-value conditions
         if plan.drop_conditions and not df.empty:
-            for col, value in plan.drop_conditions:
+            for col, value in plan.thaw_drop_conditions():
                 if col is not None and col in df.columns:
                     df = df[df[col] != value].reset_index(drop=True)
 
