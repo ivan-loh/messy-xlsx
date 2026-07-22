@@ -407,6 +407,55 @@ def test_range_batches_keep_one_physical_schema_before_global_inference() -> Non
     assert _result_contract(result)[2] == ((None,), (2.0,))
 
 
+def test_range_operation_never_emits_incompatible_schema_for_late_column() -> None:
+    operation = _transform().open(_plan(cell_range="A1:B2", header_rows=0))
+    first = operation.push(
+        CoordinateBatch(
+            batch=pa.record_batch([[11]], names=["0"]),
+            row_numbers=pa.array([1], type=pa.int64()),
+            column_numbers=(1,),
+        )
+    )
+    try:
+        second = operation.push(
+            CoordinateBatch(
+                batch=pa.record_batch([[21], [22]], names=["0", "1"]),
+                row_numbers=pa.array([2], type=pa.int64()),
+                column_numbers=(1, 2),
+            )
+        )
+    except CoordinateCompatibilityError as error:
+        assert str(error) == "coordinate input schema changed across batches"
+    else:
+        table = pa.Table.from_batches(
+            [batch.batch for batch in (*first, *second, *operation.finish())]
+        )
+        assert table.to_pydict() == {"0": [11, 21], "1": [None, 22]}
+
+
+def test_coordinate_operation_rejects_field_type_drift_before_output() -> None:
+    operation = _transform().open(_plan(header_rows=0))
+    operation.push(
+        CoordinateBatch(
+            batch=pa.record_batch([[11]], names=["0"]),
+            row_numbers=pa.array([1], type=pa.int64()),
+            column_numbers=(1,),
+        )
+    )
+
+    with pytest.raises(
+        CoordinateCompatibilityError,
+        match=r"^coordinate input schema changed across batches$",
+    ):
+        operation.push(
+            CoordinateBatch(
+                batch=pa.record_batch([["text"]], names=["0"]),
+                row_numbers=pa.array([2], type=pa.int64()),
+                column_numbers=(1,),
+            )
+        )
+
+
 def test_malformed_range_is_rejected_when_operation_opens() -> None:
     with pytest.raises(
         ValueError,

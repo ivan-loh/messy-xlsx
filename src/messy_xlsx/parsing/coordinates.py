@@ -148,6 +148,8 @@ class CoordinateOperation:
         "_finished",
         "_hidden_interval_cursor",
         "_identities",
+        "_input_column_numbers",
+        "_input_schema",
         "_last_row",
         "_merge_cursor",
         "_merge_ranges",
@@ -194,6 +196,8 @@ class CoordinateOperation:
         self._buffer: deque[CoordinateBatch] = deque()
         self._buffered_rows = 0
         self._identities: tuple[ColumnIdentity, ...] | None = None
+        self._input_column_numbers: tuple[int, ...] | None = None
+        self._input_schema: pa.Schema | None = None
         self._template: CoordinateBatch | None = None
         self._emitted_any = False
         self._hidden_interval_cursor = 0
@@ -234,6 +238,13 @@ class CoordinateOperation:
             raise ValueError("row coordinate count does not match batch rows")
         if len(batch.column_numbers) != batch.batch.num_columns:
             raise ValueError("column coordinate count does not match batch columns")
+        if self._input_schema is None:
+            self._input_column_numbers = batch.column_numbers
+            self._input_schema = batch.batch.schema
+        elif batch.column_numbers != self._input_column_numbers or not batch.batch.schema.equals(
+            self._input_schema, check_metadata=True
+        ):
+            raise CoordinateCompatibilityError("coordinate input schema changed across batches")
 
         rows = batch.row_numbers
         if rows.null_count:
