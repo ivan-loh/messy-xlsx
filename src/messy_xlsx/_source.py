@@ -391,15 +391,31 @@ class SourceHandle:
             try:
                 caller_stream.seek(entry_position)
             except BaseException as restore_error:
-                if consumer_error is None or _cleanup_takes_precedence(restore_error):
+                if consumer_error is None:
                     _mark_fallback_blocked(
                         restore_error,
                         _FallbackBlockReason.SOURCE_OWNERSHIP,
                     )
                     raise
+                if _cleanup_takes_precedence(restore_error):
+                    _mark_fallback_blocked(
+                        restore_error,
+                        _FallbackBlockReason.SOURCE_OWNERSHIP,
+                    )
+                    _attach_operation_failure(restore_error, consumer_error)
+                    _safe_add_note(
+                        restore_error,
+                        f"source operation also failed: {_type_name(consumer_error)}",
+                    )
+                    raise
                 _mark_fallback_blocked(
                     consumer_error,
                     _FallbackBlockReason.SOURCE_OWNERSHIP,
+                )
+                _attach_cleanup_failure(consumer_error, restore_error)
+                _safe_add_note(
+                    consumer_error,
+                    f"cursor restoration also failed: {_type_name(restore_error)}",
                 )
 
     def _ensure_open(self) -> None:

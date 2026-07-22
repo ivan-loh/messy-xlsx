@@ -12,6 +12,8 @@ from types import TracebackType
 from typing import BinaryIO, cast
 
 from messy_xlsx._fallback_signals import (
+    _attach_cleanup_failure,
+    _attach_operation_failure,
     _contains_process_failure,
     _exception_traceback,
     _FallbackBlockReason,
@@ -240,11 +242,17 @@ def _restore_position(
                     restore_error,
                     _FallbackBlockReason.SOURCE_OWNERSHIP,
                 )
+                _attach_operation_failure(restore_error, primary_error)
+                _safe_add_note(
+                    restore_error,
+                    f"source operation also failed: {_type_name(primary_error)}",
+                )
                 raise
             _mark_fallback_blocked(
                 primary_error,
                 _FallbackBlockReason.SOURCE_OWNERSHIP,
             )
+            _attach_cleanup_failure(primary_error, restore_error)
             _safe_add_note(
                 primary_error,
                 f"cursor restoration also failed: {_type_name(restore_error)}",
@@ -263,11 +271,13 @@ def _restore_position(
                         cleanup_error,
                         _FallbackBlockReason.SOURCE_OWNERSHIP,
                     )
+                    _attach_operation_failure(cleanup_error, restore_error)
                     _safe_add_note(
                         cleanup_error,
                         f"cursor restoration also failed: {_type_name(restore_error)}",
                     )
                     raise
+                _attach_cleanup_failure(restore_error, cleanup_error)
                 _safe_add_note(
                     restore_error,
                     f"temporary spool cleanup also failed: {_type_name(cleanup_error)}",

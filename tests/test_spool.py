@@ -160,6 +160,65 @@ def test_initial_source_seek_failure_is_marked_without_replacement(
     assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
 
 
+@pytest.mark.parametrize(
+    ("restore_error", "cleanup_wins"),
+    [
+        (OSError("restore failed"), False),
+        (ExceptionGroup("outer", [OSError("nested restore failed")]), False),
+        (MemoryError("capacity"), True),
+        (ExceptionGroup("outer", [MemoryError("nested capacity")]), True),
+        (BaseExceptionGroup("outer", [KeyboardInterrupt()]), True),
+    ],
+)
+def test_spool_restoration_diagnostics_preserve_the_exact_precedence_winner(
+    restore_error: BaseException,
+    cleanup_wins: bool,
+) -> None:
+    primary_error = OSError("source read failed")
+
+    class ReadAndRestoreFailure(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__(b"source")
+            self.read_failed = False
+
+        def read(self, _size: int = -1) -> bytes:
+            self.read_failed = True
+            raise primary_error
+
+        def seek(self, position: int, whence: int = 0) -> int:
+            if self.read_failed and position == 2 and whence == 0:
+                raise restore_error
+            return super().seek(position, whence)
+
+    source = ReadAndRestoreFailure()
+    io.BytesIO.seek(source, 2)
+    expected = restore_error if cleanup_wins else primary_error
+
+    with pytest.raises(type(expected)) as captured:
+        ReplaySpool.from_stream(source)
+
+    assert captured.value is expected
+    traceback = BaseException.__getattribute__(captured.value, "__traceback__")
+    frame_names: list[str] = []
+    while traceback is not None:
+        frame_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    assert ("seek" if cleanup_wins else "read") in frame_names
+    if cleanup_wins:
+        assert captured.value.backend_context == {  # type: ignore[attr-defined]
+            "operation_failure": {"type": "OSError"}
+        }
+        assert captured.value.__notes__ == ["source operation also failed: OSError"]
+    else:
+        assert captured.value.backend_context == {  # type: ignore[attr-defined]
+            "cleanup_failure": {"type": type(restore_error).__name__}
+        }
+        assert captured.value.__notes__ == [
+            f"cursor restoration also failed: {type(restore_error).__name__}"
+        ]
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
+
+
 def test_spill_file_is_removed_when_a_later_source_read_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

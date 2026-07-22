@@ -667,6 +667,10 @@ def test_consumer_failure_remains_primary_when_cursor_restoration_also_fails() -
         raise primary_error
 
     assert captured.value is primary_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "cleanup_failure": {"type": "OSError"}
+    }
+    assert captured.value.__notes__ == ["cursor restoration also failed: OSError"]
     assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
 
 
@@ -694,6 +698,10 @@ def test_process_level_cursor_restoration_failure_wins_over_consumer_error(
         raise RuntimeError("consumer failed")
 
     assert captured.value is restore_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "operation_failure": {"type": "RuntimeError"}
+    }
+    assert captured.value.__notes__ == ["source operation also failed: RuntimeError"]
     assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
 
 
