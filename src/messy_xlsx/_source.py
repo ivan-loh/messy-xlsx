@@ -379,10 +379,24 @@ class SourceHandle:
             return
 
         caller_stream = self._require_stream()
-        entry_position = caller_stream.tell()
+        try:
+            entry_position = caller_stream.tell()
+        except BaseException as source_error:
+            _mark_fallback_blocked(
+                source_error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
+            raise
         consumer_error: BaseException | None = None
         try:
-            caller_stream.seek(0)
+            try:
+                caller_stream.seek(0)
+            except BaseException as source_error:
+                _mark_fallback_blocked(
+                    source_error,
+                    _FallbackBlockReason.SOURCE_OWNERSHIP,
+                )
+                raise
             yield caller_stream
         except BaseException as error:
             consumer_error = error
