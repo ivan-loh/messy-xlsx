@@ -4,12 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
 import pyarrow as pa
-
-if TYPE_CHECKING:
-    from messy_xlsx.parsing.parse_plan import ParsePlan
 
 
 class OutputMode(StrEnum):
@@ -52,8 +49,8 @@ class ParseMetrics:
 class MaterializedArrowReader(Protocol):
     """A backend that produces one complete Arrow table."""
 
-    def read_table(self, plan: ParsePlan) -> pa.Table:
-        """Materialize the requested sheet according to *plan*."""
+    def read_table(self) -> pa.Table:
+        """Materialize the requested sheet using the bound parse plan."""
         ...
 
 

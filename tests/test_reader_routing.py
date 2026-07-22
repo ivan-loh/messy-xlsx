@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import MethodType
 from typing import Any
 
 import pyarrow as pa
 import pytest
+from mypy import api as mypy_api
 
 import messy_xlsx.parsing.handler_registry as handler_registry_module
 from messy_xlsx._fallback_signals import (
@@ -15,7 +17,12 @@ from messy_xlsx._fallback_signals import (
 )
 from messy_xlsx._source import SourceHandle
 from messy_xlsx.detection.format_detector import FormatDetector
-from messy_xlsx.parsing.contracts import BackendKind, OutputMode, ParseMetrics
+from messy_xlsx.parsing.contracts import (
+    BackendKind,
+    MaterializedArrowReader,
+    OutputMode,
+    ParseMetrics,
+)
 from messy_xlsx.parsing.csv_handler import CSVHandler, MetadataRowDetector
 from messy_xlsx.parsing.fallback import FallbackCoordinator
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
@@ -631,6 +638,60 @@ class _RaisingSchemaDiscoveryReader:
 
 def _batch(value: int) -> pa.RecordBatch:
     return pa.record_batch({"value": [value]})
+
+
+def test_bound_materialized_reader_protocol_matches_coordinator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = Path(__file__).parents[1]
+    contract_check = tmp_path / "bound_reader_contract.py"
+    contract_check.write_text(
+        """\
+from typing import Any
+
+from messy_xlsx.parsing.contracts import MaterializedArrowReader
+
+
+class BoundReader:
+    def read_table(self) -> Any:
+        return object()
+
+
+reader: MaterializedArrowReader = BoundReader()
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MYPYPATH", str(project_root / "src"))
+    stdout, stderr, exit_status = mypy_api.run(
+        [
+            "--config-file",
+            str(project_root / "pyproject.toml"),
+            "--ignore-missing-imports",
+            "--follow-imports=silent",
+            "--cache-dir",
+            str(tmp_path / ".mypy_cache"),
+            str(contract_check),
+        ]
+    )
+    assert exit_status == 0, f"{stdout}{stderr}"
+
+    calls: list[str] = []
+
+    class BoundReader:
+        def read_table(self) -> pa.Table:
+            calls.append("read")
+            return pa.table({"value": [1]})
+
+    reader: MaterializedArrowReader = BoundReader()
+
+    def classifier(_error: Exception) -> bool:
+        pytest.fail("zero-argument reader protocol mismatch reached the classifier")
+
+    result = FallbackCoordinator(classifier).materialize(lambda: reader, pytest.fail)
+
+    assert result.to_pydict() == {"value": [1]}
+    assert calls == ["read"]
 
 
 def test_materialized_fallback_closes_primary_before_opening_fallback() -> None:

@@ -1430,7 +1430,7 @@ git commit -m "perf: index OOXML sheet metadata lazily"
 - Modify: `tests/test_parse_plan.py`
 
 **Interfaces:**
-- Produces: `OutputMode`, `BackendKind`, `ReaderDecision`, `ParseMetrics`, `MaterializedArrowReader`, and `StreamingBatchReader`.
+- Produces: `OutputMode`, `BackendKind`, `ReaderDecision`, `ParseMetrics`, `MaterializedArrowReader`, and `StreamingBatchReader`; materialized reader factories bind the immutable `ParsePlan`, so the operation protocol is `read_table() -> pa.Table`.
 - Produces: `compile_parse_plan(config, structure, format_type, output_mode: OutputMode, batch_size: int | None) -> ParsePlan` with a deep immutable configuration snapshot.
 - Produces: `BackendRouter.select(workbook_context) -> ReaderDecision`.
 - Produces: `FallbackCoordinator.materialize()` and `FallbackCoordinator.batches()` with cleanup-before-fallback and no retry after observable output.
@@ -1515,7 +1515,7 @@ class ParseMetrics:
 
 
 class MaterializedArrowReader(Protocol):
-    def read_table(self, plan: "ParsePlan") -> pa.Table:
+    def read_table(self) -> pa.Table:
         raise NotImplementedError
 
 
@@ -1678,7 +1678,7 @@ git commit -m "refactor: route parsers by output capability"
 - Modify: `tests/test_architecture_contracts.py`
 
 **Interfaces:**
-- Produces: `FastexcelMaterializedReader.read_table(plan: ParsePlan) -> pa.Table` using the workbook-scoped `FastexcelSession`.
+- Produces: `FastexcelMaterializedReader(session, sheet, plan).read_table() -> pa.Table` using the workbook-scoped `FastexcelSession`; the factory binds the immutable `ParsePlan` when it constructs the operation reader.
 - Produces: `LegacyDataFrameAdapter.to_dataframe(table, plan) -> pd.DataFrame`, the only built-in bridge for existing materialized APIs.
 - Preserves: the legacy `XLSXHandler.parse() -> pd.DataFrame` SPI through an adapter.
 
@@ -1716,7 +1716,9 @@ def test_ordinary_materialization_never_loads_openpyxl(sample_xlsx, basic_parse_
     with SourceHandle(sample_xlsx) as source:
         session = FastexcelSession(source)
         try:
-            table = FastexcelMaterializedReader(session, "Data").read_table(basic_parse_plan)
+            table = FastexcelMaterializedReader(
+                session, "Data", basic_parse_plan
+            ).read_table()
         finally:
             session.close()
     assert table.num_rows > 0
@@ -1739,12 +1741,13 @@ import pyarrow as pa
 
 
 class FastexcelMaterializedReader:
-    def __init__(self, session, sheet: str, metrics=None) -> None:
+    def __init__(self, session, sheet: str, plan, metrics=None) -> None:
         self._session = session
         self._sheet = sheet
+        self._plan = plan
         self._metrics = metrics
 
-    def read_table(self, plan) -> pa.Table:
+    def read_table(self) -> pa.Table:
         batch = self._session.materialize(self._sheet)
         if not isinstance(batch, pa.RecordBatch):
             batch = batch.to_arrow()
