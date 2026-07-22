@@ -91,7 +91,7 @@
 | 2 | Legacy warning and API classification | 1 | [x] |
 | 3 | Spillable source lifecycle | 1 | [x] |
 | 4 | OOXML archive security and eager manifest | 3 | [x] |
-| 5 | Lazy sheet metadata, interval indexes, and bounded structure sampling | 4 | [ ] |
+| 5 | Lazy sheet metadata, interval indexes, and bounded structure sampling | 4 | [x] |
 | 6 | Immutable plans, reader contracts, and router | 2, 5 | [ ] |
 | 7 | Fastexcel materialized Arrow reader | 6 | [ ] |
 | 8 | Coordinate-aware Arrow transforms | 5, 7 | [ ] |
@@ -1047,7 +1047,7 @@ git commit -m "feat: add hardened OOXML manifest"
 - Produces: closable `FastexcelSession` that opens one workbook and serves bounded samples plus one materialization per selected sheet.
 - Produces: `PathIdentity.before(path)`, `PathIdentity.unchanged(path)`, and cache insertion only after a stable pre/post stat comparison.
 
-- [ ] **Step 1: Write failing interval, lazy-load, and cache-identity tests**
+- [x] **Step 1: Write failing interval, lazy-load, and cache-identity tests**
 
 ```python
 # tests/test_ooxml_sheet_metadata.py
@@ -1079,7 +1079,7 @@ Run: `.venv/bin/pytest tests/test_ooxml_sheet_metadata.py tests/test_detection/t
 
 Expected: failures because interval and lazy reader types do not exist.
 
-- [ ] **Step 2: Add immutable interval and sheet models**
+- [x] **Step 2: Add immutable interval and sheet models**
 
 ```python
 @dataclass(frozen=True, order=True)
@@ -1129,7 +1129,7 @@ class SheetManifest:
 
 Normalize and merge overlapping adjacent intervals before constructing `IntervalIndex` so lookup remains logarithmic and memory scales with ranges, not covered cells.
 
-- [ ] **Step 3: Implement one lazy SAX-style worksheet metadata pass**
+- [x] **Step 3: Implement one lazy SAX-style worksheet metadata pass**
 
 Use `ElementTree.iterparse()` over the selected worksheet member. On `end` events, record row/column hidden intervals, merge references, formula presence and at most 256 formula coordinates, declared dimension, and maximum observed cell coordinate. Clear each element immediately after processing it.
 
@@ -1150,7 +1150,7 @@ class ManifestReader:
         return self._sheets[name]
 ```
 
-- [ ] **Step 4: Strengthen path cache identity**
+- [x] **Step 4: Strengthen path cache identity**
 
 ```python
 @dataclass(frozen=True)
@@ -1176,7 +1176,7 @@ class PathIdentity:
 
 Make `StructureCache.put()` accept the identity captured before analysis and skip insertion when `identity.unchanged(path)` is false.
 
-- [ ] **Step 5: Characterize and replace full-frame structure analysis**
+- [x] **Step 5: Characterize and replace full-frame structure analysis**
 
 ```python
 # tests/test_detection/test_structure_sampler.py
@@ -1403,13 +1403,13 @@ class FastexcelSession:
 handle. The bounded sample is allowed to become a bounded pandas frame for the
 existing detector; only complete discarded DataFrames are forbidden.
 
-- [ ] **Step 6: Run focused metadata, sampler, and cache tests**
+- [x] **Step 6: Run focused metadata, sampler, and cache tests**
 
 Run: `.venv/bin/pytest tests/test_ooxml_sheet_metadata.py tests/test_detection/test_structure_sampler.py tests/test_detection/test_cache.py tests/test_detection/test_structure_analyzer.py -q`
 
 Expected: all tests pass and worksheet metadata is parsed only on first request per sheet.
 
-- [ ] **Step 7: Commit lazy metadata, sampler, and cache identity**
+- [x] **Step 7: Commit lazy metadata, sampler, and cache identity**
 
 ```bash
 git add src/messy_xlsx/ooxml src/messy_xlsx/detection/structure_analyzer.py src/messy_xlsx/detection/structure_sampler.py src/messy_xlsx/detection/locale_detector.py src/messy_xlsx/parsing/fastexcel_session.py src/messy_xlsx/cache.py tests/test_ooxml_sheet_metadata.py tests/test_detection/test_structure_sampler.py tests/test_detection/test_cache.py
