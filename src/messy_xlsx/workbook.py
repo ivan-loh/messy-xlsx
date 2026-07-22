@@ -28,6 +28,7 @@ from messy_xlsx.parsing.parse_plan import (
     requires_structure_analysis,
 )
 from messy_xlsx.sheet import MessySheet
+from messy_xlsx.warnings import warn_legacy
 
 # ============================================================================
 # Core
@@ -208,6 +209,14 @@ class MessyWorkbook:
         config: SheetConfig | None = None,
     ) -> pd.DataFrame:
         """Convert a sheet to a pandas DataFrame."""
+        warn_legacy("MessyWorkbook.to_dataframe")
+        return self._to_dataframe_compat(sheet, config)
+
+    def _to_dataframe_compat(
+        self,
+        sheet: str | None = None,
+        config: SheetConfig | None = None,
+    ) -> pd.DataFrame:
         sheet_name = sheet or self._sheet_names[0]
         return self._parse_sheet(sheet_name, config)
 
@@ -228,6 +237,14 @@ class MessyWorkbook:
             If include_errors is False (default): dict mapping sheet name to DataFrame.
             If include_errors is True: tuple of (results_dict, errors_list).
         """
+        warn_legacy("MessyWorkbook.to_dataframes")
+        return self._to_dataframes_compat(config, include_errors)
+
+    def _to_dataframes_compat(
+        self,
+        config: SheetConfig | None = None,
+        include_errors: bool = False,
+    ) -> dict[str, pd.DataFrame] | tuple[dict[str, pd.DataFrame], list[SheetError]]:
         result = {}
         errors: list[SheetError] = []
         for name in self._sheet_names:

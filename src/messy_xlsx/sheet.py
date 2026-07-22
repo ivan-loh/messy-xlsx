@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from messy_xlsx.models import CellValue, SheetConfig, StructureInfo, TableInfo
+from messy_xlsx.warnings import warn_legacy
 
 if TYPE_CHECKING:
     from messy_xlsx.workbook import MessyWorkbook
@@ -59,6 +60,11 @@ class MessyTable:
 
     def to_dataframe(self, config: SheetConfig | None = None) -> pd.DataFrame:
         """Convert table to DataFrame."""
+        warn_legacy("MessyTable.to_dataframe")
+        return self._to_dataframe_compat(config)
+
+    def _to_dataframe_compat(self, config: SheetConfig | None = None) -> pd.DataFrame:
+        """Convert table to DataFrame without emitting a nested legacy warning."""
         range_str = self._info.to_range_string()
 
         # Inherit the workbook defaults when no table-specific config is given,
@@ -112,6 +118,11 @@ class MessySheet:
 
     def to_dataframe(self, config: SheetConfig | None = None) -> pd.DataFrame:
         """Convert sheet to DataFrame."""
+        warn_legacy("MessySheet.to_dataframe")
+        return self._to_dataframe_compat(config)
+
+    def _to_dataframe_compat(self, config: SheetConfig | None = None) -> pd.DataFrame:
+        """Convert sheet to DataFrame without emitting a nested legacy warning."""
         return self._workbook._parse_sheet(self._name, config)
 
     def get_cell(self, row: int, col: int) -> CellValue:

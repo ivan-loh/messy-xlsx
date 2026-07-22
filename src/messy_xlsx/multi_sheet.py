@@ -4,6 +4,7 @@
 # Imports
 # ============================================================================
 
+import warnings as _warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ import pandas as pd
 
 from messy_xlsx.detection.header_detector import detect_header_row
 from messy_xlsx.models import SheetConfig
+from messy_xlsx.warnings import LegacyAPIWarning, warn_legacy
 
 # ============================================================================
 # Config
@@ -145,6 +147,11 @@ class MultiSheetParser:
         Returns:
             Dict mapping sheet name to cleaned DataFrame
         """
+        warn_legacy("MultiSheetParser.parse_all")
+        return self._parse_all_compat()
+
+    def _parse_all_compat(self) -> dict[str, pd.DataFrame]:
+        """Parse all data sheets without emitting a nested legacy warning."""
         from messy_xlsx.workbook import MessyWorkbook
 
         results = {}
@@ -175,6 +182,11 @@ class MultiSheetParser:
         Returns:
             Cleaned DataFrame
         """
+        warn_legacy("MultiSheetParser.parse_sheet")
+        return self._parse_sheet_compat(sheet_name)
+
+    def _parse_sheet_compat(self, sheet_name: str) -> pd.DataFrame:
+        """Parse one sheet without emitting a nested legacy warning."""
         from messy_xlsx.workbook import MessyWorkbook
 
         with MessyWorkbook(self.file_path) as workbook:
@@ -193,7 +205,7 @@ class MultiSheetParser:
         )
 
         try:
-            df = workbook.to_dataframe(sheet_name, config=raw_config)
+            df = workbook._to_dataframe_compat(sheet_name, config=raw_config)
         except Exception as e:
             return SheetInfo(
                 name=sheet_name,
@@ -284,12 +296,22 @@ class MultiSheetParser:
             decimal_separator=self.options.decimal_separator,
             thousands_separator=self.options.thousands_separator,
         )
-        return workbook.to_dataframe(info.name, config=config)
+        return workbook._to_dataframe_compat(info.name, config=config)
 
 
 # ============================================================================
 # Convenience Functions
 # ============================================================================
+
+_MULTI_SHEET_PARSER_PARSE_ALL = MultiSheetParser.parse_all
+
+
+def _parse_all_compat(parser: MultiSheetParser) -> dict[str, pd.DataFrame]:
+    if getattr(type(parser), "parse_all", None) is _MULTI_SHEET_PARSER_PARSE_ALL:
+        return parser._parse_all_compat()
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", LegacyAPIWarning)
+        return parser.parse_all()
 
 
 def read_all_sheets(
@@ -317,9 +339,10 @@ def read_all_sheets(
         >>> for name, df in sheets.items():
         ...     print(f"{name}: {len(df)} rows")
     """
+    warn_legacy("read_all_sheets")
     options = MultiSheetOptions(**options_kwargs)
     parser = MultiSheetParser(file_path, options)
-    return parser.parse_all()
+    return _parse_all_compat(parser)
 
 
 def analyze_excel(file_path: str | Path) -> list[SheetInfo]:
