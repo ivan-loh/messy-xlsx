@@ -367,12 +367,15 @@ def _close_reader(
     try:
         if opened.entered:
             assert opened.exit_method is not None
-            suppressed = bool(
-                opened.exit_method(
-                    type(primary_error) if primary_error is not None else None,
-                    primary_error,
-                    primary_traceback,
-                )
+            exit_result = opened.exit_method(
+                type(primary_error) if primary_error is not None else None,
+                primary_error,
+                primary_traceback,
+            )
+            suppressed = (
+                primary_error is not None
+                and _is_suppressible_parse_failure(primary_error)
+                and bool(exit_result)
             )
         else:
             suppressed = False
@@ -417,6 +420,11 @@ def _cleanup_takes_precedence(error: BaseException) -> bool:
         error,
         Exception,
     )
+
+
+def _is_suppressible_parse_failure(error: BaseException) -> bool:
+    """Limit context suppression to ordinary, recoverable parse failures."""
+    return isinstance(error, Exception) and not isinstance(error, MemoryError)
 
 
 def _failure_summary(error: BaseException) -> dict[str, str]:

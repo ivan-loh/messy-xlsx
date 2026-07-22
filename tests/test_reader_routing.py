@@ -379,6 +379,15 @@ class _FatalCleanup(BaseException):
     pass
 
 
+class _ExplodingTruth:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __bool__(self) -> bool:
+        self.calls += 1
+        raise AssertionError("process-level exit result must not be truth-tested")
+
+
 def _is_compatibility_failure(error: Exception) -> bool:
     return isinstance(error, _CompatibilityFailure)
 
@@ -393,7 +402,7 @@ class _MaterializedReaderFake:
         enter_error: BaseException | None = None,
         read_error: BaseException | None = None,
         close_error: BaseException | None = None,
-        suppress: bool = False,
+        suppress: object = False,
     ) -> None:
         self.events = events
         self.name = name
@@ -431,7 +440,7 @@ class _MaterializedReaderFake:
         error_type: type[BaseException] | None,
         error: BaseException | None,
         traceback: object,
-    ) -> bool:
+    ) -> object:
         self.exit_triples.append((error_type, error, traceback))
         self.exit_traceback_matches_error.append(error is None or traceback is error.__traceback__)
         self.close()
@@ -485,7 +494,7 @@ class _ContextStreamingReaderFake(_StreamingReaderFake):
         *,
         schema_error: BaseException | None = None,
         close_error: BaseException | None = None,
-        suppress: bool = False,
+        suppress: object = False,
     ) -> None:
         super().__init__(
             events,
@@ -510,7 +519,7 @@ class _ContextStreamingReaderFake(_StreamingReaderFake):
         error_type: type[BaseException] | None,
         error: BaseException | None,
         traceback: object,
-    ) -> bool:
+    ) -> object:
         self.exit_triples.append((error_type, error, traceback))
         self.exit_traceback_matches_error.append(error is None or traceback is error.__traceback__)
         self.close()
@@ -801,6 +810,64 @@ def test_materialized_exit_suppression_is_a_success_without_fallback() -> None:
     assert reader.exit_triples[0][0] is _CompatibilityFailure
     assert reader.exit_triples[0][1] is reader.read_error
     assert metrics == ParseMetrics(full_materializations=1)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        MemoryError("capacity"),
+        KeyboardInterrupt("interrupt"),
+        SystemExit("exit"),
+        _FatalCleanup("fatal"),
+    ],
+)
+def test_materialized_exit_cannot_suppress_process_level_failure(
+    error: BaseException,
+) -> None:
+    metrics = ParseMetrics()
+    reader = _MaterializedReaderFake(
+        [],
+        "primary",
+        read_error=error,
+        suppress=True,
+    )
+    fallback_calls = 0
+
+    def fallback_factory() -> object:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    with pytest.raises(type(error)) as captured:
+        FallbackCoordinator(
+            _is_compatibility_failure,
+            metrics=metrics,
+        ).materialize(lambda: reader, fallback_factory)
+
+    assert captured.value is error
+    assert reader.close_calls == 1
+    assert fallback_calls == 0
+    assert metrics == ParseMetrics(failed_attempts=1)
+
+
+def test_process_level_exit_result_is_not_truth_tested() -> None:
+    error = MemoryError("capacity")
+    exit_result = _ExplodingTruth()
+    reader = _MaterializedReaderFake(
+        [],
+        "primary",
+        read_error=error,
+        suppress=exit_result,
+    )
+
+    with pytest.raises(MemoryError) as captured:
+        FallbackCoordinator(_is_compatibility_failure).materialize(
+            lambda: reader,
+            pytest.fail,
+        )
+
+    assert captured.value is error
+    assert exit_result.calls == 0
 
 
 @pytest.mark.parametrize(
@@ -1122,6 +1189,50 @@ def test_streaming_exit_suppression_ends_cleanly_without_fallback(
     assert reader.exit_triples[0][0] is _CompatibilityFailure
     assert reader.exit_triples[0][1] is error
     assert metrics == ParseMetrics(streaming_passes=1)
+
+
+@pytest.mark.parametrize("failure_point", ["schema", "read"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        MemoryError("capacity"),
+        KeyboardInterrupt("interrupt"),
+        SystemExit("exit"),
+        _FatalCleanup("fatal"),
+    ],
+)
+def test_streaming_exit_cannot_suppress_process_level_failure(
+    error: BaseException,
+    failure_point: str,
+) -> None:
+    metrics = ParseMetrics()
+    reader = _ContextStreamingReaderFake(
+        [],
+        "primary",
+        [error] if failure_point == "read" else [],
+        schema_error=error if failure_point == "schema" else None,
+        suppress=True,
+    )
+    fallback_calls = 0
+
+    def fallback_factory() -> object:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    with pytest.raises(type(error)) as captured:
+        list(
+            FallbackCoordinator(
+                _is_compatibility_failure,
+                metrics=metrics,
+            ).batches(lambda: reader, fallback_factory)
+        )
+
+    assert captured.value is error
+    assert reader.close_calls == 1
+    assert len(reader.exit_triples) == 1
+    assert fallback_calls == 0
+    assert metrics == ParseMetrics(failed_attempts=1)
 
 
 def test_streaming_never_restarts_after_the_first_yield() -> None:
