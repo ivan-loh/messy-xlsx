@@ -25,7 +25,7 @@ from messy_xlsx.parsing.coordinates import (
     PreparedCoordinateSchema,
 )
 from messy_xlsx.parsing.parse_plan import ParsePlan
-from messy_xlsx.parsing.streams import _run_cleanups
+from messy_xlsx.parsing.streams import _close_if_present, _run_cleanups
 
 _MAX_EXCEL_ROW = 1_048_576
 _MAX_EXCEL_COLUMN = 16_384
@@ -341,9 +341,15 @@ class OpenpyxlStreamingReader:
         self._plan = plan
         self._layout = layout
         self._schema = layout.output_schema
-        self._operation = transform.open(plan, layout.prepared_schema)
+        self._operation: CoordinateOperation | None = transform.open(
+            plan,
+            layout.prepared_schema,
+        )
         self._batch_size = batch_size
-        self._rechunker = _BatchRechunker(self._schema, batch_size)
+        self._rechunker: _BatchRechunker | None = _BatchRechunker(
+            self._schema,
+            batch_size,
+        )
         self._backend_context: AbstractContextManager[BackendSource] | None = None
         self._workbook: Any | None = None
         self._rows: Iterator[tuple[Any, ...]] = iter(())
@@ -406,24 +412,28 @@ class OpenpyxlStreamingReader:
         """Return one non-empty bounded batch, with sticky terminal EOF."""
         if self._closed or self._terminal:
             return None
+        operation = self._operation
+        rechunker = self._rechunker
+        assert operation is not None
+        assert rechunker is not None
         while True:
-            ready = self._rechunker.pop()
+            ready = rechunker.pop()
             if ready is not None:
                 return ready
 
             raw = self._read_raw_window()
             if raw is not None:
-                for transformed in self._operation.push(raw):
-                    self._rechunker.push(transformed)
+                for transformed in operation.push(raw):
+                    rechunker.push(transformed)
                 continue
 
             if not self._coordinate_finished:
                 self._coordinate_finished = True
-                for transformed in self._operation.finish():
-                    self._rechunker.push(transformed)
+                for transformed in operation.finish():
+                    rechunker.push(transformed)
                 continue
 
-            ready = self._rechunker.pop(terminal=True)
+            ready = rechunker.pop(terminal=True)
             if ready is not None:
                 return ready
             self._terminal = True
@@ -481,11 +491,18 @@ class OpenpyxlStreamingReader:
         primary_error: BaseException | None = None,
         primary_traceback: TracebackType | None = None,
     ) -> None:
+        rows = self._rows
         workbook = self._workbook
         backend_context = self._backend_context
+        self._rows = iter(())
         self._workbook = None
         self._backend_context = None
-        cleanups: list[tuple[str, Any]] = []
+        self._operation = None
+        self._rechunker = None
+        self._terminal = True
+        cleanups: list[tuple[str, Any]] = [
+            ("worksheet row iterator cleanup", lambda: _close_if_present(rows))
+        ]
         if workbook is not None:
             cleanups.append(("openpyxl workbook cleanup", workbook.close))
         if backend_context is not None:

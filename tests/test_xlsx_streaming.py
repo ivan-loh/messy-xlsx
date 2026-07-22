@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import io
+import weakref
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +20,7 @@ from messy_xlsx import SheetConfig
 from messy_xlsx._source import SourceHandle
 from messy_xlsx.enums import MergeStrategy
 from messy_xlsx.ooxml.manifest import ManifestReader
-from messy_xlsx.ooxml.models import SheetManifest
+from messy_xlsx.ooxml.models import IntervalIndex, MergeRange, SheetManifest
 from messy_xlsx.parsing.contracts import OutputMode, ParseMetrics
 from messy_xlsx.parsing.coordinates import (
     CoordinateBatch,
@@ -611,7 +614,9 @@ def test_empty_all_hidden_and_header_only_streams_retain_precompiled_schema(
         _plan(include_hidden=False),
         pa.schema([("a", pa.string()), ("b", pa.string())]),
     )
-    assert list(reader_batches(hidden_reader)) == []
+    hidden_batches = list(reader_batches(hidden_reader))
+    assert [batch.num_rows for batch in hidden_batches] == [2]
+    assert hidden_batches[0].num_columns == 0
     assert hidden_reader.schema == pa.schema([])
 
     header_manifest = _manifest(source, "Header")
@@ -804,3 +809,356 @@ def test_coordinate_finalize_error_closes_and_restores_cursor(streaming_xlsx: Pa
     assert caller.tell() == 19
     assert caller.closed is False
     source.close()
+
+
+def test_all_hidden_columns_preserve_filtered_header_footer_row_cardinality(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "all-hidden-columns.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Data"
+    sheet.append(["left", "right"])
+    for row in range(2, 9):
+        sheet.append([f"left-{row}", f"right-{row}"])
+    sheet.column_dimensions["A"].hidden = True
+    sheet.column_dimensions["B"].hidden = True
+    sheet.row_dimensions[4].hidden = True
+    workbook.save(path)
+    workbook.close()
+
+    source = SourceHandle(path)
+    manifest = _manifest(source)
+    reader = _open_reader(
+        source,
+        manifest,
+        _plan(
+            batch_size=2,
+            include_hidden=False,
+            header_rows=1,
+            skip_footer=1,
+        ),
+        pa.schema([("a", pa.string()), ("b", pa.string())]),
+    )
+
+    batches = list(reader_batches(reader))
+
+    assert [batch.num_rows for batch in batches] == [2, 2, 1]
+    assert all(batch.num_columns == 0 for batch in batches)
+    assert sum(batch.num_rows for batch in batches) == 5
+    assert reader.schema == pa.schema([])
+    source.close()
+
+
+class _ClosableRows(Iterator[tuple[object, ...]]):
+    def __init__(self, source: Iterator[tuple[object, ...]], events: list[str]) -> None:
+        self._source = source
+        self._events = events
+        self.close_calls = 0
+        self.next_calls = 0
+        self.read_error: BaseException | None = None
+        self.close_error: BaseException | None = None
+
+    def __next__(self) -> tuple[object, ...]:
+        self.next_calls += 1
+        if self.read_error is not None:
+            error = self.read_error
+            self.read_error = None
+            raise error
+        return next(self._source)
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self._events.append("rows")
+        close = getattr(self._source, "close", None)
+        if callable(close):
+            close()
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class _ClosableWorksheet:
+    def __init__(self, worksheet: object, events: list[str]) -> None:
+        self._worksheet = worksheet
+        self._events = events
+        self.rows: _ClosableRows | None = None
+
+    def reset_dimensions(self) -> None:
+        self._worksheet.reset_dimensions()  # type: ignore[attr-defined]
+
+    def iter_rows(self, **kwargs: object) -> _ClosableRows:
+        rows = _ClosableRows(iter(self._worksheet.iter_rows(**kwargs)), self._events)  # type: ignore[attr-defined]
+        self.rows = rows
+        return rows
+
+
+class _ClosableWorkbook:
+    def __init__(self, workbook: object, events: list[str]) -> None:
+        self._workbook = workbook
+        self._events = events
+        self.sheet = _ClosableWorksheet(workbook["Data"], events)  # type: ignore[index]
+        self.close_calls = 0
+
+    def __getitem__(self, name: str) -> _ClosableWorksheet:
+        if name != "Data":
+            raise KeyError(name)
+        return self.sheet
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self._events.append("workbook")
+        self._workbook.close()  # type: ignore[attr-defined]
+
+
+def _tracked_closable_reader(
+    streaming_xlsx: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    SourceHandle,
+    io.BytesIO,
+    OpenpyxlStreamingReader,
+    _ClosableWorkbook,
+    list[str],
+]:
+    caller = io.BytesIO(streaming_xlsx.read_bytes())
+    caller.seek(23)
+    source = SourceHandle(caller, filename="streaming.xlsx")
+    manifest = _manifest(source)
+    real_load = streaming_module.openpyxl.load_workbook
+    events: list[str] = []
+    tracked: list[_ClosableWorkbook] = []
+
+    def tracking_load(*args: object, **kwargs: object) -> _ClosableWorkbook:
+        workbook = _ClosableWorkbook(real_load(*args, **kwargs), events)
+        tracked.append(workbook)
+        return workbook
+
+    monkeypatch.setattr(streaming_module.openpyxl, "load_workbook", tracking_load)
+    reader = _open_reader(
+        source,
+        manifest,
+        _plan(batch_size=2),
+        pa.schema([("a", pa.string()), ("b", pa.string())]),
+    )
+    return source, caller, reader, tracked[0], events
+
+
+@pytest.mark.parametrize("mode", ["unstarted", "early", "error", "eof"])
+def test_row_iterator_closes_before_workbook_for_every_terminal_path(
+    streaming_xlsx: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    source, caller, reader, workbook, events = _tracked_closable_reader(
+        streaming_xlsx,
+        monkeypatch,
+    )
+    rows = workbook.sheet.rows
+    assert rows is not None
+    adapter = reader_batches(reader)
+    if mode == "unstarted":
+        adapter.close()
+    elif mode == "early":
+        next(adapter)
+        adapter.close()
+    elif mode == "error":
+        expected = RuntimeError("row read failed")
+        rows.read_error = expected
+        with pytest.raises(RuntimeError) as captured:
+            next(adapter)
+        assert captured.value is expected
+    else:
+        list(adapter)
+
+    assert rows.close_calls == 1
+    assert workbook.close_calls == 1
+    assert events[:2] == ["rows", "workbook"]
+    assert caller.tell() == 23
+    assert caller.closed is False
+    source.close()
+
+
+@pytest.mark.parametrize(
+    ("cleanup_error", "winner_type"),
+    [(OSError("ordinary close"), ValueError), (MemoryError("process close"), MemoryError)],
+)
+def test_row_iterator_close_error_uses_shared_precedence_and_still_cleans_later_resources(
+    streaming_xlsx: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_error: BaseException,
+    winner_type: type[BaseException],
+) -> None:
+    source, caller, reader, workbook, events = _tracked_closable_reader(
+        streaming_xlsx,
+        monkeypatch,
+    )
+    rows = workbook.sheet.rows
+    assert rows is not None
+    operation_error = ValueError("operation failed")
+    rows.read_error = operation_error
+    rows.close_error = cleanup_error
+
+    with pytest.raises(winner_type) as captured:
+        next(reader_batches(reader))
+
+    expected = cleanup_error if winner_type is MemoryError else operation_error
+    assert captured.value is expected
+    assert events[:2] == ["rows", "workbook"]
+    assert workbook.close_calls == 1
+    assert caller.tell() == 23
+    assert caller.closed is False
+    source.close()
+
+
+class _RetainedParserState:
+    pass
+
+
+class _HostileCloseBindingRows(Iterator[tuple[object, ...]]):
+    def __init__(self, source: Iterator[tuple[object, ...]], error: BaseException) -> None:
+        self._source = source
+        self._error = error
+
+    def __next__(self) -> tuple[object, ...]:
+        return next(self._source)
+
+    @property
+    def close(self) -> object:
+        raise self._error
+
+
+def test_row_close_binding_failure_still_closes_workbook_and_restores_cursor(
+    streaming_xlsx: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, caller, reader, workbook, events = _tracked_closable_reader(
+        streaming_xlsx,
+        monkeypatch,
+    )
+    rows = workbook.sheet.rows
+    assert rows is not None
+    expected = RuntimeError("close binding failed")
+    reader._rows = _HostileCloseBindingRows(rows, expected)
+
+    with pytest.raises(RuntimeError) as captured:
+        reader.close()
+
+    assert captured.value is expected
+    assert workbook.close_calls == 1
+    assert events == ["workbook"]
+    assert caller.tell() == 23
+    assert caller.closed is False
+    source.close()
+
+
+def test_early_close_releases_coordinate_and_rechunker_state(
+    streaming_xlsx: Path,
+) -> None:
+    source = SourceHandle(streaming_xlsx)
+    manifest = _manifest(source)
+    reader = _open_reader(
+        source,
+        manifest,
+        _plan(header_rows=100, skip_footer=100),
+        pa.schema([("a", pa.string()), ("b", pa.string())]),
+    )
+    operation = _RetainedParserState()
+    rechunker = _RetainedParserState()
+    operation_ref = weakref.ref(operation)
+    rechunker_ref = weakref.ref(rechunker)
+    reader._operation = operation  # type: ignore[assignment]
+    reader._rechunker = rechunker  # type: ignore[assignment]
+
+    reader.close()
+    del operation, rechunker
+    gc.collect()
+
+    assert operation_ref() is None
+    assert rechunker_ref() is None
+    assert reader.schema == pa.schema([("0", pa.string()), ("1", pa.string())])
+    assert reader.read_next_batch() is None
+    source.close()
+
+
+def test_range_preflight_ignores_projected_away_auxiliary_merge_type_mismatch() -> None:
+    transform = CoordinateTransform(
+        hidden_rows=IntervalIndex(()),
+        hidden_columns=IntervalIndex(()),
+        merged_ranges=(MergeRange(4, 3, 6, 5),),
+    )
+    plan = _plan(cell_range="E5:E6", merge_strategy=MergeStrategy.FILL)
+    raw_schema = pa.schema([("anchor", pa.string()), ("aux", pa.int64()), ("output", pa.null())])
+
+    prepared = transform.prepare_schema(plan, raw_schema, (3, 4, 5))
+    operation = transform.open(plan, prepared)
+    emitted = operation.push(
+        CoordinateBatch(
+            batch=pa.record_batch(
+                [
+                    pa.array(["anchor", None, None], type=pa.string()),
+                    pa.array([1, None, None], type=pa.int64()),
+                    pa.nulls(3),
+                ],
+                schema=raw_schema,
+            ),
+            row_numbers=pa.array([4, 5, 6], type=pa.int64()),
+            column_numbers=(3, 4, 5),
+        )
+    )
+    result = (*emitted, *operation.finish())
+
+    assert prepared.output_schema == pa.schema([("0", pa.string())])
+    assert [value.as_py() for batch in result for value in batch.batch.column(0)] == [
+        "anchor",
+        "anchor",
+    ]
+
+
+@pytest.mark.parametrize(
+    "merge_strategy",
+    [MergeStrategy.FILL, MergeStrategy.FIRST_ONLY],
+)
+def test_overlapping_relevant_merges_fail_before_parser_io(
+    streaming_xlsx: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    merge_strategy: MergeStrategy,
+) -> None:
+    source = SourceHandle(streaming_xlsx)
+    manifest = replace(
+        _manifest(source),
+        merged_ranges=(MergeRange(5, 1, 6, 2), MergeRange(6, 2, 7, 3)),
+    )
+    calls = 0
+
+    def forbidden_load(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("parser I/O must not start")
+
+    monkeypatch.setattr(streaming_module.openpyxl, "load_workbook", forbidden_load)
+
+    with pytest.raises(CoordinateCompatibilityError, match="overlapping merged cells"):
+        _open_reader(
+            source,
+            manifest,
+            _plan(batch_size=2, merge_strategy=merge_strategy),
+            pa.schema([("a", pa.string()), ("b", pa.string()), ("c", pa.string())]),
+        )
+
+    assert calls == 0
+    source.close()
+
+
+def test_merge_skip_preflight_exempts_overlapping_ranges() -> None:
+    transform = CoordinateTransform(
+        hidden_rows=IntervalIndex(()),
+        hidden_columns=IntervalIndex(()),
+        merged_ranges=(MergeRange(5, 1, 6, 2), MergeRange(6, 2, 7, 3)),
+    )
+    prepared = transform.prepare_schema(
+        _plan(merge_strategy=MergeStrategy.SKIP),
+        pa.schema([("a", pa.string()), ("b", pa.string()), ("c", pa.string())]),
+        (1, 2, 3),
+    )
+
+    assert prepared.output_column_numbers == (1, 2, 3)

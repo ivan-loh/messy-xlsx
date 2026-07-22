@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date
@@ -28,6 +28,16 @@ _MAX_EXCEL_COLUMN = 16_384
 
 class CoordinateCompatibilityError(Exception):
     """Signal an exact coordinate result that Arrow cannot represent."""
+
+
+def _record_batch_preserving_rows(
+    arrays: list[pa.Array | pa.ChunkedArray],
+    names: list[str],
+    row_count: int,
+) -> pa.RecordBatch:
+    if arrays:
+        return pa.record_batch(arrays, names=names)
+    return pa.record_batch([pa.nulls(row_count)], names=["_row_count"]).select([])
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,9 +211,17 @@ def _prepare_coordinate_schema(
         raw_column_numbers,
         projection,
     )
+    compatibility_columns = raw_column_numbers if projection is None else output_columns
+    _validate_prepared_merge_overlaps(
+        plan,
+        merge_ranges,
+        compatibility_columns,
+        projection,
+        transform._observed_max_row,
+    )
     merge_output_types = _prepared_merge_output_types(
         plan,
-        raw_column_numbers,
+        compatibility_columns,
         input_types,
         merge_ranges,
     )
@@ -256,7 +274,7 @@ def _prepared_output_columns(
 
 def _prepared_merge_output_types(
     plan: ParsePlan,
-    raw_column_numbers: tuple[int, ...],
+    compatibility_columns: tuple[int, ...],
     input_types: dict[int, pa.DataType],
     merge_ranges: tuple[MergeRange, ...],
 ) -> dict[int, pa.DataType]:
@@ -266,7 +284,7 @@ def _prepared_merge_output_types(
     candidate_types: dict[int, set[pa.DataType]] = {}
     for merged_range in merge_ranges:
         _add_merge_candidate_types(
-            raw_column_numbers,
+            compatibility_columns,
             input_types,
             merged_range,
             candidate_types,
@@ -279,7 +297,7 @@ def _prepared_merge_output_types(
 
 
 def _add_merge_candidate_types(
-    raw_column_numbers: tuple[int, ...],
+    compatibility_columns: tuple[int, ...],
     input_types: dict[int, pa.DataType],
     merged_range: MergeRange,
     candidate_types: dict[int, set[pa.DataType]],
@@ -291,7 +309,7 @@ def _add_merge_candidate_types(
         )
     if pa.types.is_null(anchor_type):
         return
-    for column in raw_column_numbers:
+    for column in compatibility_columns:
         if not merged_range.min_col <= column <= merged_range.max_col:
             continue
         source_type = input_types[column]
@@ -301,6 +319,41 @@ def _add_merge_candidate_types(
             raise CoordinateCompatibilityError(
                 "merged-cell fill cannot guarantee lossless streaming output"
             )
+
+
+def _validate_prepared_merge_overlaps(
+    plan: ParsePlan,
+    merge_ranges: tuple[MergeRange, ...],
+    transformed_columns: tuple[int, ...],
+    projection: _RangeProjection | None,
+    observed_max_row: int,
+) -> None:
+    if (
+        MergeStrategy(plan.merge_strategy) is MergeStrategy.SKIP
+        or len(merge_ranges) < 2
+        or not transformed_columns
+    ):
+        return
+    min_row = projection.min_row if projection is not None else 1
+    max_row = (
+        projection.max_row
+        if projection is not None
+        else max(observed_max_row, *(merged.max_row for merged in merge_ranges))
+    )
+    rectangles: list[tuple[int, int, int, int]] = []
+    for merged in merge_ranges:
+        clipped_min_row = max(min_row, merged.min_row)
+        clipped_max_row = min(max_row, merged.max_row)
+        start = bisect_left(transformed_columns, merged.min_col)
+        stop = bisect_right(transformed_columns, merged.max_col)
+        if clipped_min_row <= clipped_max_row and start < stop:
+            rectangles.append((clipped_min_row, clipped_max_row, start, stop))
+    active_until = np.zeros(len(transformed_columns), dtype=np.int64)
+    for clipped_min_row, clipped_max_row, start, stop in sorted(rectangles):
+        active = active_until[start:stop]
+        if bool(np.any(active >= clipped_min_row)):
+            raise CoordinateCompatibilityError("overlapping merged cells require legacy inference")
+        np.maximum(active, clipped_max_row, out=active)
 
 
 class CoordinateOperation:
@@ -572,7 +625,11 @@ class CoordinateOperation:
             ]
             inferred.append(
                 CoordinateBatch(
-                    batch=pa.record_batch(arrays, names=batch.batch.schema.names),
+                    batch=_record_batch_preserving_rows(
+                        arrays,
+                        batch.batch.schema.names,
+                        batch.batch.num_rows,
+                    ),
                     row_numbers=batch.row_numbers,
                     column_numbers=batch.column_numbers,
                 )
@@ -792,7 +849,11 @@ class CoordinateOperation:
             arrays[position] = self._rebuild_merged_array(arrays[position], segments)
 
         return CoordinateBatch(
-            batch=pa.record_batch(arrays, names=batch.batch.schema.names),
+            batch=_record_batch_preserving_rows(
+                arrays,
+                batch.batch.schema.names,
+                batch.batch.num_rows,
+            ),
             row_numbers=batch.row_numbers,
             column_numbers=batch.column_numbers,
             column_identities=batch.column_identities,
@@ -818,7 +879,11 @@ class CoordinateOperation:
         if not changed:
             return batch
         return CoordinateBatch(
-            batch=pa.record_batch(arrays, names=batch.batch.schema.names),
+            batch=_record_batch_preserving_rows(
+                arrays,
+                batch.batch.schema.names,
+                batch.batch.num_rows,
+            ),
             row_numbers=batch.row_numbers,
             column_numbers=batch.column_numbers,
             column_identities=batch.column_identities,
@@ -1031,7 +1096,7 @@ class CoordinateOperation:
         arrays = [batch.batch.column(position) for position in selected_positions]
         if row_mask is not None:
             arrays = [pc.filter(array, row_mask) for array in arrays]
-        if len(selected_rows) == 0 or not arrays:
+        if len(selected_rows) == 0:
             return ()
         columns = tuple(batch.column_numbers[position] for position in selected_positions)
         return (self._coordinate_batch(arrays, selected_rows, columns),)
@@ -1138,9 +1203,10 @@ class CoordinateOperation:
         column_numbers: tuple[int, ...],
     ) -> CoordinateBatch:
         return CoordinateBatch(
-            batch=pa.record_batch(
+            batch=_record_batch_preserving_rows(
                 arrays,
-                names=[str(ordinal) for ordinal in range(len(arrays))],
+                [str(ordinal) for ordinal in range(len(arrays))],
+                len(row_numbers),
             ),
             row_numbers=pa.array(row_numbers, type=pa.int64()),
             column_numbers=column_numbers,
@@ -1230,7 +1296,11 @@ class CoordinateOperation:
         arrays = [pa.concat_arrays([array]) for array in batch.batch.columns]
         row_numbers = pa.concat_arrays([batch.row_numbers])
         return CoordinateBatch(
-            batch=pa.record_batch(arrays, names=batch.batch.schema.names),
+            batch=_record_batch_preserving_rows(
+                arrays,
+                batch.batch.schema.names,
+                batch.batch.num_rows,
+            ),
             row_numbers=row_numbers,
             column_numbers=batch.column_numbers,
             column_identities=batch.column_identities,
