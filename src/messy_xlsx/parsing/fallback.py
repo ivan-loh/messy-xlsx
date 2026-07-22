@@ -110,7 +110,7 @@ class FallbackCoordinator:
                 try:
                     batch = opened.reader.read_next_batch()
                 except BaseException as error:
-                    traceback = error.__traceback__
+                    traceback = _exception_traceback(error)
                     closed = _close_reader(opened, error, traceback)
                     opened = None
                     if closed.suppressed:
@@ -143,7 +143,7 @@ class FallbackCoordinator:
                 closed = _close_reader(
                     opened,
                     error,
-                    error.__traceback__,
+                    _exception_traceback(error),
                     cleanup_overrides=True,
                 )
                 opened = None
@@ -158,7 +158,7 @@ class FallbackCoordinator:
             raise
         except BaseException as error:
             if opened is not None:
-                closed = _close_reader(opened, error, error.__traceback__)
+                closed = _close_reader(opened, error, _exception_traceback(error))
                 opened = None
                 if closed.suppressed:
                     return
@@ -190,7 +190,7 @@ class FallbackCoordinator:
             value = opened.reader.read_table()
         except BaseException as caught:
             error = caught
-            traceback = caught.__traceback__
+            traceback = _exception_traceback(caught)
 
         closed = _close_reader(opened, error, traceback)
         if closed.error is not None:
@@ -220,7 +220,10 @@ class FallbackCoordinator:
                 primary_failure=_failure_summary(error),
                 classifier_failure=_failure_summary(classifier_error),
             )
-            classifier_error.add_note(f"primary backend failed: {type(error).__name__}")
+            _safe_add_note(
+                classifier_error,
+                f"primary backend failed: {_type_name(error)}",
+            )
             raise
 
     def _may_retry_stream(
@@ -257,7 +260,7 @@ class FallbackCoordinator:
             using_fallback=using_fallback,
         ):
             return _failure_summary(attempt.error)
-        raise attempt.error.with_traceback(attempt.traceback)
+        return _raise_with_traceback(attempt.error, attempt.traceback)
 
     def _record_failure(self) -> None:
         if self._metrics is not None:
@@ -281,26 +284,26 @@ def _open_reader(
     try:
         owner = factory()
     except BaseException as error:
-        return None, _Attempt(error=error, traceback=error.__traceback__)
+        return None, _Attempt(error=error, traceback=_exception_traceback(error))
 
     try:
         exit_method = _bind_special(owner, "__exit__")
         enter = _bind_special(owner, "__enter__")
     except BaseException as error:
         opened = _OpenedReader(owner=owner, reader=owner, entered=False)
-        return None, _close_reader(opened, error, error.__traceback__)
+        return None, _close_reader(opened, error, _exception_traceback(error))
 
     has_exit = exit_method is not _MISSING_SPECIAL
     has_enter = enter is not _MISSING_SPECIAL
     if has_exit != has_enter or (has_enter and (not callable(enter) or not callable(exit_method))):
         protocol_error = TypeError(
-            f"{type(owner).__name__} has an incomplete context manager protocol"
+            f"{_type_name(owner)} has an incomplete context manager protocol"
         )
         opened = _OpenedReader(owner=owner, reader=owner, entered=False)
         return None, _close_reader(
             opened,
             protocol_error,
-            protocol_error.__traceback__,
+            _exception_traceback(protocol_error),
         )
 
     if callable(enter):
@@ -308,7 +311,7 @@ def _open_reader(
             reader = enter()
         except BaseException as error:
             opened = _OpenedReader(owner=owner, reader=owner, entered=False)
-            return None, _close_reader(opened, error, error.__traceback__)
+            return None, _close_reader(opened, error, _exception_traceback(error))
         opened = _OpenedReader(
             owner=owner,
             reader=reader,
@@ -324,7 +327,7 @@ def _open_reader(
                 schema = opened.reader.schema
                 del schema
         except BaseException as error:
-            return None, _close_reader(opened, error, error.__traceback__)
+            return None, _close_reader(opened, error, _exception_traceback(error))
 
     return opened, _Attempt()
 
@@ -383,9 +386,12 @@ def _close_reader(
             if callable(close):
                 close()
     except BaseException as cleanup_error:
-        cleanup_traceback = cleanup_error.__traceback__
+        cleanup_traceback = _exception_traceback(cleanup_error)
         if primary_error is None:
-            cleanup_error.add_note(f"reader cleanup failed: {type(cleanup_error).__name__}")
+            _safe_add_note(
+                cleanup_error,
+                f"reader cleanup failed: {_type_name(cleanup_error)}",
+            )
             _attach_cleanup_failure(cleanup_error, cleanup_error)
             return _Attempt(
                 error=cleanup_error,
@@ -393,7 +399,10 @@ def _close_reader(
                 cleanup_failed=True,
             )
         if cleanup_overrides or _cleanup_takes_precedence(cleanup_error):
-            cleanup_error.add_note(f"backend operation also failed: {type(primary_error).__name__}")
+            _safe_add_note(
+                cleanup_error,
+                f"backend operation also failed: {_type_name(primary_error)}",
+            )
             _attach_operation_failure(cleanup_error, primary_error)
             _attach_cleanup_failure(cleanup_error, cleanup_error)
             return _Attempt(
@@ -401,7 +410,10 @@ def _close_reader(
                 traceback=cleanup_traceback,
                 cleanup_failed=True,
             )
-        primary_error.add_note(f"reader cleanup also failed: {type(cleanup_error).__name__}")
+        _safe_add_note(
+            primary_error,
+            f"reader cleanup also failed: {_type_name(cleanup_error)}",
+        )
         _attach_cleanup_failure(primary_error, cleanup_error)
         return _Attempt(
             error=primary_error,
@@ -429,7 +441,7 @@ def _is_suppressible_parse_failure(error: BaseException) -> bool:
 
 def _failure_summary(error: BaseException) -> dict[str, str]:
     """Return useful backend context without source paths or cell values."""
-    return {"type": type(error).__name__}
+    return {"type": _type_name(error)}
 
 
 def _attach_primary_failure(
@@ -442,7 +454,10 @@ def _attach_primary_failure(
         primary_failure=dict(primary_summary),
         fallback_failure=fallback_summary,
     )
-    fallback_error.add_note(f"primary backend failed: {primary_summary['type']}")
+    _safe_add_note(
+        fallback_error,
+        f"primary backend failed: {primary_summary['type']}",
+    )
 
 
 def _attach_cleanup_failure(
@@ -469,30 +484,66 @@ def _merge_backend_context(
     error: BaseException,
     **updates: dict[str, str],
 ) -> None:
-    """Merge only type summaries produced by this coordinator."""
-    context: dict[str, dict[str, str]] = {}
-    existing = getattr(error, "backend_context", None)
-    if isinstance(existing, dict):
-        for name in (
-            "primary_failure",
-            "fallback_failure",
-            "operation_failure",
-            "cleanup_failure",
-            "classifier_failure",
-        ):
-            summary = existing.get(name)
-            if (
-                isinstance(summary, dict)
-                and set(summary) == {"type"}
-                and isinstance(summary["type"], str)
+    """Best-effort merge of sanitized summaries without virtual hooks."""
+    try:
+        state = BaseException.__getattribute__(error, "__dict__")
+        if type(state) is not dict:
+            return
+        context: dict[str, dict[str, str]] = {}
+        existing = dict.get(state, "backend_context")
+        if type(existing) is dict:
+            for name in (
+                "primary_failure",
+                "fallback_failure",
+                "operation_failure",
+                "cleanup_failure",
+                "classifier_failure",
             ):
-                context[name] = {"type": summary["type"]}
-    context.update({name: dict(summary) for name, summary in updates.items()})
-    error.backend_context = context  # type: ignore[attr-defined]
+                summary = dict.get(existing, name)
+                if (
+                    type(summary) is dict
+                    and set(summary) == {"type"}
+                    and isinstance(dict.__getitem__(summary, "type"), str)
+                ):
+                    context[name] = {"type": dict.__getitem__(summary, "type")}
+        context.update({name: dict(summary) for name, summary in updates.items()})
+        dict.__setitem__(state, "backend_context", context)
+    except BaseException:
+        return
+
+
+def _type_name(value: object) -> str:
+    """Read a concrete type name without invoking metaclass overrides."""
+    try:
+        name = type.__getattribute__(type(value), "__name__")
+    except BaseException:
+        return "<unknown>"
+    return name if isinstance(name, str) else "<unknown>"
+
+
+def _exception_traceback(error: BaseException) -> TracebackType | None:
+    """Read traceback state without invoking exception attribute overrides."""
+    try:
+        traceback = BaseException.__getattribute__(error, "__traceback__")
+    except BaseException:
+        return None
+    return traceback if isinstance(traceback, TracebackType) else None
+
+
+def _safe_add_note(error: BaseException, note: str) -> None:
+    """Attach sanitized diagnostics without allowing annotation failures to mask."""
+    try:
+        BaseException.add_note(error, note)
+    except BaseException:
+        return
 
 
 def _raise_with_traceback(
     error: BaseException,
     traceback: TracebackType | None,
 ) -> NoReturn:
-    raise error.with_traceback(traceback)
+    try:
+        error = BaseException.with_traceback(error, traceback)
+    except BaseException:
+        pass
+    raise error

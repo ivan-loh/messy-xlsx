@@ -388,6 +388,42 @@ class _ExplodingTruth:
         raise AssertionError("process-level exit result must not be truth-tested")
 
 
+class _HostileExceptionMeta(type):
+    def __getattribute__(cls, name: str) -> object:
+        if name == "__name__":
+            raise AssertionError("diagnostics must bypass metaclass name lookup")
+        return type.__getattribute__(cls, name)
+
+
+class _HostileDiagnosticError(RuntimeError, metaclass=_HostileExceptionMeta):
+    def __getattribute__(self, name: str) -> object:
+        if name in {
+            "__dict__",
+            "__traceback__",
+            "add_note",
+            "backend_context",
+            "with_traceback",
+        }:
+            raise AssertionError(f"diagnostics must bypass {name}")
+        return BaseException.__getattribute__(self, name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "backend_context":
+            raise AssertionError("diagnostics must bypass backend_context assignment")
+        BaseException.__setattr__(self, name, value)
+
+    def __str__(self) -> str:
+        raise AssertionError("diagnostics must not stringify backend failures")
+
+    def add_note(self, note: str) -> None:
+        del note
+        raise AssertionError("diagnostics must bypass add_note overrides")
+
+    def with_traceback(self, traceback: object) -> BaseException:
+        del traceback
+        raise AssertionError("diagnostics must bypass with_traceback overrides")
+
+
 def _is_compatibility_failure(error: Exception) -> bool:
     return isinstance(error, _CompatibilityFailure)
 
@@ -684,6 +720,42 @@ def test_materialized_fallback_failure_has_sanitized_structured_context() -> Non
     assert secret not in repr(captured.value.__notes__)
     assert metrics.failed_attempts == 2
     assert metrics.full_materializations == 0
+
+
+def test_hostile_fallback_diagnostics_never_mask_the_exact_backend_failure() -> None:
+    fallback_error = _HostileDiagnosticError("fallback failed")
+
+    class HostileFailureReader:
+        def read_table(self) -> pa.Table:
+            raise fallback_error
+
+        def close(self) -> None:
+            pass
+
+    with pytest.raises(RuntimeError) as captured:
+        FallbackCoordinator(_is_compatibility_failure).materialize(
+            lambda: _MaterializedReaderFake(
+                [],
+                "primary",
+                read_error=_CompatibilityFailure("unsupported"),
+            ),
+            HostileFailureReader,
+        )
+
+    assert captured.value is fallback_error
+    state = BaseException.__getattribute__(fallback_error, "__dict__")
+    assert state["backend_context"] == {
+        "primary_failure": {"type": "_CompatibilityFailure"},
+        "fallback_failure": {"type": "_HostileDiagnosticError"},
+    }
+    notes = BaseException.__getattribute__(fallback_error, "__notes__")
+    assert notes == ["primary backend failed: _CompatibilityFailure"]
+    traceback = BaseException.__getattribute__(fallback_error, "__traceback__")
+    frame_names: list[str] = []
+    while traceback is not None:
+        frame_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    assert "read_table" in frame_names
 
 
 def test_materialized_metrics_count_one_successful_result_and_failed_attempt() -> None:
