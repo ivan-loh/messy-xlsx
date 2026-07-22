@@ -327,6 +327,10 @@ class _CompatibilityFailure(Exception):
     pass
 
 
+class _FatalCleanup(BaseException):
+    pass
+
+
 def _is_compatibility_failure(error: Exception) -> bool:
     return isinstance(error, _CompatibilityFailure)
 
@@ -341,6 +345,7 @@ class _MaterializedReaderFake:
         enter_error: BaseException | None = None,
         read_error: BaseException | None = None,
         close_error: BaseException | None = None,
+        suppress: bool = False,
     ) -> None:
         self.events = events
         self.name = name
@@ -348,7 +353,12 @@ class _MaterializedReaderFake:
         self.enter_error = enter_error
         self.read_error = read_error
         self.close_error = close_error
+        self.suppress = suppress
         self.close_calls = 0
+        self.exit_triples: list[
+            tuple[type[BaseException] | None, BaseException | None, object]
+        ] = []
+        self.exit_traceback_matches_error: list[bool] = []
 
     def __enter__(self) -> _MaterializedReaderFake:
         self.events.append(f"{self.name}-enter")
@@ -370,12 +380,14 @@ class _MaterializedReaderFake:
 
     def __exit__(
         self,
-        _error_type: type[BaseException] | None,
-        _error: BaseException | None,
-        _traceback: object,
+        error_type: type[BaseException] | None,
+        error: BaseException | None,
+        traceback: object,
     ) -> bool:
+        self.exit_triples.append((error_type, error, traceback))
+        self.exit_traceback_matches_error.append(error is None or traceback is error.__traceback__)
         self.close()
-        return False
+        return self.suppress
 
 
 class _StreamingReaderFake:
@@ -414,6 +426,47 @@ class _StreamingReaderFake:
         self.events.append(f"{self.name}-close")
         if self.close_error is not None:
             raise self.close_error
+
+
+class _ContextStreamingReaderFake(_StreamingReaderFake):
+    def __init__(
+        self,
+        events: list[str],
+        name: str,
+        outcomes: list[pa.RecordBatch | BaseException | None],
+        *,
+        schema_error: BaseException | None = None,
+        close_error: BaseException | None = None,
+        suppress: bool = False,
+    ) -> None:
+        super().__init__(
+            events,
+            name,
+            outcomes,
+            schema_error=schema_error,
+            close_error=close_error,
+        )
+        self.suppress = suppress
+        self.enter_calls = 0
+        self.exit_triples: list[
+            tuple[type[BaseException] | None, BaseException | None, object]
+        ] = []
+        self.exit_traceback_matches_error: list[bool] = []
+
+    def __enter__(self) -> _ContextStreamingReaderFake:
+        self.enter_calls += 1
+        return self
+
+    def __exit__(
+        self,
+        error_type: type[BaseException] | None,
+        error: BaseException | None,
+        traceback: object,
+    ) -> bool:
+        self.exit_triples.append((error_type, error, traceback))
+        self.exit_traceback_matches_error.append(error is None or traceback is error.__traceback__)
+        self.close()
+        return self.suppress
 
 
 def _batch(value: int) -> pa.RecordBatch:
@@ -458,6 +511,7 @@ def test_materialized_reader_is_closed_when_context_initialization_fails() -> No
     )
 
     assert primary.close_calls == fallback.close_calls == 1
+    assert primary.exit_triples == []
     assert events.index("primary-close") < events.index("fallback-enter")
 
 
@@ -495,7 +549,7 @@ def test_cleanup_failure_blocks_materialized_fallback_and_stays_attached() -> No
         [],
         "primary",
         read_error=primary_error,
-        close_error=OSError("restore failed"),
+        close_error=OSError("secret restore path"),
     )
 
     def fallback_factory() -> _MaterializedReaderFake:
@@ -512,7 +566,8 @@ def test_cleanup_failure_blocks_materialized_fallback_and_stays_attached() -> No
     assert captured.value is primary_error
     assert fallback_calls == 0
     assert primary.close_calls == 1
-    assert any("cleanup" in note and "restore failed" in note for note in captured.value.__notes__)
+    assert any("cleanup" in note and "OSError" in note for note in captured.value.__notes__)
+    assert "secret" not in repr(captured.value.__notes__)
 
 
 def test_materialized_fallback_failure_has_sanitized_structured_context() -> None:
@@ -562,6 +617,339 @@ def test_materialized_metrics_count_one_successful_result_and_failed_attempt() -
     assert metrics.full_materializations == 1
 
 
+def test_context_special_methods_ignore_instance_shadows() -> None:
+    reader = _MaterializedReaderFake([], "primary")
+    reader.__enter__ = lambda: pytest.fail("instance __enter__ must be ignored")  # type: ignore[method-assign]
+    reader.__exit__ = lambda *_args: pytest.fail("instance __exit__ must be ignored")  # type: ignore[method-assign]
+
+    result = FallbackCoordinator(_is_compatibility_failure).materialize(
+        lambda: reader,
+        pytest.fail,
+    )
+
+    assert result.to_pydict() == {"value": [1]}
+    assert reader.close_calls == 1
+
+
+def test_context_special_method_descriptors_bind_exit_before_enter() -> None:
+    events: list[str] = []
+
+    class SpecialDescriptor:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __get__(self, instance: object, _owner: type[object]) -> object:
+            events.append(f"bind-{self.name}")
+            if self.name == "enter":
+                return lambda: instance
+            return lambda *_args: events.append("exit") or False
+
+    class DescriptorReader:
+        __enter__ = SpecialDescriptor("enter")
+        __exit__ = SpecialDescriptor("exit")
+
+        def read_table(self) -> pa.Table:
+            return pa.table({"value": [1]})
+
+    result = FallbackCoordinator(_is_compatibility_failure).materialize(
+        DescriptorReader,
+        pytest.fail,
+    )
+
+    assert result.to_pydict() == {"value": [1]}
+    assert events == ["bind-exit", "bind-enter", "exit"]
+
+
+def test_present_but_noncallable_context_special_methods_are_rejected() -> None:
+    class InvalidContextReader:
+        __enter__ = None
+        __exit__ = None
+
+        def read_table(self) -> pa.Table:
+            pytest.fail("invalid context protocol must fail before reading")
+
+    with pytest.raises(TypeError, match="incomplete context manager protocol"):
+        FallbackCoordinator(_is_compatibility_failure).materialize(
+            InvalidContextReader,
+            pytest.fail,
+        )
+
+
+def test_context_exit_is_bound_before_enter_can_mutate_its_class() -> None:
+    events: list[str] = []
+
+    class MutatingExitReader:
+        def __enter__(self) -> MutatingExitReader:
+            type(self).__exit__ = replacement_exit
+            return self
+
+        def read_table(self) -> pa.Table:
+            return pa.table({"value": [1]})
+
+        def __exit__(self, *_args: object) -> bool:
+            events.append("original-exit")
+            return False
+
+    def replacement_exit(_self: object, *_args: object) -> bool:
+        events.append("replacement-exit")
+        return False
+
+    original_exit = MutatingExitReader.__exit__
+    try:
+        FallbackCoordinator(_is_compatibility_failure).materialize(
+            MutatingExitReader,
+            pytest.fail,
+        )
+    finally:
+        MutatingExitReader.__exit__ = original_exit
+
+    assert events == ["original-exit"]
+
+
+def test_materialized_exit_suppression_is_a_success_without_fallback() -> None:
+    metrics = ParseMetrics()
+    reader = _MaterializedReaderFake(
+        [],
+        "primary",
+        read_error=_CompatibilityFailure("suppressed"),
+        suppress=True,
+    )
+
+    result = FallbackCoordinator(
+        _is_compatibility_failure,
+        metrics=metrics,
+    ).materialize(lambda: reader, pytest.fail)
+
+    assert result is None
+    assert reader.close_calls == 1
+    assert reader.exit_triples[0][0] is _CompatibilityFailure
+    assert reader.exit_triples[0][1] is reader.read_error
+    assert metrics == ParseMetrics(full_materializations=1)
+
+
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [
+        MemoryError("secret-memory"),
+        KeyboardInterrupt("secret-key"),
+        SystemExit("secret-exit"),
+        _FatalCleanup("secret-fatal"),
+    ],
+)
+def test_process_level_cleanup_failure_wins_over_materialized_operation_error(
+    cleanup_error: BaseException,
+) -> None:
+    operation_error = _CompatibilityFailure("secret-operation")
+    metrics = ParseMetrics()
+    reader = _MaterializedReaderFake(
+        [],
+        "primary",
+        read_error=operation_error,
+        close_error=cleanup_error,
+    )
+
+    with pytest.raises(type(cleanup_error)) as captured:
+        FallbackCoordinator(
+            _is_compatibility_failure,
+            metrics=metrics,
+        ).materialize(lambda: reader, pytest.fail)
+
+    assert captured.value is cleanup_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "operation_failure": {"type": "_CompatibilityFailure"},
+        "cleanup_failure": {"type": type(cleanup_error).__name__},
+    }
+    assert "secret" not in repr(captured.value.__notes__)
+    assert "secret" not in repr(captured.value.backend_context)  # type: ignore[attr-defined]
+    assert metrics == ParseMetrics(failed_attempts=1)
+
+
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [
+        OSError("secret-os"),
+        MemoryError("secret-memory"),
+        KeyboardInterrupt("secret-key"),
+        SystemExit("secret-exit"),
+        _FatalCleanup("secret-fatal"),
+    ],
+)
+def test_cleanup_failure_without_an_operation_error_wins_and_is_sanitized(
+    cleanup_error: BaseException,
+) -> None:
+    metrics = ParseMetrics()
+    reader = _MaterializedReaderFake([], "primary", close_error=cleanup_error)
+
+    with pytest.raises(type(cleanup_error)) as captured:
+        FallbackCoordinator(
+            _is_compatibility_failure,
+            metrics=metrics,
+        ).materialize(lambda: reader, pytest.fail)
+
+    assert captured.value is cleanup_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "cleanup_failure": {"type": type(cleanup_error).__name__}
+    }
+    assert "secret" not in repr(getattr(captured.value, "__notes__", []))
+    assert "secret" not in repr(captured.value.backend_context)  # type: ignore[attr-defined]
+    assert metrics == ParseMetrics(failed_attempts=1)
+
+
+@pytest.mark.parametrize(
+    "classifier_error",
+    [
+        RuntimeError("secret-runtime"),
+        MemoryError("secret-memory"),
+        KeyboardInterrupt("secret-key"),
+        SystemExit("secret-exit"),
+    ],
+)
+def test_classifier_failure_propagates_exactly_after_primary_cleanup(
+    classifier_error: BaseException,
+) -> None:
+    metrics = ParseMetrics()
+    reader = _MaterializedReaderFake(
+        [],
+        "primary",
+        read_error=_CompatibilityFailure("secret-primary"),
+    )
+    fallback_calls = 0
+
+    def classifier(_error: Exception) -> bool:
+        raise classifier_error
+
+    def fallback_factory() -> object:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    with pytest.raises(type(classifier_error)) as captured:
+        FallbackCoordinator(classifier, metrics=metrics).materialize(
+            lambda: reader,
+            fallback_factory,
+        )
+
+    assert captured.value is classifier_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "primary_failure": {"type": "_CompatibilityFailure"},
+        "classifier_failure": {"type": type(classifier_error).__name__},
+    }
+    assert "secret" not in repr(captured.value.__notes__)
+    assert fallback_calls == 0
+    assert reader.close_calls == 1
+    assert metrics == ParseMetrics(failed_attempts=1)
+
+
+def test_streaming_classifier_failure_propagates_after_exact_once_cleanup() -> None:
+    classifier_error = RuntimeError("secret-classifier")
+    reader = _StreamingReaderFake(
+        [],
+        "primary",
+        [_CompatibilityFailure("secret-primary")],
+    )
+    metrics = ParseMetrics()
+    fallback_calls = 0
+
+    def classifier(_error: Exception) -> bool:
+        raise classifier_error
+
+    def fallback_factory() -> object:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    with pytest.raises(RuntimeError) as captured:
+        list(
+            FallbackCoordinator(classifier, metrics=metrics).batches(
+                lambda: reader,
+                fallback_factory,
+            )
+        )
+
+    assert captured.value is classifier_error
+    assert reader.close_calls == 1
+    assert fallback_calls == 0
+    assert metrics == ParseMetrics(failed_attempts=1)
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "primary_failure": {"type": "_CompatibilityFailure"},
+        "classifier_failure": {"type": "RuntimeError"},
+    }
+    assert "secret" not in repr(captured.value.__notes__)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PermissionError("denied"),
+        FileNotFoundError("missing"),
+        MemoryError("capacity"),
+        ValueError("invalid configuration"),
+        RuntimeError("SourceHandle already has an active borrow"),
+    ],
+)
+def test_excluded_errors_are_never_sent_to_the_classifier(error: BaseException) -> None:
+    def classifier(_error: Exception) -> bool:
+        pytest.fail("excluded failure reached classifier")
+
+    with pytest.raises(type(error)):
+        FallbackCoordinator(classifier).materialize(
+            lambda: _MaterializedReaderFake([], "primary", read_error=error),
+            pytest.fail,
+        )
+
+
+def test_fallback_cleanup_context_merges_without_leaking_messages() -> None:
+    primary_error = _CompatibilityFailure("secret-primary")
+    fallback_error = RuntimeError("secret-fallback")
+    cleanup_error = OSError("secret-cleanup")
+
+    with pytest.raises(RuntimeError) as captured:
+        FallbackCoordinator(_is_compatibility_failure).materialize(
+            lambda: _MaterializedReaderFake([], "primary", read_error=primary_error),
+            lambda: _MaterializedReaderFake(
+                [],
+                "fallback",
+                read_error=fallback_error,
+                close_error=cleanup_error,
+            ),
+        )
+
+    assert captured.value is fallback_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "cleanup_failure": {"type": "OSError"},
+        "primary_failure": {"type": "_CompatibilityFailure"},
+        "fallback_failure": {"type": "RuntimeError"},
+    }
+    assert "secret" not in repr(captured.value.__notes__)
+    assert "secret" not in repr(captured.value.backend_context)  # type: ignore[attr-defined]
+
+
+def test_fallback_exit_only_failure_preserves_primary_and_cleanup_context() -> None:
+    cleanup_error = OSError("secret-cleanup")
+
+    with pytest.raises(OSError) as captured:
+        FallbackCoordinator(_is_compatibility_failure).materialize(
+            lambda: _MaterializedReaderFake(
+                [],
+                "primary",
+                read_error=_CompatibilityFailure("secret-primary"),
+            ),
+            lambda: _MaterializedReaderFake(
+                [],
+                "fallback",
+                close_error=cleanup_error,
+            ),
+        )
+
+    assert captured.value is cleanup_error
+    assert captured.value.backend_context == {  # type: ignore[attr-defined]
+        "cleanup_failure": {"type": "OSError"},
+        "primary_failure": {"type": "_CompatibilityFailure"},
+        "fallback_failure": {"type": "OSError"},
+    }
+    assert "secret" not in repr(captured.value.__notes__)
+
+
 def test_streaming_fallback_is_allowed_before_the_first_observable_batch() -> None:
     events: list[str] = []
     primary = _StreamingReaderFake(
@@ -606,6 +994,35 @@ def test_streaming_schema_failure_closes_primary_before_fallback() -> None:
     assert primary.close_calls == fallback.close_calls == 1
 
 
+@pytest.mark.parametrize("failure_point", ["schema", "read"])
+def test_streaming_exit_suppression_ends_cleanly_without_fallback(
+    failure_point: str,
+) -> None:
+    error = _CompatibilityFailure("suppressed")
+    metrics = ParseMetrics()
+    reader = _ContextStreamingReaderFake(
+        [],
+        "primary",
+        [error] if failure_point == "read" else [],
+        schema_error=error if failure_point == "schema" else None,
+        suppress=True,
+    )
+
+    batches = list(
+        FallbackCoordinator(
+            _is_compatibility_failure,
+            metrics=metrics,
+        ).batches(lambda: reader, pytest.fail)
+    )
+
+    assert batches == []
+    assert reader.enter_calls == reader.close_calls == 1
+    assert len(reader.exit_triples) == 1
+    assert reader.exit_triples[0][0] is _CompatibilityFailure
+    assert reader.exit_triples[0][1] is error
+    assert metrics == ParseMetrics(streaming_passes=1)
+
+
 def test_streaming_never_restarts_after_the_first_yield() -> None:
     fallback_calls = 0
     primary = _StreamingReaderFake(
@@ -638,7 +1055,7 @@ def test_streaming_cleanup_failure_blocks_an_unsafe_fallback() -> None:
         [],
         "primary",
         [primary_error],
-        close_error=OSError("cursor restore failed"),
+        close_error=OSError("secret cursor restore path"),
     )
 
     def fallback_factory() -> _StreamingReaderFake:
@@ -658,6 +1075,7 @@ def test_streaming_cleanup_failure_blocks_an_unsafe_fallback() -> None:
     assert fallback_calls == 0
     assert primary.close_calls == 1
     assert any("cleanup" in note for note in captured.value.__notes__)
+    assert "secret" not in repr(captured.value.__notes__)
 
 
 def test_streaming_exhaustion_and_generator_close_each_close_exactly_once() -> None:
@@ -673,6 +1091,68 @@ def test_streaming_exhaustion_and_generator_close_each_close_exactly_once() -> N
 
     assert exhausted.close_calls == interrupted.close_calls == 1
     assert metrics.streaming_passes == 1
+
+
+def test_context_streaming_exhaustion_receives_the_none_exit_triple_once() -> None:
+    reader = _ContextStreamingReaderFake([], "primary", [_batch(1), None])
+
+    assert (
+        len(
+            list(
+                FallbackCoordinator(_is_compatibility_failure).batches(lambda: reader, pytest.fail)
+            )
+        )
+        == 1
+    )
+
+    assert reader.close_calls == 1
+    assert reader.exit_triples == [(None, None, None)]
+
+
+def test_context_streaming_early_close_receives_generator_exit_without_pass_metric() -> None:
+    metrics = ParseMetrics()
+    reader = _ContextStreamingReaderFake([], "primary", [_batch(1), None])
+    stream = FallbackCoordinator(
+        _is_compatibility_failure,
+        metrics=metrics,
+    ).batches(lambda: reader, pytest.fail)
+
+    assert next(stream).to_pydict() == {"value": [1]}
+    stream.close()
+
+    assert reader.close_calls == 1
+    assert len(reader.exit_triples) == 1
+    assert reader.exit_triples[0][0] is GeneratorExit
+    assert isinstance(reader.exit_triples[0][1], GeneratorExit)
+    assert metrics == ParseMetrics()
+
+
+def test_context_streaming_late_failure_receives_exact_triple_and_never_retries() -> None:
+    error = _CompatibilityFailure("late")
+    reader = _ContextStreamingReaderFake([], "primary", [_batch(1), error])
+    fallback_calls = 0
+
+    def fallback_factory() -> object:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    stream = FallbackCoordinator(_is_compatibility_failure).batches(
+        lambda: reader,
+        fallback_factory,
+    )
+    assert next(stream).to_pydict() == {"value": [1]}
+    with pytest.raises(_CompatibilityFailure) as captured:
+        next(stream)
+
+    assert captured.value is error
+    assert reader.close_calls == 1
+    assert len(reader.exit_triples) == 1
+    error_type, received_error, _traceback = reader.exit_triples[0]
+    assert error_type is _CompatibilityFailure
+    assert received_error is error
+    assert reader.exit_traceback_matches_error == [True]
+    assert fallback_calls == 0
 
 
 def test_closing_an_unstarted_stream_does_not_initialize_a_backend() -> None:

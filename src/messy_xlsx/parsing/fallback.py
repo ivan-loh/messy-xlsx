@@ -20,6 +20,7 @@ _OWNERSHIP_MARKERS = (
     "cursor restoration",
     "source ownership",
 )
+_MISSING_SPECIAL = object()
 
 
 @dataclass(slots=True)
@@ -27,6 +28,7 @@ class _OpenedReader:
     owner: Any
     reader: Any
     entered: bool
+    exit_method: Callable[[Any, Any, Any], Any] | None = None
 
 
 @dataclass(slots=True)
@@ -35,6 +37,7 @@ class _Attempt:
     error: BaseException | None = None
     traceback: TracebackType | None = None
     cleanup_failed: bool = False
+    suppressed: bool = False
 
 
 class FallbackCoordinator:
@@ -74,7 +77,7 @@ class FallbackCoordinator:
         self._record_materialization()
         return fallback.value
 
-    def batches(
+    def batches(  # noqa: C901
         self,
         primary_factory: Callable[[], Any],
         fallback_factory: Callable[[], Any],
@@ -90,6 +93,9 @@ class FallbackCoordinator:
                 if opened is None:
                     factory = fallback_factory if using_fallback else primary_factory
                     opened, attempt = _open_reader(factory, inspect_schema=True)
+                    if attempt.suppressed:
+                        self._record_streaming_pass()
+                        return
                     if attempt.error is not None:
                         primary_summary = self._handle_stream_failure(
                             attempt,
@@ -107,6 +113,9 @@ class FallbackCoordinator:
                     traceback = error.__traceback__
                     closed = _close_reader(opened, error, traceback)
                     opened = None
+                    if closed.suppressed:
+                        self._record_streaming_pass()
+                        return
                     primary_summary = self._handle_stream_failure(
                         closed,
                         yielded=yielded,
@@ -129,9 +138,41 @@ class FallbackCoordinator:
 
                 yielded = True
                 yield batch
+        except GeneratorExit as error:
+            if opened is not None:
+                closed = _close_reader(
+                    opened,
+                    error,
+                    error.__traceback__,
+                    cleanup_overrides=True,
+                )
+                opened = None
+                if closed.suppressed:
+                    return
+                assert closed.error is not None
+                if closed.error is not error:
+                    self._record_failure()
+                    if using_fallback and primary_summary is not None:
+                        _attach_primary_failure(closed.error, primary_summary)
+                    _raise_with_traceback(closed.error, closed.traceback)
+            raise
+        except BaseException as error:
+            if opened is not None:
+                closed = _close_reader(opened, error, error.__traceback__)
+                opened = None
+                if closed.suppressed:
+                    return
+                assert closed.error is not None
+                if closed.cleanup_failed:
+                    self._record_failure()
+                if using_fallback and primary_summary is not None:
+                    _attach_primary_failure(closed.error, primary_summary)
+                _raise_with_traceback(closed.error, closed.traceback)
+            raise
         finally:
             if opened is not None:
                 closed = _close_reader(opened, None, None)
+                opened = None
                 if closed.error is not None:
                     self._record_failure()
                     _raise_with_traceback(closed.error, closed.traceback)
@@ -171,7 +212,16 @@ class FallbackCoordinator:
             marker in message for marker in _OWNERSHIP_MARKERS
         ):
             return False
-        return self._is_compatibility_error(error)
+        try:
+            return self._is_compatibility_error(error)
+        except BaseException as classifier_error:
+            _merge_backend_context(
+                classifier_error,
+                primary_failure=_failure_summary(error),
+                classifier_failure=_failure_summary(classifier_error),
+            )
+            classifier_error.add_note(f"primary backend failed: {type(error).__name__}")
+            raise
 
     def _may_retry_stream(
         self,
@@ -233,14 +283,38 @@ def _open_reader(
     except BaseException as error:
         return None, _Attempt(error=error, traceback=error.__traceback__)
 
-    enter = getattr(owner, "__enter__", None)
+    try:
+        exit_method = _bind_special(owner, "__exit__")
+        enter = _bind_special(owner, "__enter__")
+    except BaseException as error:
+        opened = _OpenedReader(owner=owner, reader=owner, entered=False)
+        return None, _close_reader(opened, error, error.__traceback__)
+
+    has_exit = exit_method is not _MISSING_SPECIAL
+    has_enter = enter is not _MISSING_SPECIAL
+    if has_exit != has_enter or (has_enter and (not callable(enter) or not callable(exit_method))):
+        protocol_error = TypeError(
+            f"{type(owner).__name__} has an incomplete context manager protocol"
+        )
+        opened = _OpenedReader(owner=owner, reader=owner, entered=False)
+        return None, _close_reader(
+            opened,
+            protocol_error,
+            protocol_error.__traceback__,
+        )
+
     if callable(enter):
         try:
             reader = enter()
         except BaseException as error:
             opened = _OpenedReader(owner=owner, reader=owner, entered=False)
             return None, _close_reader(opened, error, error.__traceback__)
-        opened = _OpenedReader(owner=owner, reader=reader, entered=True)
+        opened = _OpenedReader(
+            owner=owner,
+            reader=reader,
+            entered=True,
+            exit_method=exit_method,
+        )
     else:
         opened = _OpenedReader(owner=owner, reader=owner, entered=False)
 
@@ -256,43 +330,69 @@ def _open_reader(
 
 def _declares_schema(reader: Any) -> bool:
     """Avoid requiring the future protocol field from legacy test doubles."""
-    return hasattr(type(reader), "schema") or "schema" in vars(reader)
+    class_declares = any("schema" in vars(owner) for owner in type(reader).__mro__)
+    instance_state = vars(reader) if hasattr(reader, "__dict__") else {}
+    return class_declares or "schema" in instance_state
+
+
+def _bind_special(owner: Any, name: str) -> Any:
+    """Bind a special method from the owner type/MRO, ignoring instance state."""
+    owner_type = type(owner)
+    for value_type in owner_type.__mro__:
+        namespace = vars(value_type)
+        if name not in namespace:
+            continue
+        descriptor = namespace[name]
+        binder = getattr(type(descriptor), "__get__", None)
+        if binder is None:
+            return descriptor
+        return binder(descriptor, owner, owner_type)
+    return _MISSING_SPECIAL
 
 
 def _close_reader(
     opened: _OpenedReader,
     primary_error: BaseException | None,
     primary_traceback: TracebackType | None,
+    *,
+    cleanup_overrides: bool = False,
 ) -> _Attempt:
     """Close once, keeping an ordinary cleanup failure attached to its cause."""
     try:
         if opened.entered:
-            exit_method = opened.owner.__exit__
-            exit_method(
-                type(primary_error) if primary_error is not None else None,
-                primary_error,
-                primary_traceback,
+            assert opened.exit_method is not None
+            suppressed = bool(
+                opened.exit_method(
+                    type(primary_error) if primary_error is not None else None,
+                    primary_error,
+                    primary_traceback,
+                )
             )
         else:
+            suppressed = False
             close = getattr(opened.owner, "close", None)
             if callable(close):
                 close()
     except BaseException as cleanup_error:
         cleanup_traceback = cleanup_error.__traceback__
         if primary_error is None:
+            cleanup_error.add_note(f"reader cleanup failed: {type(cleanup_error).__name__}")
+            _attach_cleanup_failure(cleanup_error, cleanup_error)
             return _Attempt(
                 error=cleanup_error,
                 traceback=cleanup_traceback,
                 cleanup_failed=True,
             )
-        if not isinstance(cleanup_error, Exception):
+        if cleanup_overrides or _cleanup_takes_precedence(cleanup_error):
             cleanup_error.add_note(f"backend operation also failed: {type(primary_error).__name__}")
+            _attach_operation_failure(cleanup_error, primary_error)
+            _attach_cleanup_failure(cleanup_error, cleanup_error)
             return _Attempt(
                 error=cleanup_error,
                 traceback=cleanup_traceback,
                 cleanup_failed=True,
             )
-        primary_error.add_note(f"reader cleanup also failed: {cleanup_error!r}")
+        primary_error.add_note(f"reader cleanup also failed: {type(cleanup_error).__name__}")
         _attach_cleanup_failure(primary_error, cleanup_error)
         return _Attempt(
             error=primary_error,
@@ -300,9 +400,17 @@ def _close_reader(
             cleanup_failed=True,
         )
 
-    if primary_error is not None:
+    if primary_error is not None and not suppressed:
         return _Attempt(error=primary_error, traceback=primary_traceback)
-    return _Attempt()
+    return _Attempt(suppressed=suppressed and primary_error is not None)
+
+
+def _cleanup_takes_precedence(error: BaseException) -> bool:
+    """Return whether teardown must replace an operation failure."""
+    return isinstance(error, (MemoryError, KeyboardInterrupt, SystemExit)) or not isinstance(
+        error,
+        Exception,
+    )
 
 
 def _failure_summary(error: BaseException) -> dict[str, str]:
@@ -315,10 +423,11 @@ def _attach_primary_failure(
     primary_summary: dict[str, str],
 ) -> None:
     fallback_summary = _failure_summary(fallback_error)
-    fallback_error.backend_context = {  # type: ignore[attr-defined]
-        "primary_failure": dict(primary_summary),
-        "fallback_failure": fallback_summary,
-    }
+    _merge_backend_context(
+        fallback_error,
+        primary_failure=dict(primary_summary),
+        fallback_failure=fallback_summary,
+    )
     fallback_error.add_note(f"primary backend failed: {primary_summary['type']}")
 
 
@@ -326,13 +435,46 @@ def _attach_cleanup_failure(
     primary_error: BaseException,
     cleanup_error: BaseException,
 ) -> None:
-    context = getattr(primary_error, "backend_context", {})
-    if not isinstance(context, dict):
-        context = {}
-    primary_error.backend_context = {  # type: ignore[attr-defined]
-        **context,
-        "cleanup_failure": _failure_summary(cleanup_error),
-    }
+    _merge_backend_context(
+        primary_error,
+        cleanup_failure=_failure_summary(cleanup_error),
+    )
+
+
+def _attach_operation_failure(
+    cleanup_error: BaseException,
+    operation_error: BaseException,
+) -> None:
+    _merge_backend_context(
+        cleanup_error,
+        operation_failure=_failure_summary(operation_error),
+    )
+
+
+def _merge_backend_context(
+    error: BaseException,
+    **updates: dict[str, str],
+) -> None:
+    """Merge only type summaries produced by this coordinator."""
+    context: dict[str, dict[str, str]] = {}
+    existing = getattr(error, "backend_context", None)
+    if isinstance(existing, dict):
+        for name in (
+            "primary_failure",
+            "fallback_failure",
+            "operation_failure",
+            "cleanup_failure",
+            "classifier_failure",
+        ):
+            summary = existing.get(name)
+            if (
+                isinstance(summary, dict)
+                and set(summary) == {"type"}
+                and isinstance(summary["type"], str)
+            ):
+                context[name] = {"type": summary["type"]}
+    context.update({name: dict(summary) for name, summary in updates.items()})
+    error.backend_context = context  # type: ignore[attr-defined]
 
 
 def _raise_with_traceback(
