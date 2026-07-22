@@ -419,17 +419,63 @@ def _freeze(  # noqa: C901
     active.add(identity)
     try:
         if type(value) is dict:
-            items = [(_freeze(key, active), _freeze(item, active)) for key, item in value.items()]
+            items = [
+                (
+                    _freeze(
+                        key,
+                        active,
+                        preserve_identity_reference=preserve_identity_reference,
+                    ),
+                    _freeze(
+                        item,
+                        active,
+                        preserve_identity_reference=preserve_identity_reference,
+                    ),
+                )
+                for key, item in value.items()
+            ]
             return _FrozenMapping(_order_mapping_items(items))
         if type(value) is list:
-            return _FrozenList(tuple(_freeze(item, active) for item in value))
+            return _FrozenList(
+                tuple(
+                    _freeze(
+                        item,
+                        active,
+                        preserve_identity_reference=preserve_identity_reference,
+                    )
+                    for item in value
+                )
+            )
         if type(value) is tuple:
-            return _FrozenTuple(tuple(_freeze(item, active) for item in value))
+            return _FrozenTuple(
+                tuple(
+                    _freeze(
+                        item,
+                        active,
+                        preserve_identity_reference=preserve_identity_reference,
+                    )
+                    for item in value
+                )
+            )
         if type(value) is set:
-            set_items = tuple(_freeze(item, active) for item in value)
+            set_items = tuple(
+                _freeze(
+                    item,
+                    active,
+                    preserve_identity_reference=preserve_identity_reference,
+                )
+                for item in value
+            )
             return _FrozenSet(_order_set_items(set_items))
         if type(value) is frozenset:
-            frozenset_items = tuple(_freeze(item, active) for item in value)
+            frozenset_items = tuple(
+                _freeze(
+                    item,
+                    active,
+                    preserve_identity_reference=preserve_identity_reference,
+                )
+                for item in value
+            )
             return _FrozenFrozenSet(_order_set_items(frozenset_items))
         if type(value) is bytearray:
             return _FrozenBytearray(bytes(value))
@@ -442,7 +488,15 @@ def _freeze(  # noqa: C901
             return FrozenDataclassValue(
                 dataclass_type=type(value),
                 attribute_values=tuple(
-                    (name, _freeze(item, active)) for name, item in sorted(attributes.items())
+                    (
+                        name,
+                        _freeze(
+                            item,
+                            active,
+                            preserve_identity_reference=preserve_identity_reference,
+                        ),
+                    )
+                    for name, item in sorted(attributes.items())
                 ),
             )
         if uses_identity_semantics:
@@ -455,7 +509,15 @@ def _freeze(  # noqa: C901
             return _FrozenObject(
                 object_type=type(value),
                 attribute_values=tuple(
-                    (name, _freeze(item, active)) for name, item in sorted(attributes.items())
+                    (
+                        name,
+                        _freeze(
+                            item,
+                            active,
+                            preserve_identity_reference=preserve_identity_reference,
+                        ),
+                    )
+                    for name, item in sorted(attributes.items())
                 ),
             )
         try:
@@ -542,6 +604,14 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
         return ("float", value.hexadecimal)
     if isinstance(value, _FrozenComplex):
         return ("complex", _stable_token(value.real), _stable_token(value.imaginary))
+    if isinstance(value, _FrozenIdentityReference):
+        return (
+            "identity",
+            value.type_module,
+            value.type_qualname,
+            value.type_identity,
+            value.identity,
+        )
     if isinstance(value, _FrozenMapping):
         return (
             "mapping",

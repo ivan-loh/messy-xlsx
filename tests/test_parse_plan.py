@@ -1509,6 +1509,57 @@ def test_identity_drop_token_uses_nonvirtual_stable_type_identity() -> None:
     assert first.thaw_drop_conditions()[0][1] is condition
 
 
+@pytest.mark.parametrize("container_kind", ["list", "tuple", "mapping", "set"])
+@pytest.mark.parametrize("leaf_kind", ["object", "dataclass"])
+def test_nested_drop_value_role_preserves_identity_leaves_and_snapshots_containers(
+    container_kind: str,
+    leaf_kind: str,
+) -> None:
+    if leaf_kind == "dataclass":
+        condition: object = _IdentityEqualityDataclass(["target"])
+        other: object = _IdentityEqualityDataclass(["other"])
+    else:
+        condition = _IdentityCondition()
+        other = _IdentityCondition()
+    if container_kind == "list":
+        operand: object = [condition, ["owned"]]
+    elif container_kind == "tuple":
+        operand = (condition, ["owned"])
+    elif container_kind == "mapping":
+        operand = {"identity": condition, "mutable": ["owned"]}
+    else:
+        operand = {condition}
+
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": operand}],
+        ),
+        None,
+        "xlsx",
+    )
+    initial_hash = hash(plan)
+
+    if container_kind in {"list", "tuple"}:
+        operand[1].append("changed")  # type: ignore[index,union-attr]
+    elif container_kind == "mapping":
+        operand["mutable"].append("changed")  # type: ignore[index,union-attr]
+    else:
+        operand.add(other)  # type: ignore[union-attr]
+
+    thawed = plan.thaw_drop_conditions()[0][1]
+    if container_kind in {"list", "tuple"}:
+        assert thawed[0] is condition
+        assert thawed[1] == ["owned"]
+    elif container_kind == "mapping":
+        assert thawed["identity"] is condition
+        assert thawed["mutable"] == ["owned"]
+    else:
+        assert thawed == {condition}
+        assert other not in thawed
+    assert hash(plan) == initial_hash
+
+
 def test_opaque_c_backed_mutable_callable_is_rejected_before_backend_io() -> None:
     opaque = partial(pow, 2)
 
