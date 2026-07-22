@@ -203,8 +203,6 @@ class FallbackCoordinator:
             return False
         if not isinstance(error, Exception):
             return False
-        if isinstance(error, (PermissionError, FileNotFoundError, MemoryError)):
-            return False
         try:
             return self._is_compatibility_error(error)
         except BaseException as classifier_error:

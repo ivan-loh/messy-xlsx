@@ -220,6 +220,14 @@ class TestHandlerRegistry:
             ),
             ExceptionGroup(
                 "outer",
+                [ExceptionGroup("inner", [PermissionError("denied")])],
+            ),
+            ExceptionGroup(
+                "outer",
+                [ExceptionGroup("inner", [FileNotFoundError("missing")])],
+            ),
+            ExceptionGroup(
+                "outer",
                 [
                     ExceptionGroup(
                         "inner",
@@ -274,6 +282,14 @@ class TestHandlerRegistry:
             ExceptionGroup(
                 "outer",
                 [ExceptionGroup("inner", [MemoryError("capacity")])],
+            ),
+            ExceptionGroup(
+                "outer",
+                [ExceptionGroup("inner", [PermissionError("denied")])],
+            ),
+            ExceptionGroup(
+                "outer",
+                [ExceptionGroup("inner", [FileNotFoundError("missing")])],
             ),
             ExceptionGroup(
                 "outer",

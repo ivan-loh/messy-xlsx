@@ -103,8 +103,30 @@ def _contains_process_failure(error: BaseException) -> bool:
 
 
 def _blocks_backend_retry(error: BaseException) -> bool:
-    """Return whether process semantics or an internal marker forbid retry."""
-    return _contains_process_failure(error) or _is_fallback_blocked(error)
+    """Find any bounded-tree leaf whose semantics make a retry unsafe."""
+    stack = [error]
+    seen: set[int] = set()
+    while stack:
+        candidate = stack.pop()
+        identity = id(candidate)
+        if identity in seen:
+            continue
+        if len(seen) >= _MAX_EXCEPTION_TREE_NODES:
+            return True
+        seen.add(identity)
+        if (
+            isinstance(candidate, (PermissionError, FileNotFoundError, MemoryError))
+            or not isinstance(candidate, Exception)
+            or _direct_fallback_block_reason(candidate) is not None
+        ):
+            return True
+        nested = _nested_exceptions(candidate)
+        if nested is None:
+            if isinstance(candidate, BaseExceptionGroup):
+                return True
+            continue
+        stack.extend(reversed(nested))
+    return False
 
 
 def _failure_summary(error: BaseException) -> dict[str, str]:

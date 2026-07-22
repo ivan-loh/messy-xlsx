@@ -670,7 +670,7 @@ class HandlerRegistry:
         with self._source_handle(file_source, filename) as source:
             return self._detect(source, filename)
 
-    def parse(  # noqa: C901
+    def parse(
         self,
         file_source: SourceInput | SourceHandle,
         sheet: str | None = None,
@@ -697,8 +697,6 @@ class HandlerRegistry:
 
             try:
                 return self._parse_with(handler, source, sheet, options)
-            except (PermissionError, FileNotFoundError, MemoryError):
-                raise
             except Exception as error:
                 if _blocks_backend_retry(error):
                     raise
@@ -712,8 +710,6 @@ class HandlerRegistry:
                 attempted_handlers.append(fallback_handler.__class__.__name__)
                 try:
                     return self._parse_with(fallback_handler, source, sheet, options)
-                except (PermissionError, FileNotFoundError, MemoryError):
-                    raise
                 except Exception as error:
                     if _blocks_backend_retry(error):
                         raise
@@ -727,7 +723,7 @@ class HandlerRegistry:
                 attempted_formats=attempted_handlers,
             )
 
-    def get_sheet_names(  # noqa: C901
+    def get_sheet_names(
         self,
         file_source: SourceInput | SourceHandle,
         format_type: str | None = None,
@@ -745,8 +741,6 @@ class HandlerRegistry:
 
             try:
                 return self._sheet_names_with(handler, source)
-            except (PermissionError, FileNotFoundError, MemoryError):
-                raise
             except Exception as error:
                 if _blocks_backend_retry(error):
                     raise
@@ -758,8 +752,6 @@ class HandlerRegistry:
 
                 try:
                     return self._sheet_names_with(fallback_handler, source)
-                except (PermissionError, FileNotFoundError, MemoryError):
-                    raise
                 except Exception as error:
                     if _blocks_backend_retry(error):
                         raise

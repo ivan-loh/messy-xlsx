@@ -1198,6 +1198,46 @@ def test_nested_process_groups_are_not_classified_suppressed_or_retried(
     assert fallback_calls == 0
 
 
+@pytest.mark.parametrize("leaf", [PermissionError("denied"), FileNotFoundError("missing")])
+@pytest.mark.parametrize("phase", ["materialized", "schema", "read"])
+def test_nested_hard_failure_groups_never_classify_or_retry(
+    leaf: Exception,
+    phase: str,
+) -> None:
+    group = ExceptionGroup("outer", [ExceptionGroup("inner", [leaf])])
+    fallback_calls = 0
+
+    def classifier(_error: Exception) -> bool:
+        pytest.fail("hard non-retryable group reached classifier")
+
+    def fallback_factory() -> object:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    with pytest.raises(ExceptionGroup) as captured:
+        if phase == "materialized":
+            FallbackCoordinator(classifier).materialize(
+                lambda: _MaterializedReaderFake([], "primary", read_error=group),
+                fallback_factory,
+            )
+        else:
+            list(
+                FallbackCoordinator(classifier).batches(
+                    lambda: _StreamingReaderFake(
+                        [],
+                        "primary",
+                        [group] if phase == "read" else [None],
+                        schema_error=group if phase == "schema" else None,
+                    ),
+                    fallback_factory,
+                )
+            )
+
+    assert captured.value is group
+    assert fallback_calls == 0
+
+
 def test_nested_marked_group_blocks_schema_fallback_and_preserves_identity() -> None:
     marked = _mark_fallback_blocked(
         ValueError("paramètre non valide"),
