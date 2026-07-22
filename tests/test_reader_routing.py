@@ -8,6 +8,7 @@ from typing import Any
 import pyarrow as pa
 import pytest
 
+import messy_xlsx.parsing.handler_registry as handler_registry_module
 from messy_xlsx.detection.format_detector import FormatDetector
 from messy_xlsx.parsing.contracts import BackendKind, OutputMode, ParseMetrics
 from messy_xlsx.parsing.csv_handler import CSVHandler, MetadataRowDetector
@@ -292,6 +293,34 @@ def test_multiple_ordinary_builtin_registries_remain_fast_path_eligible() -> Non
     registries = [HandlerRegistry(), HandlerRegistry(), HandlerRegistry()]
 
     assert all(registry._uses_builtin_components() for registry in registries for _ in range(3))
+
+
+@pytest.mark.parametrize(
+    "fingerprinter",
+    [
+        pytest.param(
+            lambda: handler_registry_module._CompositionFingerprinter(include_identity=True),
+            id="composition",
+        ),
+        pytest.param(
+            handler_registry_module._BehaviorFingerprinter,
+            id="behavior",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param([0] * 1_000_000, id="million-primitives"),
+        pytest.param(b"x" * 1_000_000, id="large-bytes"),
+    ],
+)
+def test_fingerprint_budget_counts_primitive_edges_and_bulk_bytes(
+    fingerprinter: Any,
+    value: object,
+) -> None:
+    with pytest.raises(RuntimeError, match="fingerprint budget"):
+        fingerprinter().token(value)
 
 
 def test_class_level_handler_override_before_registry_construction_is_custom(

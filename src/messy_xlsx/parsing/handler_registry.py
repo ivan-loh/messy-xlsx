@@ -30,6 +30,7 @@ from messy_xlsx.parsing.xlsx_handler import XLSXHandler
 
 _BUILTIN_HANDLER_TYPES = (XLSXHandler, XLSHandler, CSVHandler)
 _MAX_FINGERPRINT_NODES = 10_000
+_MAX_FINGERPRINT_COST = 10_000
 _REGISTRY_STATE_NAMES = frozenset(
     {
         "handlers",
@@ -48,15 +49,30 @@ class _FingerprintError(RuntimeError):
     """Raised when an extension graph cannot be inspected safely."""
 
 
-class _CompositionFingerprinter:
+class _FingerprintBudget:
+    def __init__(self) -> None:
+        self._cost = 0
+
+    def _charge(self, units: int = 1) -> None:
+        self._cost += units
+        if self._cost > _MAX_FINGERPRINT_COST:
+            raise _FingerprintError("fingerprint budget exceeded")
+
+
+class _CompositionFingerprinter(_FingerprintBudget):
     """Build a bounded recursive identity-and-state token for owned components."""
 
     def __init__(self, *, include_identity: bool) -> None:
+        super().__init__()
         self._seen: dict[int, int] = {}
         self._include_identity = include_identity
 
     def token(self, value: object) -> object:  # noqa: C901
-        if value is None or isinstance(value, (bool, int, str, bytes)):
+        self._charge()
+        if isinstance(value, bytes):
+            self._charge(len(value))
+            return (bytes, value)
+        if value is None or isinstance(value, (bool, int, str)):
             return (type(value), value)
         if isinstance(value, float):
             return (float, value.hex())
@@ -81,11 +97,12 @@ class _CompositionFingerprinter:
         if identity in self._seen:
             return ("ref", self._seen[identity])
         if len(self._seen) >= _MAX_FINGERPRINT_NODES:
-            raise _FingerprintError("component graph exceeds fingerprint limit")
+            raise _FingerprintError("fingerprint budget exceeded")
         node = len(self._seen)
         self._seen[identity] = node
 
         if type(value) is dict:
+            self._charge(len(value) * 2)
             return (
                 "dict",
                 node,
@@ -93,6 +110,7 @@ class _CompositionFingerprinter:
                 frozenset((self.token(key), self.token(item)) for key, item in value.items()),
             )
         if type(value) is list:
+            self._charge(len(value))
             return (
                 "list",
                 node,
@@ -100,6 +118,7 @@ class _CompositionFingerprinter:
                 tuple(self.token(item) for item in value),
             )
         if type(value) is tuple:
+            self._charge(len(value))
             return (
                 "tuple",
                 node,
@@ -107,6 +126,7 @@ class _CompositionFingerprinter:
                 tuple(self.token(item) for item in value),
             )
         if type(value) is set:
+            self._charge(len(value))
             return (
                 "set",
                 node,
@@ -114,6 +134,7 @@ class _CompositionFingerprinter:
                 frozenset(self.token(item) for item in value),
             )
         if type(value) is frozenset:
+            self._charge(len(value))
             return (
                 "frozenset",
                 node,
@@ -121,6 +142,7 @@ class _CompositionFingerprinter:
                 frozenset(self.token(item) for item in value),
             )
         if type(value) is bytearray:
+            self._charge(len(value))
             return (
                 "bytearray",
                 node,
@@ -128,6 +150,7 @@ class _CompositionFingerprinter:
                 bytes(value),
             )
         if type(value) is memoryview:
+            self._charge(value.nbytes)
             return (
                 "memoryview",
                 node,
@@ -143,6 +166,7 @@ class _CompositionFingerprinter:
                         state.setdefault(name, descriptor.__get__(value, type(value)))
                     except AttributeError:
                         continue
+        self._charge(len(state))
         return (
             "object",
             node,
@@ -152,14 +176,19 @@ class _CompositionFingerprinter:
         )
 
 
-class _BehaviorFingerprinter:
+class _BehaviorFingerprinter(_FingerprintBudget):
     """Snapshot raw class attributes without binding or invoking descriptors."""
 
     def __init__(self) -> None:
+        super().__init__()
         self._seen: dict[int, int] = {}
 
     def token(self, value: object) -> object:  # noqa: C901
-        if value is None or isinstance(value, (bool, int, str, bytes)):
+        self._charge()
+        if isinstance(value, bytes):
+            self._charge(len(value))
+            return (bytes, value)
+        if value is None or isinstance(value, (bool, int, str)):
             return (type(value), value)
         if isinstance(value, float):
             return (float, value.hex())
@@ -172,10 +201,11 @@ class _BehaviorFingerprinter:
             if identity in self._seen:
                 return ("ref", self._seen[identity])
             if len(self._seen) >= _MAX_FINGERPRINT_NODES:
-                raise _FingerprintError("class behavior exceeds fingerprint limit")
+                raise _FingerprintError("fingerprint budget exceeded")
             node = len(self._seen)
             self._seen[identity] = node
             closure: list[tuple[str, object]] = []
+            self._charge(len(value.__closure__ or ()) + 4)
             for name, cell in zip(
                 value.__code__.co_freevars,
                 value.__closure__ or (),
@@ -199,10 +229,13 @@ class _BehaviorFingerprinter:
                 self.token(vars(value)),
             )
         if isinstance(value, staticmethod):
+            self._charge()
             return ("staticmethod", self.token(value.__func__))
         if isinstance(value, classmethod):
+            self._charge()
             return ("classmethod", self.token(value.__func__))
         if isinstance(value, property):
+            self._charge(3)
             return (
                 "property",
                 self.token(value.fget),
@@ -229,27 +262,34 @@ class _BehaviorFingerprinter:
         if identity in self._seen:
             return ("ref", self._seen[identity])
         if len(self._seen) >= _MAX_FINGERPRINT_NODES:
-            raise _FingerprintError("class behavior exceeds fingerprint limit")
+            raise _FingerprintError("fingerprint budget exceeded")
         node = len(self._seen)
         self._seen[identity] = node
 
         if type(value) is dict:
+            self._charge(len(value) * 2)
             return (
                 "dict",
                 node,
                 frozenset((self.token(key), self.token(item)) for key, item in value.items()),
             )
         if type(value) is list:
+            self._charge(len(value))
             return ("list", node, tuple(self.token(item) for item in value))
         if type(value) is tuple:
+            self._charge(len(value))
             return ("tuple", node, tuple(self.token(item) for item in value))
         if type(value) is set:
+            self._charge(len(value))
             return ("set", node, frozenset(self.token(item) for item in value))
         if type(value) is frozenset:
+            self._charge(len(value))
             return ("frozenset", node, frozenset(self.token(item) for item in value))
         if type(value) is bytearray:
+            self._charge(len(value))
             return ("bytearray", node, bytes(value))
         if type(value) is memoryview:
+            self._charge(value.nbytes)
             return ("memoryview", node, value.tobytes())
         return ("opaque", type(value), identity)
 
