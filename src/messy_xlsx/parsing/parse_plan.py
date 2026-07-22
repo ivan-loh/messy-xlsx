@@ -548,13 +548,7 @@ def _freeze(  # noqa: C901
                     for name, item in sorted(attributes.items())
                 ),
             )
-        try:
-            hash(value)
-        except TypeError as error:
-            raise TypeError(
-                f"unsupported mutable configuration value: {type(value).__name__}"
-            ) from error
-        return value
+        raise TypeError(f"unsupported mutable configuration value: {type(value).__name__}")
     finally:
         active.remove(identity)
 

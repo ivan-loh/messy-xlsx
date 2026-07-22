@@ -1096,6 +1096,16 @@ class _CustomNewValue:
         return isinstance(other, _CustomNewValue) and self.value == other.value
 
 
+class _StatelessHashableValue:
+    __slots__ = ()
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _StatelessHashableValue)
+
+    def __hash__(self) -> int:
+        return 1
+
+
 def test_plan_thaws_fresh_values_with_original_supported_container_kinds() -> None:
     dataclass_value = _MutablePayload(["alpha"], {"codes": {1, 2}})
     object_value = _MutableObject(["original"])
@@ -1288,6 +1298,18 @@ def test_unknown_unsupported_mutable_value_is_rejected_before_backend_io() -> No
             SheetConfig(
                 auto_detect=False,
                 type_hints={"queue": deque([1, 2])},  # type: ignore[dict-item]
+            ),
+            None,
+            "xlsx",
+        )
+
+
+def test_stateless_custom_hashable_is_rejected_before_plan_retains_live_semantics() -> None:
+    with pytest.raises(TypeError, match="unsupported mutable configuration value"):
+        compile_parse_plan(
+            SheetConfig(
+                auto_detect=False,
+                type_hints={"opaque": _StatelessHashableValue()},  # type: ignore[dict-item]
             ),
             None,
             "xlsx",
