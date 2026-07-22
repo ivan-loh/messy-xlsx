@@ -32,6 +32,7 @@ from messy_xlsx.parsing.contracts import OutputMode
 
 _STRUCTURE_FORMATS: Final = frozenset({"xlsx", "xlsm", "xltx", "xltm"})
 _TEXT_FORMATS: Final = frozenset({"csv", "tsv", "txt"})
+_PY_TPFLAGS_IMMUTABLETYPE: Final = 1 << 8
 
 _COMMA_DECIMAL_DOT_THOUSANDS: Final = frozenset(
     {
@@ -767,6 +768,13 @@ def _has_object_allocation_layout(
     if value_type is object or value_type in seen:
         return True
     seen.add(value_type)
+
+    try:
+        flags = type.__getattribute__(value_type, "__flags__")
+    except BaseException:
+        return False
+    if type(flags) is not int or flags & _PY_TPFLAGS_IMMUTABLETYPE:
+        return False
 
     namespace = vars(value_type)
     if "__new__" in namespace:
