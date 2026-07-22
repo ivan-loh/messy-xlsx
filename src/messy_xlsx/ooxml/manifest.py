@@ -20,6 +20,7 @@ from messy_xlsx.cache import PathIdentity
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.ooxml.models import (
     DEFAULT_LIMITS,
+    CellEvidence,
     Interval,
     IntervalIndex,
     MergeRange,
@@ -865,6 +866,34 @@ def _xml_boolean(value: str | None) -> bool:
     return value is not None and value.casefold() in {"1", "true"}
 
 
+def _semantic_region(
+    row_bounds: Mapping[int, tuple[int, int]],
+    observed_max_row: int,
+) -> tuple[int, int, int, int]:
+    """Apply the legacy bounded-region heuristic to value-presence metadata."""
+    if not row_bounds:
+        return 1, 1, 1, 1
+    first_row = min(row_bounds)
+    scan_start = 1 if first_row <= 10_000 else first_row
+    scan_end = min(observed_max_row, scan_start + 9_999)
+    included: list[int] = []
+    last_data_row: int | None = None
+    for row in sorted(row for row in row_bounds if scan_start <= row <= scan_end):
+        if last_data_row is not None and row - last_data_row >= 102:
+            break
+        included.append(row)
+        last_data_row = row
+    if not included:
+        return 1, 1, 1, 1
+    start_row = included[0]
+    end_row = included[-1]
+    start_col = min(row_bounds[row][0] for row in included)
+    end_col = max(row_bounds[row][1] for row in included)
+    if scan_end < observed_max_row and scan_end - end_row < 10:
+        end_row = observed_max_row
+    return start_row, end_row, start_col, end_col
+
+
 class ManifestReader:
     """Build workbook metadata eagerly and sheet metadata on first request.
 
@@ -883,9 +912,7 @@ class ManifestReader:
         self._limits = limits
         self._on_member_open = on_member_open
         self.workbook = build_manifest(source, limits)
-        self._path_identity = (
-            PathIdentity.before(source.path) if source.path is not None else None
-        )
+        self._path_identity = PathIdentity.before(source.path) if source.path is not None else None
         self._sheets: dict[str, SheetManifest] = {}
 
     def sheet(self, name: str) -> SheetManifest:
@@ -938,17 +965,29 @@ class ManifestReader:
         declared_dimension: tuple[int, int, int, int] | None = None
         observed_max_row = 0
         observed_max_col = 0
+        observed_min_col = 0
         hidden_rows: list[Interval] = []
         hidden_columns: list[Interval] = []
         merged_ranges: list[MergeRange] = []
         formula_samples: list[str] = []
+        formula_probe_coordinates: list[tuple[int, int]] = []
         number_format_codes: list[str] = []
         seen_number_format_codes: set[str] = set()
+        semantic_row_bounds: dict[int, tuple[int, int]] = {}
+        primary_cell_evidence: dict[tuple[int, int], CellEvidence] = {}
+        tail_cell_evidence: dict[int, list[CellEvidence]] = {}
         has_formulas = False
         current_cell: str | None = None
+        current_row = 0
+        current_column = 0
+        current_data_type = "n"
+        current_number_format = "General"
+        current_has_value = False
+        current_has_formula = False
+        first_semantic_row: int | None = None
         namespace: str | None = None
         namespaced_elements = frozenset(
-            {"worksheet", "dimension", "row", "col", "c", "f", "mergeCell"}
+            {"worksheet", "dimension", "row", "col", "c", "f", "v", "t", "mergeCell"}
         )
 
         for event, element in safe_iterparse(source, member, self._limits):
@@ -967,13 +1006,22 @@ class ManifestReader:
             )
             if event == "start" and local_name == "c":
                 current_cell = element.attrib.get("r")
-                row, column = _coordinate(current_cell, member)
-                observed_max_row = max(observed_max_row, row)
-                observed_max_col = max(observed_max_col, column)
+                current_row, current_column = _coordinate(current_cell, member)
+                observed_max_row = max(observed_max_row, current_row)
+                observed_max_col = max(observed_max_col, current_column)
+                observed_min_col = (
+                    current_column
+                    if observed_min_col == 0
+                    else min(observed_min_col, current_column)
+                )
+                current_data_type = element.attrib.get("t", "n")
+                current_has_value = False
+                current_has_formula = False
                 style_index = _style_index(element.attrib.get("s"), member)
                 style_codes = self.workbook.styles.number_format_codes
                 if style_index < len(style_codes):
-                    format_code = style_codes[style_index]
+                    current_number_format = style_codes[style_index]
+                    format_code = current_number_format
                     if (
                         format_code
                         and format_code != "General"
@@ -987,6 +1035,8 @@ class ManifestReader:
                         member=member,
                         style=style_index,
                     )
+                else:
+                    current_number_format = "General"
             elif event == "end" and local_name == "dimension":
                 declared_dimension = _range(element.attrib.get("ref"), member)
             elif (
@@ -994,9 +1044,7 @@ class ManifestReader:
                 and local_name == "row"
                 and _xml_boolean(element.attrib.get("hidden"))
             ):
-                row = _one_based_int(
-                    element.attrib.get("r"), member, "r", _MAX_EXCEL_ROW
-                )
+                row = _one_based_int(element.attrib.get("r"), member, "r", _MAX_EXCEL_ROW)
                 hidden_rows.append(Interval(row, row))
             elif (
                 event == "end"
@@ -1005,28 +1053,83 @@ class ManifestReader:
             ):
                 hidden_columns.append(
                     Interval(
-                        _one_based_int(
-                            element.attrib.get("min"), member, "min", _MAX_EXCEL_COLUMN
-                        ),
-                        _one_based_int(
-                            element.attrib.get("max"), member, "max", _MAX_EXCEL_COLUMN
-                        ),
+                        _one_based_int(element.attrib.get("min"), member, "min", _MAX_EXCEL_COLUMN),
+                        _one_based_int(element.attrib.get("max"), member, "max", _MAX_EXCEL_COLUMN),
                     )
                 )
             elif event == "end" and local_name == "mergeCell":
                 min_row, min_col, max_row, max_col = _range(element.attrib.get("ref"), member)
                 merged_ranges.append(MergeRange(min_row, min_col, max_row, max_col))
+            elif event == "end" and local_name in {"v", "t"} and current_cell is not None:
+                if element.text not in {None, ""}:
+                    current_has_value = True
             elif event == "end" and local_name == "f":
                 has_formulas = True
+                current_has_formula = True
                 if (
                     current_cell is not None
                     and len(formula_samples) < self._limits.max_formula_samples
                 ):
                     formula_samples.append(current_cell)
             elif event == "end" and local_name == "c":
+                if current_has_value:
+                    previous = semantic_row_bounds.get(current_row)
+                    if previous is None:
+                        semantic_row_bounds[current_row] = (
+                            current_column,
+                            current_column,
+                        )
+                    else:
+                        semantic_row_bounds[current_row] = (
+                            min(previous[0], current_column),
+                            max(previous[1], current_column),
+                        )
+                    first_semantic_row = (
+                        current_row
+                        if first_semantic_row is None
+                        else min(first_semantic_row, current_row)
+                    )
+                evidence = CellEvidence(
+                    row=current_row,
+                    column=current_column,
+                    data_type=current_data_type,
+                    has_value=current_has_value,
+                    has_formula=current_has_formula,
+                    number_format=current_number_format,
+                )
+                tail_cell_evidence.setdefault(current_row, []).append(evidence)
+                for old_row in tuple(tail_cell_evidence):
+                    if old_row < observed_max_row - 9:
+                        del tail_cell_evidence[old_row]
+                if (
+                    first_semantic_row is not None
+                    and first_semantic_row <= current_row <= first_semantic_row + 9_999
+                ):
+                    primary_cell_evidence[(current_row, current_column)] = evidence
+                if (
+                    current_has_formula
+                    and first_semantic_row is not None
+                    and first_semantic_row <= current_row <= first_semantic_row + 49
+                ):
+                    formula_probe_coordinates.append((current_row, current_column))
                 current_cell = None
             if event == "end":
                 element.clear()
+
+        semantic_data_region = _semantic_region(
+            semantic_row_bounds,
+            observed_max_row,
+        )
+        start_row, _end_row, start_col, end_col = semantic_data_region
+        legacy_has_formulas = any(
+            start_row <= row <= start_row + 49
+            and start_col <= column <= min(end_col, start_col + 9)
+            for row, column in formula_probe_coordinates
+        )
+        combined_evidence = dict(primary_cell_evidence)
+        for row_evidence in tail_cell_evidence.values():
+            for evidence in row_evidence:
+                combined_evidence[(evidence.row, evidence.column)] = evidence
 
         return SheetManifest(
             name=descriptor.name,
@@ -1040,4 +1143,11 @@ class ManifestReader:
             has_formulas=has_formulas,
             formula_samples=tuple(formula_samples),
             number_format_codes=tuple(number_format_codes),
+            observed_min_col=observed_min_col,
+            semantic_data_region=semantic_data_region,
+            semantic_nonempty_rows=IntervalIndex(
+                tuple(Interval(row, row) for row in semantic_row_bounds)
+            ),
+            cell_evidence=tuple(combined_evidence.values()),
+            legacy_has_formulas=legacy_has_formulas,
         )

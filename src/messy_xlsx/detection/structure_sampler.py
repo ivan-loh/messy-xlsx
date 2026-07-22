@@ -8,15 +8,17 @@ from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
-from openpyxl.utils.cell import coordinate_to_tuple
+from openpyxl.styles.numbers import is_date_format
 
 from messy_xlsx.cache import StructureCache
 from messy_xlsx.detection.locale_detector import LocaleDetector
 from messy_xlsx.detection.structure_analyzer import StructureAnalyzer
 from messy_xlsx.models import StructureInfo
-from messy_xlsx.ooxml.models import IntervalIndex, SheetManifest
+from messy_xlsx.ooxml.models import CellEvidence, IntervalIndex, SheetManifest
 
 _NUMERIC_EVIDENCE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?$")
+_MISSING_EVIDENCE = object()
+_DATE_EVIDENCE = object()
 
 
 @dataclass(frozen=True)
@@ -84,13 +86,16 @@ def coalesce_rows(rows: tuple[int, ...]) -> tuple[SampleWindow, ...]:
     return tuple(windows)
 
 
-def structure_sample_windows(max_row: int) -> tuple[SampleWindow, ...]:
+def structure_sample_windows(
+    max_row: int,
+    start_row: int = 1,
+) -> tuple[SampleWindow, ...]:
     """Build the bounded union of head, blank-sample, and footer rows."""
-    if max_row < 1:
+    if max_row < 1 or start_row < 1 or start_row > max_row:
         return ()
-    head = range(1, min(max_row, 10_000) + 1)
-    tail = range(max(1, max_row - 9), max_row + 1)
-    sampled_blanks = blank_row_sample_positions(1, max_row)
+    head = range(start_row, min(max_row, start_row + 9_999) + 1)
+    tail = range(max(start_row, max_row - 9), max_row + 1)
+    sampled_blanks = blank_row_sample_positions(start_row, max_row)
     rows = tuple(sorted(set(head) | set(tail) | set(sampled_blanks)))
     return coalesce_rows(rows)
 
@@ -100,21 +105,27 @@ class _EvidenceWorksheet:
 
     def __init__(self, evidence: StructureEvidence, manifest: SheetManifest) -> None:
         self._evidence = evidence
-        self._formula_coordinates = {
-            coordinate_to_tuple(coordinate) for coordinate in manifest.formula_samples
-        }
-        self.max_row = manifest.observed_max_row or 1
-        self.max_column = manifest.observed_max_col or 1
+        self._retained_rows = frozenset(evidence.row_numbers)
+        self._cell_evidence = {(cell.row, cell.column): cell for cell in manifest.cell_evidence}
+        self._semantic_nonempty_rows = manifest.semantic_nonempty_rows
+        region = manifest.semantic_data_region
+        self.max_row = region[1]
+        self.max_column = region[3]
 
     def cell(self, row: int, column: int) -> SimpleNamespace:
         value = self._value(row, column)
-        return SimpleNamespace(value=value, number_format="General")
+        metadata = self._cell_evidence.get((row, column))
+        number_format = "General" if metadata is None else metadata.number_format
+        return SimpleNamespace(value=value, number_format=number_format)
 
     def _value(self, row: int, column: int) -> object:
-        if (row, column) in self._formula_coordinates:
+        if not self._semantic_nonempty_rows.contains(row):
             return None
+        if row not in self._retained_rows:
+            return _MISSING_EVIDENCE
         values = self._evidence.row(row)
-        return _worksheet_scalar(values[column - 1]) if column <= len(values) else None
+        value = values[column - 1] if column <= len(values) else None
+        return _worksheet_scalar(value, self._cell_evidence.get((row, column)))
 
     def iter_rows(
         self,
@@ -134,9 +145,23 @@ class _EvidenceWorksheet:
                 yield tuple(SimpleNamespace(value=value) for value in row)
 
 
-def _worksheet_scalar(value: object) -> object:
-    """Recover numeric cell evidence coerced to text by Arrow's column dtype."""
-    if isinstance(value, str) and _NUMERIC_EVIDENCE.fullmatch(value):
+def _worksheet_scalar(value: object, evidence: CellEvidence | None) -> object:
+    """Recover a scalar only when exact OOXML provenance permits coercion."""
+    if evidence is None:
+        return value
+    if not evidence.has_value:
+        return None
+    if evidence.data_type == "b":
+        if isinstance(value, str):
+            return value.casefold() in {"1", "true"}
+        return bool(value)
+    if evidence.data_type == "d" or is_date_format(evidence.number_format):
+        return value if not isinstance(value, str) else _DATE_EVIDENCE
+    if (
+        evidence.data_type in {"n", ""}
+        and isinstance(value, str)
+        and _NUMERIC_EVIDENCE.fullmatch(value)
+    ):
         try:
             return float(value) if any(marker in value for marker in ".eE") else int(value)
         except ValueError:
@@ -153,19 +178,21 @@ def _expand_intervals(index: IntervalIndex) -> list[int]:
 
 
 def _locale_evidence(
-    evidence: StructureEvidence,
+    worksheet: _EvidenceWorksheet,
     data_region: dict[str, int],
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     text_values: list[str] = []
+    format_codes: list[str] = []
     end_row = min(data_region["end_row"], data_region["start_row"] + 50)
     end_col = min(data_region["end_col"], data_region["start_col"] + 20)
     for row in range(data_region["start_row"], end_row + 1):
-        values = evidence.row(row)
         for column in range(data_region["start_col"], end_col + 1):
-            value = values[column - 1] if column <= len(values) else None
-            if isinstance(value, str):
-                text_values.append(value)
-    return text_values
+            cell = worksheet.cell(row, column)
+            if isinstance(cell.value, str):
+                text_values.append(cell.value)
+            if cell.number_format and cell.number_format != "General":
+                format_codes.append(cell.number_format)
+    return text_values, format_codes
 
 
 def analyze_structure_evidence(
@@ -176,7 +203,13 @@ def analyze_structure_evidence(
     """Apply the established analyzer heuristics to bounded evidence."""
     analyzer = StructureAnalyzer(cache=StructureCache())
     worksheet = _EvidenceWorksheet(evidence, manifest)
-    data_region = analyzer._detect_data_region(worksheet)
+    start_row, end_row, start_col, end_col = manifest.semantic_data_region
+    data_region = {
+        "start_row": start_row,
+        "end_row": end_row,
+        "start_col": start_col,
+        "end_col": end_col,
+    }
     merged = [
         (item.min_row, item.min_col, item.max_row, item.max_col) for item in manifest.merged_ranges
     ]
@@ -192,10 +225,8 @@ def analyze_structure_evidence(
     tables = analyzer._detect_multiple_tables(worksheet, data_region, header)
     blank_rows = analyzer._detect_blank_rows(worksheet, data_region)
     sparse_columns = analyzer._detect_sparse_columns(worksheet, data_region)
-    locale = LocaleDetector().detect_from_evidence(
-        _locale_evidence(evidence, data_region),
-        list(manifest.number_format_codes),
-    )
+    text_values, format_codes = _locale_evidence(worksheet, data_region)
+    locale = LocaleDetector().detect_from_evidence(text_values, format_codes)
     return StructureInfo(
         data_start_row=data_region["start_row"],
         data_end_row=data_region["end_row"],
@@ -216,7 +247,7 @@ def analyze_structure_evidence(
         num_tables=len(tables),
         table_ranges=[analyzer._table_to_dict(table) for table in tables],
         blank_rows=blank_rows,
-        has_formulas=manifest.has_formulas,
+        has_formulas=manifest.legacy_has_formulas,
         sparse_columns=sparse_columns,
         suggested_skip_rows=analyzer._suggest_skip_rows(metadata, header),
         suggested_skip_footer=analyzer._suggest_skip_footer(worksheet, data_region),
@@ -248,10 +279,12 @@ class StructureSampler:
         if cached is not None:
             return cached
         manifest = self._manifest_reader.sheet(sheet)
-        windows = structure_sample_windows(manifest.observed_max_row)
+        start_row, end_row, _start_col, _end_col = manifest.semantic_data_region
+        windows = structure_sample_windows(end_row, start_row)
         evidence = self._excel_reader.sample_windows(
             sheet,
             windows=windows,
+            min_column=manifest.observed_min_col,
             max_column=manifest.observed_max_col,
         )
         result = analyze_structure_evidence(evidence, manifest, key[1])

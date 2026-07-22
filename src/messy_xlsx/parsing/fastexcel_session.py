@@ -28,6 +28,7 @@ class FastexcelSession:
         self,
         sheet: str,
         windows: tuple[SampleWindow, ...],
+        min_column: int,
         max_column: int,
     ) -> StructureEvidence:
         """Read bounded windows using integer skip_rows and n_rows only."""
@@ -42,10 +43,13 @@ class FastexcelSession:
                 "schema_sample_rows": min(1_000, window.n_rows),
                 "eager": True,
             }
-            if max_column > 0:
-                options["use_columns"] = list(range(max_column))
+            if min_column > 0 and max_column >= min_column:
+                options["use_columns"] = list(range(min_column - 1, max_column))
             batch = self._reader.load_sheet(sheet, **options)
             frame = batch.to_pandas()
+            if min_column > 1:
+                frame.columns = range(min_column, min_column + len(frame.columns))
+                frame = frame.reindex(columns=range(1, max_column + 1))
             frame.index = pd.RangeIndex(
                 window.start_row,
                 window.start_row + len(frame),

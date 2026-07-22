@@ -81,6 +81,22 @@ class MergeRange:
 
 
 @dataclass(frozen=True)
+class CellEvidence:
+    """Value-free OOXML provenance for one structurally sampled cell."""
+
+    row: int
+    column: int
+    data_type: str
+    has_value: bool
+    has_formula: bool
+    number_format: str = "General"
+
+    def __post_init__(self) -> None:
+        if self.row < 1 or self.column < 1:
+            raise ValueError("cell evidence requires positive one-based coordinates")
+
+
+@dataclass(frozen=True)
 class SheetManifest:
     """Metadata-only index from one worksheet XML pass."""
 
@@ -95,6 +111,11 @@ class SheetManifest:
     has_formulas: bool
     formula_samples: tuple[str, ...]
     number_format_codes: tuple[str, ...] = ()
+    observed_min_col: int = 0
+    semantic_data_region: tuple[int, int, int, int] = (1, 1, 1, 1)
+    semantic_nonempty_rows: IntervalIndex = field(default_factory=lambda: IntervalIndex(()))
+    cell_evidence: tuple[CellEvidence, ...] = ()
+    legacy_has_formulas: bool = False
 
 
 @dataclass(frozen=True)

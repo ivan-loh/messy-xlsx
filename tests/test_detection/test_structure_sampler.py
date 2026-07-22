@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from datetime import date
 from itertools import pairwise
 from pathlib import Path
 from zipfile import ZIP_STORED, ZipFile
@@ -60,9 +61,17 @@ class RecordingExcelReader:
         self,
         sheet: str,
         windows: tuple[SampleWindow, ...],
+        min_column: int,
         max_column: int,
     ) -> StructureEvidence:
-        self.requests.append({"sheet": sheet, "windows": windows, "max_column": max_column})
+        self.requests.append(
+            {
+                "sheet": sheet,
+                "windows": windows,
+                "min_column": min_column,
+                "max_column": max_column,
+            }
+        )
         return StructureEvidence(
             row_numbers=(1, 2),
             values=pd.DataFrame([["name", "value"], ["a", 1]], index=(1, 2)),
@@ -86,6 +95,13 @@ def test_structure_sample_windows_are_sorted_coalesced_and_bounded() -> None:
         for current, following in pairwise(windows)
     )
     assert windows[-1].start_row + windows[-1].n_rows - 1 == 1_000_000
+
+
+def test_offset_structure_sample_windows_remain_bounded() -> None:
+    windows = structure_sample_windows(1_000_000, start_row=12_000)
+
+    assert windows[0].start_row == 12_000
+    assert sum(window.n_rows for window in windows) <= 10_500
 
 
 def test_sampler_reuses_reader_and_caches_by_sheet_and_pattern_tuple() -> None:
@@ -161,6 +177,7 @@ def test_fastexcel_session_uses_integer_windows_and_one_backend_context(monkeypa
     evidence = session.sample_windows(
         "Data",
         (SampleWindow(3, 2), SampleWindow(10, 1)),
+        min_column=1,
         max_column=1,
     )
     session.close()
@@ -173,6 +190,11 @@ def test_fastexcel_session_uses_integer_windows_and_one_backend_context(monkeypa
     assert [request["skip_rows"] for request in backend.requests] == [2, 9]
     assert [request["n_rows"] for request in backend.requests] == [2, 1]
     assert all(type(request["skip_rows"]) is int for request in backend.requests)
+    assert all(type(request["n_rows"]) is int for request in backend.requests)
+    assert all(
+        all(type(column) is int for column in request["use_columns"])
+        for request in backend.requests
+    )
 
 
 def test_fastexcel_session_closes_source_when_backend_initialization_fails(monkeypatch) -> None:
@@ -249,9 +271,7 @@ def test_fresh_components_analyze_multiple_sheets_without_nested_borrows(
 ) -> None:
     content = _workbook_bytes(tmp_path, disk_spool=source_kind == "disk_spool")
     raw_source = (
-        tmp_path / "composition.xlsx"
-        if source_kind == "path"
-        else NonSeekableBytes(content)
+        tmp_path / "composition.xlsx" if source_kind == "path" else NonSeekableBytes(content)
     )
 
     with SourceHandle(raw_source) as source:
@@ -299,8 +319,140 @@ def test_sampler_matches_existing_structure_characterization(
         manifest_reader = ManifestReader(source)
         sheet = manifest_reader.workbook.sheets[0].name
         expected = StructureAnalyzer().analyze(path, sheet, force=True)
-        sheet_manifest = manifest_reader.sheet(sheet)
         with FastexcelSession(source) as session:
             actual = StructureSampler(session, manifest_reader).analyze(sheet)
 
-    assert actual == replace(expected, has_formulas=sheet_manifest.has_formulas)
+    assert actual == expected
+
+
+def _differential_results(path: Path) -> tuple[object, object, SheetManifest]:
+    expected = StructureAnalyzer().analyze(path, "Data", force=True)
+    with SourceHandle(path) as source:
+        manifest_reader = ManifestReader(source)
+        manifest = manifest_reader.sheet("Data")
+        with FastexcelSession(source) as session:
+            actual = StructureSampler(session, manifest_reader).analyze("Data")
+    return expected, actual, manifest
+
+
+def test_mixed_cell_types_preserve_numeric_text_boolean_and_date_provenance(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "mixed-types.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.append(["identifier"])
+    for value in ("001", "2024", "1e3", "+12.50", "-7.25", True, date(2024, 1, 2), 42):
+        worksheet.append([value])
+    workbook.save(path)
+    workbook.close()
+
+    expected, actual, _manifest = _differential_results(path)
+
+    assert actual == expected
+
+
+def test_uncached_formulas_beyond_diagnostic_cap_do_not_change_structure(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "many-formulas.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    for row in range(1, 301):
+        worksheet.cell(row=row, column=1, value=f"={row}+1")
+    worksheet.cell(row=301, column=2, value="name")
+    worksheet.cell(row=301, column=3, value="amount")
+    worksheet.cell(row=302, column=2, value="alpha")
+    worksheet.cell(row=302, column=3, value=1)
+    workbook.save(path)
+    workbook.close()
+
+    expected, actual, manifest = _differential_results(path)
+
+    assert len(manifest.formula_samples) == 256
+    assert manifest.has_formulas is True
+    assert actual == expected
+    assert actual.data_start_row == 301
+
+
+@pytest.mark.parametrize(
+    ("formula_row", "formula_column", "expected_has_formulas"),
+    [(50, 10, True), (51, 10, False), (50, 11, False)],
+)
+def test_legacy_formula_flag_uses_only_first_50_data_rows(
+    tmp_path: Path,
+    formula_row: int,
+    formula_column: int,
+    expected_has_formulas: bool,
+) -> None:
+    path = tmp_path / f"formula-{formula_row}-{formula_column}.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    for row in range(1, 61):
+        worksheet.cell(row=row, column=1, value=row)
+        worksheet.cell(row=row, column=10, value=row)
+    worksheet.cell(row=formula_row, column=formula_column, value="=1+1")
+    workbook.save(path)
+    workbook.close()
+
+    expected, actual, manifest = _differential_results(path)
+
+    assert manifest.has_formulas is True
+    assert expected.has_formulas is expected_has_formulas
+    assert actual.has_formulas is expected_has_formulas
+
+
+def test_distant_number_format_does_not_affect_locale_probe(tmp_path: Path) -> None:
+    path = tmp_path / "locale-scope.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet["A1"] = "amount"
+    worksheet["A2"] = 1.25
+    worksheet["A100"] = 2.5
+    worksheet["A100"].number_format = "#.##0,00"
+    workbook.save(path)
+    workbook.close()
+
+    expected, actual, _manifest = _differential_results(path)
+
+    assert expected.detected_locale == "en_US"
+    assert actual == expected
+
+
+def test_offset_large_region_does_not_treat_unrequested_rows_as_blank(tmp_path: Path) -> None:
+    path = tmp_path / "offset-large.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    for row in range(5, 20_001):
+        worksheet.cell(row=row, column=1, value=row)
+    workbook.save(path)
+    workbook.close()
+
+    expected, actual, manifest = _differential_results(path)
+
+    assert expected.blank_rows == []
+    assert actual.blank_rows == []
+    assert actual == expected
+    assert len({cell.row for cell in manifest.cell_evidence}) <= 10_500
+
+
+def test_data_region_can_start_after_legacy_head_window(tmp_path: Path) -> None:
+    path = tmp_path / "deep-offset.xlsx"
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.cell(row=12_000, column=3, value="name")
+    worksheet.cell(row=12_001, column=3, value="alpha")
+    worksheet.cell(row=12_001, column=4, value=1)
+    workbook.save(path)
+    workbook.close()
+
+    _expected, actual, _manifest = _differential_results(path)
+
+    assert actual.data_start_row == 12_000
+    assert actual.data_start_col == 3
