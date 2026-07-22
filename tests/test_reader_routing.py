@@ -13,6 +13,7 @@ from messy_xlsx._fallback_signals import (
     _FallbackBlockReason,
     _mark_fallback_blocked,
 )
+from messy_xlsx._source import SourceHandle
 from messy_xlsx.detection.format_detector import FormatDetector
 from messy_xlsx.parsing.contracts import BackendKind, OutputMode, ParseMetrics
 from messy_xlsx.parsing.csv_handler import CSVHandler, MetadataRowDetector
@@ -254,6 +255,22 @@ def test_referenced_project_global_rebind_and_restore_is_detected() -> None:
         assert registry._uses_builtin_components() is False
     finally:
         function_globals["SourceHandle"] = original
+
+    assert registry._uses_builtin_components() is True
+
+
+def test_referenced_project_type_behavior_mutation_and_restore_is_detected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = HandlerRegistry()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SourceHandle,
+            "coerce",
+            classmethod(lambda cls, source, filename=None: cls(source, filename)),
+        )
+        assert registry._uses_builtin_components() is False
 
     assert registry._uses_builtin_components() is True
 

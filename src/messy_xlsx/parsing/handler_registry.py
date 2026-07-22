@@ -51,6 +51,9 @@ _FINGERPRINT_BOOTSTRAP_GLOBALS = frozenset(
         "_CANONICAL_COMPONENT_SHAPE",
     }
 )
+_NON_BEHAVIOR_CLASS_ATTRIBUTES = frozenset(
+    {"__dict__", "__doc__", "__module__", "__qualname__", "__weakref__"}
+)
 
 
 class _FingerprintError(RuntimeError):
@@ -343,7 +346,9 @@ class _BehaviorFingerprinter(_FingerprintBudget):
                 module = type.__getattribute__(value, "__module__")
             except BaseException:
                 module = "<unknown>"
-            return ("project-type" if module.startswith("messy_xlsx") else "type", id(value))
+            if module.startswith("messy_xlsx"):
+                return self._project_type_token(value)
+            return ("type", id(value))
         if isinstance(value, ModuleType):
             return ("module", value.__name__, id(value))
         if isinstance(
@@ -365,6 +370,77 @@ class _BehaviorFingerprinter(_FingerprintBudget):
         ):
             return self.token(value)
         return ("global", type(value), id(value))
+
+    def _project_type_token(self, value_type: type[object]) -> object:
+        """Fingerprint bounded raw behavior for a referenced project type."""
+        identity = id(value_type)
+        if identity in self._seen:
+            return ("ref", self._seen[identity])
+        if len(self._seen) >= _MAX_FINGERPRINT_NODES:
+            raise _FingerprintError("fingerprint budget exceeded")
+        node = len(self._seen)
+        self._seen[identity] = node
+
+        namespace = vars(value_type)
+        attributes: list[tuple[str, object]] = []
+        for name, value in sorted(namespace.items()):
+            if name in _NON_BEHAVIOR_CLASS_ATTRIBUTES:
+                continue
+            self._charge(len(name))
+            attributes.append((name, self._class_attribute_token(value)))
+        self._charge(len(attributes))
+        return ("project-type", node, value_type, tuple(attributes))
+
+    def _class_attribute_token(self, value: object) -> object:
+        """Fingerprint raw class behavior without expanding another global graph."""
+        if isinstance(value, FunctionType):
+            return self._shallow_function_token(value)
+        if isinstance(value, staticmethod):
+            return ("staticmethod", self._class_attribute_token(value.__func__))
+        if isinstance(value, classmethod):
+            return ("classmethod", self._class_attribute_token(value.__func__))
+        if isinstance(value, property):
+            return (
+                "property",
+                self._class_attribute_token(value.fget),
+                self._class_attribute_token(value.fset),
+                self._class_attribute_token(value.fdel),
+            )
+        return self.token(value)
+
+    def _shallow_function_token(self, value: FunctionType) -> object:
+        """Capture code, closure, defaults, and state but not transitive globals."""
+        identity = id(value)
+        if identity in self._seen:
+            return ("ref", self._seen[identity])
+        if len(self._seen) >= _MAX_FINGERPRINT_NODES:
+            raise _FingerprintError("fingerprint budget exceeded")
+        node = len(self._seen)
+        self._seen[identity] = node
+
+        closure: list[tuple[str, object]] = []
+        self._charge(len(value.__closure__ or ()) + 2)
+        for name, cell in zip(
+            value.__code__.co_freevars,
+            value.__closure__ or (),
+            strict=True,
+        ):
+            self._charge(len(name))
+            try:
+                contents = cell.cell_contents
+            except ValueError:
+                closure.append((name, ("empty-cell",)))
+            else:
+                closure.append((name, self.token(contents)))
+        return (
+            "class-function",
+            node,
+            identity,
+            id(value.__code__),
+            tuple(closure),
+            self.token(value.__defaults__),
+            self.token(value.__kwdefaults__),
+        )
 
 
 def _component_token(
@@ -431,6 +507,7 @@ def _class_behavior_token(component_types: tuple[type[object], ...]) -> object:
             tuple(
                 (name, fingerprinter.token(value))
                 for name, value in sorted(vars(component_type).items())
+                if name not in _NON_BEHAVIOR_CLASS_ATTRIBUTES
             ),
         )
         for component_type in component_types
