@@ -9,11 +9,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, is_dataclass
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 from inspect import isbuiltin, isfunction
 from itertools import pairwise
 from types import MethodDescriptorType, WrapperDescriptorType
 from typing import Any, Final
+from uuid import UUID
 
 from messy_xlsx._fallback_signals import (
     _FallbackBlockReason,
@@ -124,6 +127,49 @@ class _FrozenFloat:
 class _FrozenComplex:
     real: _FrozenFloat
     imaginary: _FrozenFloat
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenDecimal:
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenDate:
+    year: int
+    month: int
+    day: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenTimedelta:
+    days: int
+    seconds: int
+    microseconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenTimezone:
+    offset: _FrozenTimedelta
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenDatetime:
+    year: int
+    month: int
+    day: int
+    hour: int
+    minute: int
+    second: int
+    microsecond: int
+    timezone: _FrozenTimezone | None
+    fold: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenUUID:
+    integer: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +454,38 @@ def _freeze(  # noqa: C901
             _FrozenFloat(value.real.hex()),
             _FrozenFloat(value.imag.hex()),
         )
+    if type(value) is Decimal:
+        return _FrozenDecimal(str(value))
+    if type(value) is datetime:
+        frozen_timezone: _FrozenTimezone | None = None
+        if value.tzinfo is not None:
+            if type(value.tzinfo) is not timezone:
+                raise TypeError("unsupported mutable configuration value: datetime")
+            offset = value.tzinfo.utcoffset(None)
+            name = value.tzinfo.tzname(None)
+            if offset is None or name is None:
+                raise TypeError("unsupported mutable configuration value: datetime")
+            frozen_timezone = _FrozenTimezone(
+                _FrozenTimedelta(offset.days, offset.seconds, offset.microseconds),
+                name,
+            )
+        return _FrozenDatetime(
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            frozen_timezone,
+            value.fold,
+        )
+    if type(value) is date:
+        return _FrozenDate(value.year, value.month, value.day)
+    if type(value) is timedelta:
+        return _FrozenTimedelta(value.days, value.seconds, value.microseconds)
+    if type(value) is UUID:
+        return _FrozenUUID(value.int)
     if isinstance(value, type):
         type_module, type_qualname = _safe_type_description(value)
         return _FrozenTypeReference(
@@ -573,6 +651,33 @@ def _thaw(value: Any) -> Any:  # noqa: C901
         return float.fromhex(value.hexadecimal)
     if isinstance(value, _FrozenComplex):
         return complex(_thaw(value.real), _thaw(value.imaginary))
+    if isinstance(value, _FrozenDecimal):
+        return Decimal(value.text)
+    if isinstance(value, _FrozenDate):
+        return date(value.year, value.month, value.day)
+    if isinstance(value, _FrozenTimedelta):
+        return timedelta(value.days, value.seconds, value.microseconds)
+    if isinstance(value, _FrozenDatetime):
+        thawed_timezone = None
+        if value.timezone is not None:
+            offset = value.timezone.offset
+            thawed_timezone = timezone(
+                timedelta(offset.days, offset.seconds, offset.microseconds),
+                value.timezone.name,
+            )
+        return datetime(
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            tzinfo=thawed_timezone,
+            fold=value.fold,
+        )
+    if isinstance(value, _FrozenUUID):
+        return UUID(int=value.integer)
     if isinstance(value, _FrozenTypeReference):
         return value.reference
     if isinstance(value, _FrozenIdentityReference):
@@ -628,6 +733,37 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
         return ("float", value.hexadecimal)
     if isinstance(value, _FrozenComplex):
         return ("complex", _stable_token(value.real), _stable_token(value.imaginary))
+    if isinstance(value, _FrozenDecimal):
+        return ("decimal", value.text)
+    if isinstance(value, _FrozenDate):
+        return ("date", value.year, value.month, value.day)
+    if isinstance(value, _FrozenTimedelta):
+        return ("timedelta", value.days, value.seconds, value.microseconds)
+    if isinstance(value, _FrozenDatetime):
+        frozen_timezone = value.timezone
+        timezone_token: tuple[Any, ...]
+        if frozen_timezone is None:
+            timezone_token = ("naive",)
+        else:
+            timezone_token = (
+                "timezone",
+                _stable_token(frozen_timezone.offset),
+                frozen_timezone.name,
+            )
+        return (
+            "datetime",
+            value.year,
+            value.month,
+            value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            timezone_token,
+            value.fold,
+        )
+    if isinstance(value, _FrozenUUID):
+        return ("uuid", value.integer)
     if isinstance(value, _FrozenTypeReference):
         return (
             "type",

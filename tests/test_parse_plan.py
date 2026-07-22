@@ -5,11 +5,14 @@ from __future__ import annotations
 from collections import deque
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, dataclass, fields, replace
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
+from uuid import UUID
 
 import openpyxl
 import pandas as pd
@@ -1314,6 +1317,45 @@ def test_stateless_custom_hashable_is_rejected_before_plan_retains_live_semantic
             None,
             "xlsx",
         )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        Decimal("1234.500"),
+        date(2026, 7, 22),
+        datetime(2026, 7, 22, 15, 4, 3, 2),
+        datetime(2026, 7, 22, 15, 4, 3, 2, tzinfo=timezone(timedelta(hours=8))),
+        timedelta(days=-2, seconds=3, microseconds=4),
+        UUID("12345678-1234-5678-1234-567812345678"),
+    ],
+    ids=["decimal", "date", "datetime", "aware-datetime", "timedelta", "uuid"],
+)
+def test_trusted_immutable_drop_scalars_have_stable_snapshot_semantics(
+    value: object,
+) -> None:
+    first = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": value}],
+        ),
+        None,
+        "xlsx",
+    )
+    second = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": value}],
+        ),
+        None,
+        "xlsx",
+    )
+
+    thawed = first.thaw_drop_conditions()[0][1]
+    assert first == second
+    assert hash(first) == hash(second)
+    assert type(thawed) is type(value)
+    assert thawed == value
 
 
 def test_type_and_function_hints_are_preserved_by_thaw_projection() -> None:
