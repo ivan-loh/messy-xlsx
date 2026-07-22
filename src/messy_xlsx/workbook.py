@@ -18,6 +18,7 @@ import pandas as pd
 
 from messy_xlsx._fallback_signals import (
     _blocks_backend_retry,
+    _contains_process_failure,
     _exception_traceback,
     _FallbackBlockReason,
     _mark_fallback_blocked,
@@ -405,7 +406,7 @@ class MessyWorkbook:
                 except _ActiveOperationError:
                     raise
                 except Exception as e:
-                    if _blocks_backend_retry(e):
+                    if _contains_process_failure(e):
                         raise
                     logger.warning("Failed to parse sheet %r, skipping", name, exc_info=True)
                     if include_errors:

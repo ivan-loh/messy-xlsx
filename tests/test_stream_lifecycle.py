@@ -470,6 +470,54 @@ def test_process_failure_is_not_swallowed_by_to_dataframes(sample_xlsx: Any) -> 
     assert captured.value is failure
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [PermissionError("sheet permission"), FileNotFoundError("sheet missing")],
+)
+@pytest.mark.parametrize("include_errors", [False, True])
+def test_ordinary_blocked_sheet_failure_remains_aggregated_for_legacy_callers(
+    sample_xlsx: Any,
+    failure: Exception,
+    include_errors: bool,
+) -> None:
+    class OrdinaryFailureRegistry(HandlerRegistry):
+        def parse(self, *_args: Any, **_kwargs: Any) -> pd.DataFrame:
+            raise failure
+
+    with MessyWorkbook(sample_xlsx, registry=OrdinaryFailureRegistry()) as workbook:
+        result = workbook.to_dataframes(include_errors=include_errors)
+
+    if not include_errors:
+        assert result == {}
+        return
+    frames, errors = result
+    assert frames == {}
+    assert len(errors) == 1
+    assert errors[0].sheet_name == "Data"
+    assert errors[0].error_type == type(failure).__name__
+
+
+def test_nested_process_failure_tree_is_not_aggregated_by_to_dataframes(
+    sample_xlsx: Any,
+) -> None:
+    failure = ExceptionGroup(
+        "outer",
+        [ValueError("ordinary"), ExceptionGroup("inner", [MemoryError("process")])],
+    )
+
+    class ProcessTreeRegistry(HandlerRegistry):
+        def parse(self, *_args: Any, **_kwargs: Any) -> pd.DataFrame:
+            raise failure
+
+    with (
+        MessyWorkbook(sample_xlsx, registry=ProcessTreeRegistry()) as workbook,
+        pytest.raises(ExceptionGroup) as captured,
+    ):
+        workbook.to_dataframes(include_errors=True)
+
+    assert captured.value is failure
+
+
 def test_failed_materialized_parse_releases_reservation_for_the_next_parse(
     sample_xlsx: Any,
     monkeypatch: pytest.MonkeyPatch,
