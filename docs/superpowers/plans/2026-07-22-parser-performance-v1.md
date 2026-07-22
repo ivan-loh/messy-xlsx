@@ -90,7 +90,7 @@
 | 1 | v0.10.0 compatibility and performance contract | — | [x] |
 | 2 | Legacy warning and API classification | 1 | [x] |
 | 3 | Spillable source lifecycle | 1 | [x] |
-| 4 | OOXML archive security and eager manifest | 3 | [ ] |
+| 4 | OOXML archive security and eager manifest | 3 | [x] |
 | 5 | Lazy sheet metadata, interval indexes, and bounded structure sampling | 4 | [ ] |
 | 6 | Immutable plans, reader contracts, and router | 2, 5 | [ ] |
 | 7 | Fastexcel materialized Arrow reader | 6 | [ ] |
@@ -766,7 +766,7 @@ git commit -m "perf: add spillable source replay"
 - Produces: `build_manifest(source: SourceHandle, limits: OoxmlLimits = DEFAULT_LIMITS) -> WorkbookManifest`.
 - Raises: existing `FormatError` for unsafe or malformed packages without reading worksheet values.
 
-- [ ] **Step 1: Write failing security and workbook-order tests**
+- [x] **Step 1: Write failing security and workbook-order tests**
 
 ```python
 # tests/test_ooxml_security.py
@@ -820,7 +820,7 @@ Run: `.venv/bin/pytest tests/test_ooxml_security.py tests/test_ooxml_manifest.py
 
 Expected: collection fails because the `messy_xlsx.ooxml` package does not exist.
 
-- [ ] **Step 2: Define immutable limits and manifest models**
+- [x] **Step 2: Define immutable limits and manifest models**
 
 Add `"defusedxml>=0.7.1"` to the required project dependencies before importing
 the hardened parser.
@@ -870,7 +870,7 @@ class WorkbookManifest:
     external_relationships: tuple[str, ...] = field(default_factory=tuple)
 ```
 
-- [ ] **Step 3: Implement archive validation before XML parsing**
+- [x] **Step 3: Implement archive validation before XML parsing**
 
 ```python
 # src/messy_xlsx/ooxml/security.py
@@ -944,7 +944,7 @@ def safe_iterparse(source, member: str, limits: OoxmlLimits):
         yield event, element
 ```
 
-- [ ] **Step 4: Parse workbook relationships without following external targets**
+- [x] **Step 4: Parse workbook relationships without following external targets**
 
 Implement `build_manifest()` with `zipfile.ZipFile`, `validate_archive()`, and `safe_iterparse()`. Resolve only normalized internal relationship targets below the archive root. Record `TargetMode="External"` relationships as evidence and never open them. Open the archive through `SourceHandle.open_binary()` and close it before returning the frozen manifest.
 
@@ -1012,13 +1012,13 @@ def _read_styles(package, member):
     return StyleManifest(tuple(sorted(custom.items())), tuple(date_styles))
 ```
 
-- [ ] **Step 5: Run security, manifest, malformed-file, and format tests**
+- [x] **Step 5: Run security, manifest, malformed-file, and format tests**
 
 Run: `.venv/bin/pytest tests/test_ooxml_security.py tests/test_ooxml_manifest.py tests/test_edge_cases/test_malformed_files.py tests/test_detection/test_format_detector.py -q`
 
 Expected: all tests pass with external relationships never opened.
 
-- [ ] **Step 6: Commit the hardened eager manifest**
+- [x] **Step 6: Commit the hardened eager manifest**
 
 ```bash
 git add pyproject.toml src/messy_xlsx/ooxml tests/test_ooxml_security.py tests/test_ooxml_manifest.py
