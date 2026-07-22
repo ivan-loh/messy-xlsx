@@ -245,8 +245,9 @@ OOXML inspection applies these security limits before parsing values:
   rejected as suspicious.
 - Duplicate member names, absolute paths, and normalized `..` archive targets
   are rejected.
-- DTDs and entity declarations are rejected; XML parsing performs no network
-  access and enforces bounded element depth, attributes, and text.
+- DTDs and entity declarations are rejected with `defusedxml>=0.7.1`; XML
+  parsing performs no network access and enforces bounded element depth,
+  attributes, and text.
 - External workbook relationships are recorded only as unsupported evidence;
   they are never followed.
 
@@ -272,6 +273,14 @@ freeze the current analyzer's effective windows before replacement: up to
 10,000 rows for data-region evidence and the first 16 header candidates across
 the detected width. Exact row and column counts come from fastexcel
 `total_height` and `width` or manifest dimensions, not a discarded complete
+DataFrame.
+
+The bounded evidence set also includes the current analyzer's sparse blank-row
+sample positions and final ten footer rows. The deduplicated positions are
+coalesced into contiguous fastexcel windows using integer `skip_rows` plus
+`n_rows`; list/callable filtering is not relied on because it is unreliable in
+the 0.20.2 baseline. Repeated windows are permitted only for this bounded
+structural evidence, not for public streaming, and never produce a complete
 DataFrame.
 
 One sampler instance analyzes every requested sheet through one workbook
@@ -463,9 +472,10 @@ with workbook.iter_batches("Sales") as batches:
 - `close()` is idempotent. `next()` after explicit close or exhaustion raises
   `StopIteration`; closing the parent workbook makes subsequent `next()` raise
   `RuntimeError("MessyWorkbook is closed")`.
-- Configuration, sheet selection, schema compilation, and `batch_size >= 1`
-  validation happen before the stream is returned. Backend value reading starts
-  on first iteration.
+- Configuration, sheet selection, bounded schema sampling, schema compilation,
+  and `batch_size >= 1` validation happen before the stream is returned. The
+  full row streaming pass starts on first iteration; only the bounded evidence
+  required to expose `schema` may be read during stream creation.
 - Every yielded batch contains at most `batch_size` output rows after filters.
 - One workbook permits one active stream or parse. Concurrent or re-entrant use
   raises `RuntimeError` and thread safety is not promised.
