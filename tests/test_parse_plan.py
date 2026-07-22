@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, dataclass, fields, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from decimal import Decimal
 from enum import Enum
 from functools import partial
@@ -1326,10 +1326,21 @@ def test_stateless_custom_hashable_is_rejected_before_plan_retains_live_semantic
         date(2026, 7, 22),
         datetime(2026, 7, 22, 15, 4, 3, 2),
         datetime(2026, 7, 22, 15, 4, 3, 2, tzinfo=timezone(timedelta(hours=8))),
+        time(15, 4, 3, 2),
+        time(15, 4, 3, 2, tzinfo=timezone(timedelta(hours=8)), fold=1),
         timedelta(days=-2, seconds=3, microseconds=4),
         UUID("12345678-1234-5678-1234-567812345678"),
     ],
-    ids=["decimal", "date", "datetime", "aware-datetime", "timedelta", "uuid"],
+    ids=[
+        "decimal",
+        "date",
+        "datetime",
+        "aware-datetime",
+        "time",
+        "aware-time",
+        "timedelta",
+        "uuid",
+    ],
 )
 def test_trusted_immutable_drop_scalars_have_stable_snapshot_semantics(
     value: object,
@@ -1356,6 +1367,30 @@ def test_trusted_immutable_drop_scalars_have_stable_snapshot_semantics(
     assert hash(first) == hash(second)
     assert type(thawed) is type(value)
     assert thawed == value
+
+
+def test_time_with_custom_timezone_is_not_treated_as_a_trusted_scalar() -> None:
+    class MutableTimezone(tzinfo):
+        def utcoffset(self, _value):
+            return timedelta(hours=1)
+
+        def dst(self, _value):
+            return timedelta(0)
+
+    with pytest.raises(TypeError, match="unsupported mutable configuration value: time"):
+        compile_parse_plan(
+            SheetConfig(
+                auto_detect=False,
+                drop_conditions=[
+                    {
+                        "column": "value",
+                        "value": time(12, tzinfo=MutableTimezone()),
+                    }
+                ],
+            ),
+            None,
+            "xlsx",
+        )
 
 
 def test_type_and_function_hints_are_preserved_by_thaw_projection() -> None:

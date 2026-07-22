@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, is_dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from inspect import isbuiltin, isfunction
@@ -159,6 +159,16 @@ class _FrozenDatetime:
     year: int
     month: int
     day: int
+    hour: int
+    minute: int
+    second: int
+    microsecond: int
+    timezone: _FrozenTimezone | None
+    fold: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenTime:
     hour: int
     minute: int
     second: int
@@ -457,18 +467,7 @@ def _freeze(  # noqa: C901
     if type(value) is Decimal:
         return _FrozenDecimal(str(value))
     if type(value) is datetime:
-        frozen_timezone: _FrozenTimezone | None = None
-        if value.tzinfo is not None:
-            if type(value.tzinfo) is not timezone:
-                raise TypeError("unsupported mutable configuration value: datetime")
-            offset = value.tzinfo.utcoffset(None)
-            name = value.tzinfo.tzname(None)
-            if offset is None or name is None:
-                raise TypeError("unsupported mutable configuration value: datetime")
-            frozen_timezone = _FrozenTimezone(
-                _FrozenTimedelta(offset.days, offset.seconds, offset.microseconds),
-                name,
-            )
+        frozen_timezone = _freeze_stdlib_timezone(value.tzinfo, "datetime")
         return _FrozenDatetime(
             value.year,
             value.month,
@@ -482,6 +481,15 @@ def _freeze(  # noqa: C901
         )
     if type(value) is date:
         return _FrozenDate(value.year, value.month, value.day)
+    if type(value) is time:
+        return _FrozenTime(
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            _freeze_stdlib_timezone(value.tzinfo, "time"),
+            value.fold,
+        )
     if type(value) is timedelta:
         return _FrozenTimedelta(value.days, value.seconds, value.microseconds)
     if type(value) is UUID:
@@ -631,6 +639,35 @@ def _freeze(  # noqa: C901
         active.remove(identity)
 
 
+def _freeze_stdlib_timezone(
+    value: object,
+    scalar_name: str,
+) -> _FrozenTimezone | None:
+    """Snapshot only the immutable stdlib fixed-offset timezone type."""
+    if value is None:
+        return None
+    if type(value) is not timezone:
+        raise TypeError(f"unsupported mutable configuration value: {scalar_name}")
+    offset = value.utcoffset(None)
+    name = value.tzname(None)
+    if offset is None or name is None:
+        raise TypeError(f"unsupported mutable configuration value: {scalar_name}")
+    return _FrozenTimezone(
+        _FrozenTimedelta(offset.days, offset.seconds, offset.microseconds),
+        name,
+    )
+
+
+def _thaw_stdlib_timezone(value: _FrozenTimezone | None) -> timezone | None:
+    if value is None:
+        return None
+    offset = value.offset
+    return timezone(
+        timedelta(offset.days, offset.seconds, offset.microseconds),
+        value.name,
+    )
+
+
 def _thaw(value: Any) -> Any:  # noqa: C901
     """Return a fresh legacy value from a tagged immutable snapshot."""
     if isinstance(value, _FrozenMapping):
@@ -658,13 +695,6 @@ def _thaw(value: Any) -> Any:  # noqa: C901
     if isinstance(value, _FrozenTimedelta):
         return timedelta(value.days, value.seconds, value.microseconds)
     if isinstance(value, _FrozenDatetime):
-        thawed_timezone = None
-        if value.timezone is not None:
-            offset = value.timezone.offset
-            thawed_timezone = timezone(
-                timedelta(offset.days, offset.seconds, offset.microseconds),
-                value.timezone.name,
-            )
         return datetime(
             value.year,
             value.month,
@@ -673,7 +703,16 @@ def _thaw(value: Any) -> Any:  # noqa: C901
             value.minute,
             value.second,
             value.microsecond,
-            tzinfo=thawed_timezone,
+            tzinfo=_thaw_stdlib_timezone(value.timezone),
+            fold=value.fold,
+        )
+    if isinstance(value, _FrozenTime):
+        return time(
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            tzinfo=_thaw_stdlib_timezone(value.timezone),
             fold=value.fold,
         )
     if isinstance(value, _FrozenUUID):
@@ -755,6 +794,26 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
             value.year,
             value.month,
             value.day,
+            value.hour,
+            value.minute,
+            value.second,
+            value.microsecond,
+            timezone_token,
+            value.fold,
+        )
+    if isinstance(value, _FrozenTime):
+        frozen_timezone = value.timezone
+        timezone_token = (
+            ("naive",)
+            if frozen_timezone is None
+            else (
+                "timezone",
+                _stable_token(frozen_timezone.offset),
+                frozen_timezone.name,
+            )
+        )
+        return (
+            "time",
             value.hour,
             value.minute,
             value.second,
