@@ -371,7 +371,8 @@ def requires_structure_analysis(
     format_type: FormatType | str,
 ) -> bool:
     """Return whether current behavior requires OOXML structure evidence."""
-    return config.auto_detect and format_type in _STRUCTURE_FORMATS
+    projected_format_type = _validated_format_type(format_type)
+    return config.auto_detect and projected_format_type in _STRUCTURE_FORMATS
 
 
 def compile_parse_plan(
@@ -387,8 +388,9 @@ def compile_parse_plan(
         output_mode,
         batch_size,
     )
+    projected_format_type = _validated_format_type(format_type)
 
-    use_structure = projected.auto_detect and format_type in _STRUCTURE_FORMATS
+    use_structure = projected.auto_detect and projected_format_type in _STRUCTURE_FORMATS
     if use_structure and structure is None:
         error = ValueError("StructureInfo is required for auto-detected OOXML parsing")
         raise _mark_fallback_blocked(
@@ -440,7 +442,7 @@ def compile_parse_plan(
             ignore_hidden=_project_bool(ignore_hidden, "ignore_hidden"),
             cell_range=projected.cell_range,
             data_only=projected.evaluate_formulas,
-            auto_detect_header=projected.auto_detect and format_type in _TEXT_FORMATS,
+            auto_detect_header=projected.auto_detect and projected_format_type in _TEXT_FORMATS,
             normalize=projected.normalize,
             decimal_separator=_project_optional_str(
                 decimal_separator,
@@ -585,6 +587,15 @@ def _project_choice(
     return choice_type(text)
 
 
+def _validated_format_type(value: object) -> str:
+    """Project a format identifier before any set-membership operation."""
+    try:
+        return _project_str(value, "format_type")
+    except TypeError as error:
+        _mark_fallback_blocked(error, _FallbackBlockReason.CONFIGURATION)
+        raise
+
+
 def _project_confidence_threshold(value: object) -> float:
     """Copy the header threshold to an exact bounded float."""
     if isinstance(value, bool):
@@ -595,6 +606,10 @@ def _project_confidence_threshold(value: object) -> float:
         projected = float.__float__(value)
     elif isinstance(value, int):
         integer = value if type(value) is int else int.__int__(value)
+        if not 0 <= integer <= 1:
+            raise ValueError(
+                f"header_confidence_threshold must be between 0.0 and 1.0, got {integer}"
+            )
         projected = float(integer)
     else:
         raise TypeError("header_confidence_threshold must be a float")

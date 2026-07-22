@@ -32,6 +32,7 @@ from messy_xlsx.enums import FormatType, HeaderDetectionMode, HeaderFallback, Me
 from messy_xlsx.exceptions import StructureError
 from messy_xlsx.parsing import ParseOptions
 from messy_xlsx.parsing.contracts import OutputMode
+from messy_xlsx.parsing.fallback import FallbackCoordinator
 from messy_xlsx.parsing.parse_plan import (
     ParsePlan,
     compile_parse_plan,
@@ -2238,6 +2239,95 @@ def test_compile_parse_plan_treats_enums_and_raw_strings_equally() -> None:
         structure,
         "xlsx",
     )
+
+
+@pytest.mark.parametrize(
+    ("invalid_input", "error_type", "message"),
+    [
+        pytest.param(
+            "header_confidence_threshold",
+            ValueError,
+            "header_confidence_threshold must be between 0.0 and 1.0",
+            id="oversized-confidence-threshold",
+        ),
+        pytest.param(
+            "format_type",
+            TypeError,
+            "format_type must be a str",
+            id="unhashable-format-type",
+        ),
+    ],
+)
+def test_invalid_plan_input_blocks_fallback_before_classification(
+    invalid_input: str,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    config = SheetConfig()
+    format_type: object = "csv"
+    if invalid_input == "header_confidence_threshold":
+        config.header_confidence_threshold = 10**400
+    else:
+        format_type = []
+    classifier_calls = 0
+    fallback_calls = 0
+
+    def classifier(_error: Exception) -> bool:
+        nonlocal classifier_calls
+        classifier_calls += 1
+        return True
+
+    def fallback_factory() -> SimpleNamespace:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return SimpleNamespace(read_table=lambda: "fallback")
+
+    with pytest.raises(error_type, match=message) as captured:
+        FallbackCoordinator(classifier).materialize(
+            lambda: compile_parse_plan(
+                config,
+                None,
+                format_type,  # type: ignore[arg-type]
+            ),
+            fallback_factory,
+        )
+
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
+    assert classifier_calls == 0
+    assert fallback_calls == 0
+
+
+def test_format_type_string_subclass_is_projected_before_membership() -> None:
+    class HostileFormat(str):
+        def __hash__(self) -> int:
+            raise AssertionError("format_type subclass hash hook must not run")
+
+    format_type = HostileFormat("xlsx")
+    config = SheetConfig(auto_detect=True)
+
+    assert requires_structure_analysis(config, format_type) is True
+    plan = compile_parse_plan(config, _structure(), format_type)
+
+    assert plan.auto_detect_header is False
+
+
+def test_non_string_format_type_is_rejected_by_pre_io_structure_decision() -> None:
+    with pytest.raises(TypeError, match="format_type must be a str") as captured:
+        requires_structure_analysis(
+            SheetConfig(auto_detect=True),
+            [],  # type: ignore[arg-type]
+        )
+
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
+
+
+def test_unknown_exact_format_string_preserves_non_structural_behavior() -> None:
+    config = SheetConfig(auto_detect=True)
+
+    assert requires_structure_analysis(config, "future-format") is False
+    plan = compile_parse_plan(config, None, "future-format")
+
+    assert plan.auto_detect_header is False
 
 
 @pytest.mark.parametrize(
