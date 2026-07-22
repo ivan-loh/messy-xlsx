@@ -152,6 +152,7 @@ class CoordinateOperation:
         "_input_schema",
         "_last_row",
         "_merge_cursor",
+        "_merge_output_types",
         "_merge_ranges",
         "_merge_strategy",
         "_next_range_row",
@@ -189,6 +190,7 @@ class CoordinateOperation:
             )
         )
         self._merge_cursor = 0
+        self._merge_output_types: dict[int, pa.DataType] = {}
         self._active_merge_ranges: list[MergeRange] = []
         self._next_range_row = self._projection.min_row if self._projection is not None else None
         self._range_types: tuple[pa.DataType, ...] | None = None
@@ -241,6 +243,7 @@ class CoordinateOperation:
         if self._input_schema is None:
             self._input_column_numbers = batch.column_numbers
             self._input_schema = batch.batch.schema
+            self._merge_output_types = self._compile_merge_output_types(batch)
         elif batch.column_numbers != self._input_column_numbers or not batch.batch.schema.equals(
             self._input_schema, check_metadata=True
         ):
@@ -263,6 +266,38 @@ class CoordinateOperation:
             raise ValueError("coordinate batches are out of order")
         if last_row is not None:
             self._last_row = last_row
+
+    def _compile_merge_output_types(
+        self,
+        batch: CoordinateBatch,
+    ) -> dict[int, pa.DataType]:
+        if self._merge_strategy is not MergeStrategy.FILL or not self._merge_ranges:
+            return {}
+
+        input_types = dict(zip(batch.column_numbers, batch.batch.schema.types, strict=True))
+        output_columns = set(batch.column_numbers)
+        if self._projection is not None:
+            output_columns.update(self._projection.column_numbers)
+        anchor_types: dict[int, set[pa.DataType]] = {}
+        for merged_range in self._merge_ranges:
+            anchor_type = input_types.get(merged_range.min_col)
+            if anchor_type is None or pa.types.is_null(anchor_type):
+                continue
+            for column in output_columns:
+                source_type = input_types.get(column, pa.null())
+                if merged_range.min_col <= column <= merged_range.max_col and pa.types.is_null(
+                    source_type
+                ):
+                    anchor_types.setdefault(column, set()).add(anchor_type)
+
+        output_types: dict[int, pa.DataType] = {}
+        for column, candidate_types in anchor_types.items():
+            if len(candidate_types) != 1:
+                raise CoordinateCompatibilityError(
+                    "merged-cell fill cannot establish one Arrow schema"
+                )
+            output_types[column] = next(iter(candidate_types))
+        return output_types
 
     def _project_batch(self, batch: CoordinateBatch) -> tuple[CoordinateBatch, ...]:
         if self._projection is not None:
@@ -540,6 +575,8 @@ class CoordinateOperation:
         ):
             return batch
 
+        batch = self._normalize_merge_output_types(batch)
+
         first_row = batch.row_numbers[0].as_py()
         last_row = batch.row_numbers[-1].as_py()
         candidates = merged_ranges if merged_ranges is not None else self._merge_candidates(batch)
@@ -565,6 +602,32 @@ class CoordinateOperation:
         for position, segments in replacements.items():
             arrays[position] = self._rebuild_merged_array(arrays[position], segments)
 
+        return CoordinateBatch(
+            batch=pa.record_batch(arrays, names=batch.batch.schema.names),
+            row_numbers=batch.row_numbers,
+            column_numbers=batch.column_numbers,
+            column_identities=batch.column_identities,
+        )
+
+    def _normalize_merge_output_types(self, batch: CoordinateBatch) -> CoordinateBatch:
+        arrays = list(batch.batch.columns)
+        changed = False
+        for position, column in enumerate(batch.column_numbers):
+            target_type = self._merge_output_types.get(column)
+            if target_type is None or arrays[position].type == target_type:
+                continue
+            if arrays[position].null_count != len(arrays[position]):
+                raise CoordinateCompatibilityError(
+                    "merged-cell fill cannot establish one Arrow schema"
+                )
+            arrays[position] = self._safe_cast(
+                arrays[position],
+                target_type,
+                "merged-cell fill cannot establish one Arrow schema",
+            )
+            changed = True
+        if not changed:
+            return batch
         return CoordinateBatch(
             batch=pa.record_batch(arrays, names=batch.batch.schema.names),
             row_numbers=batch.row_numbers,

@@ -565,6 +565,98 @@ def test_fill_carries_anchor_across_batches() -> None:
     )
 
 
+def test_fill_keeps_promoted_null_follower_schema_after_merge_ends() -> None:
+    transform = CoordinateTransform(
+        IntervalIndex(()),
+        IntervalIndex(()),
+        (MergeRange(1, 1, 1, 2),),
+    )
+    operation = transform.open(_plan(merge_strategy=MergeStrategy.FILL))
+    raw_schema = pa.schema([pa.field("0", pa.int64()), pa.field("1", pa.null())])
+
+    first = operation.push(
+        CoordinateBatch(
+            batch=pa.RecordBatch.from_arrays(
+                [pa.array([11], type=pa.int64()), pa.nulls(1)],
+                schema=raw_schema,
+            ),
+            row_numbers=pa.array([1], type=pa.int64()),
+            column_numbers=(1, 2),
+        )
+    )
+    second = operation.push(
+        CoordinateBatch(
+            batch=pa.RecordBatch.from_arrays(
+                [pa.array([21], type=pa.int64()), pa.nulls(1)],
+                schema=raw_schema,
+            ),
+            row_numbers=pa.array([2], type=pa.int64()),
+            column_numbers=(1, 2),
+        )
+    )
+
+    table = pa.Table.from_batches([batch.batch for batch in (*first, *second, *operation.finish())])
+    assert table.to_pydict() == {"0": [11, 21], "1": [11, None]}
+
+
+def test_fill_keeps_projected_synthetic_follower_schema_after_merge_ends() -> None:
+    transform = CoordinateTransform(
+        IntervalIndex(()),
+        IntervalIndex(()),
+        (MergeRange(1, 1, 1, 2),),
+    )
+    operation = transform.open(_plan(cell_range="B1:B2", merge_strategy=MergeStrategy.FILL))
+    raw_schema = pa.schema([pa.field("0", pa.int64())])
+
+    emitted = tuple(
+        output
+        for row, value in ((1, 11), (2, 21))
+        for output in operation.push(
+            CoordinateBatch(
+                batch=pa.RecordBatch.from_arrays(
+                    [pa.array([value], type=pa.int64())],
+                    schema=raw_schema,
+                ),
+                row_numbers=pa.array([row], type=pa.int64()),
+                column_numbers=(1,),
+            )
+        )
+    )
+
+    table = pa.Table.from_batches([batch.batch for batch in (*emitted, *operation.finish())])
+    assert table.to_pydict() == {"0": [11, None]}
+
+
+def test_fill_rejects_conflicting_null_follower_promotions_before_output() -> None:
+    transform = CoordinateTransform(
+        IntervalIndex(()),
+        IntervalIndex(()),
+        (
+            MergeRange(1, 1, 1, 3),
+            MergeRange(2, 2, 2, 3),
+        ),
+    )
+    operation = transform.open(_plan(merge_strategy=MergeStrategy.FILL))
+    raw = CoordinateBatch(
+        batch=pa.record_batch(
+            [
+                pa.array([11, 21], type=pa.int64()),
+                pa.array([1.5, 2.5], type=pa.float64()),
+                pa.nulls(2),
+            ],
+            names=["0", "1", "2"],
+        ),
+        row_numbers=pa.array([1, 2], type=pa.int64()),
+        column_numbers=(1, 2, 3),
+    )
+
+    with pytest.raises(
+        CoordinateCompatibilityError,
+        match=r"^merged-cell fill cannot establish one Arrow schema$",
+    ):
+        operation.push(raw)
+
+
 def test_projected_out_anchor_fills_requested_follower() -> None:
     transform = CoordinateTransform(
         IntervalIndex(()),
@@ -671,6 +763,30 @@ def test_mixed_type_merge_fill_raises_exact_compatibility_signal() -> None:
     operation = transform.open(_plan(merge_strategy=MergeStrategy.FILL))
     with pytest.raises(CoordinateCompatibilityError):
         operation.push(raw)
+
+
+def test_typed_null_anchor_does_not_preemptively_reject_non_null_follower() -> None:
+    transform = CoordinateTransform(
+        IntervalIndex(()),
+        IntervalIndex(()),
+        (MergeRange(1, 1, 1, 2),),
+    )
+    raw = CoordinateBatch(
+        batch=pa.record_batch(
+            [
+                pa.array([None], type=pa.string()),
+                pa.array([7], type=pa.int64()),
+            ],
+            names=["0", "1"],
+        ),
+        row_numbers=pa.array([1], type=pa.int64()),
+        column_numbers=(1, 2),
+    )
+
+    result = _run(transform, _plan(merge_strategy=MergeStrategy.FILL), raw)
+
+    assert _result_contract(result)[2] == ((None, None),)
+    assert result[0].batch.schema.types == [pa.string(), pa.int64()]
 
 
 @pytest.mark.parametrize("anchor", [1.0, 1.5])
