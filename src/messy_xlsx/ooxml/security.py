@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ElementTree
+import zipfile
 from collections.abc import Iterator
 from pathlib import PurePosixPath
-from typing import IO
+from typing import IO, NoReturn
+from urllib.parse import unquote
 from zipfile import ZipFile, ZipInfo
 
 from defusedxml import ElementTree as SafeElementTree
@@ -15,26 +18,104 @@ from messy_xlsx.exceptions import FormatError
 from messy_xlsx.ooxml.models import OoxmlLimits
 
 _XML_PART_SUFFIXES = (".xml", ".rels")
+_INVALID_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_SUPPORTED_COMPRESSIONS = {
+    zipfile.ZIP_STORED,
+    zipfile.ZIP_DEFLATED,
+    zipfile.ZIP_BZIP2,
+    zipfile.ZIP_LZMA,
+}
+if hasattr(zipfile, "ZIP_ZSTANDARD"):
+    _SUPPORTED_COMPRESSIONS.add(zipfile.ZIP_ZSTANDARD)
 
 
-def _safe_member(name: str) -> bool:
+def _member_identity(name: str) -> tuple[str, bool] | None:
+    """Return a decoded comparison key and whether the raw path is canonical."""
     path = PurePosixPath(name)
-    drive_like = bool(path.parts and ":" in path.parts[0])
-    return bool(
-        name
-        and "\x00" not in name
-        and "\\" not in name
-        and not drive_like
-        and not path.is_absolute()
-        and ".." not in path.parts
-    )
+    raw_drive_like = bool(path.parts and ":" in path.parts[0])
+    if (
+        not name
+        or "\x00" in name
+        or "\\" in name
+        or raw_drive_like
+        or path.is_absolute()
+        or _INVALID_PERCENT_ESCAPE.search(name)
+    ):
+        return None
+
+    canonical = True
+    decoded_parts: list[str] = []
+    for raw_part in name.split("/"):
+        if raw_part in {"", "."}:
+            canonical = False
+            continue
+        try:
+            decoded = unquote(raw_part, encoding="utf-8", errors="strict")
+        except UnicodeError:
+            return None
+        if decoded == ".." or any(character in decoded for character in ("\x00", "/", "\\")):
+            return None
+        if decoded == ".":
+            canonical = False
+            continue
+        decoded_parts.append(decoded)
+
+    if not decoded_parts or ":" in decoded_parts[0]:
+        return None
+    return "/".join(decoded_parts), canonical
 
 
-def _raise_unsafe_member(member: ZipInfo) -> None:
+def canonical_archive_name(name: str) -> str:
+    """Return a safe canonical comparison key for a validated archive member."""
+    identity = _member_identity(name)
+    if identity is None or not identity[1]:
+        raise ValueError(f"unsafe OOXML archive member: {name!r}")
+    return identity[0]
+
+
+def _raise_unsafe_member(member: ZipInfo) -> NoReturn:
     raise FormatError(
         "OOXML archive contains unsafe archive path",
         member=member.filename,
     )
+
+
+def _validate_member_metadata(member: ZipInfo, limits: OoxmlLimits) -> None:
+    if member.flag_bits & 0x1:
+        raise FormatError(
+            "OOXML archive contains encrypted member",
+            member=member.filename,
+        )
+    if member.compress_type not in _SUPPORTED_COMPRESSIONS:
+        raise FormatError(
+            "OOXML archive member uses unsupported compression",
+            member=member.filename,
+            compression=member.compress_type,
+        )
+    if (
+        member.filename.lower().endswith(_XML_PART_SUFFIXES)
+        and member.file_size > limits.max_xml_uncompressed
+    ):
+        raise FormatError(
+            "OOXML XML member exceeds size limit",
+            member=member.filename,
+            uncompressed=member.file_size,
+            limit=limits.max_xml_uncompressed,
+        )
+
+    compression_ratio = member.file_size / max(member.compress_size, 1)
+    if (
+        member.file_size > limits.suspicious_ratio_size
+        and compression_ratio > limits.max_compression_ratio
+    ):
+        raise FormatError(
+            "OOXML member has suspicious compression ratio",
+            member=member.filename,
+            uncompressed=member.file_size,
+            compressed=member.compress_size,
+            compression_ratio=compression_ratio,
+            limit=limits.max_compression_ratio,
+        )
 
 
 def validate_archive(package: ZipFile, limits: OoxmlLimits) -> None:
@@ -49,14 +130,18 @@ def validate_archive(package: ZipFile, limits: OoxmlLimits) -> None:
 
     seen: set[str] = set()
     for member in members:
-        if not _safe_member(member.filename):
+        identity = _member_identity(member.filename)
+        if identity is None:
             _raise_unsafe_member(member)
-        if member.filename in seen:
+        canonical_name, is_canonical = identity
+        if canonical_name in seen:
             raise FormatError(
                 "OOXML archive contains duplicate member names",
                 member=member.filename,
             )
-        seen.add(member.filename)
+        if not is_canonical:
+            _raise_unsafe_member(member)
+        seen.add(canonical_name)
 
     total = sum(member.file_size for member in members)
     if total > limits.max_total_uncompressed:
@@ -67,30 +152,7 @@ def validate_archive(package: ZipFile, limits: OoxmlLimits) -> None:
         )
 
     for member in members:
-        if (
-            member.filename.lower().endswith(_XML_PART_SUFFIXES)
-            and member.file_size > limits.max_xml_uncompressed
-        ):
-            raise FormatError(
-                "OOXML XML member exceeds size limit",
-                member=member.filename,
-                uncompressed=member.file_size,
-                limit=limits.max_xml_uncompressed,
-            )
-
-        compression_ratio = member.file_size / max(member.compress_size, 1)
-        if (
-            member.file_size > limits.suspicious_ratio_size
-            and compression_ratio > limits.max_compression_ratio
-        ):
-            raise FormatError(
-                "OOXML member has suspicious compression ratio",
-                member=member.filename,
-                uncompressed=member.file_size,
-                compressed=member.compress_size,
-                compression_ratio=compression_ratio,
-                limit=limits.max_compression_ratio,
-            )
+        _validate_member_metadata(member, limits)
 
 
 def reject_unsafe_xml_prefix(prefix: bytes, member: str) -> None:
@@ -151,6 +213,11 @@ def safe_iterparse(
     except DefusedXmlException as error:
         raise FormatError(
             "OOXML XML declarations are not allowed",
+            member=member,
+        ) from error
+    except (zipfile.BadZipFile, NotImplementedError, RuntimeError, OSError) as error:
+        raise FormatError(
+            "OOXML archive member cannot be read",
             member=member,
         ) from error
     except (ElementTree.ParseError, UnicodeError, ValueError) as error:

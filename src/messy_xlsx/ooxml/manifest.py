@@ -6,6 +6,7 @@ import posixpath
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from typing import IO
 from urllib.parse import unquote
 from zipfile import BadZipFile, ZipFile
 
@@ -20,12 +21,49 @@ from messy_xlsx.ooxml.models import (
     StyleManifest,
     WorkbookManifest,
 )
-from messy_xlsx.ooxml.security import safe_iterparse, validate_archive
+from messy_xlsx.ooxml.security import (
+    canonical_archive_name,
+    safe_iterparse,
+    validate_archive,
+)
 
 _CONTENT_TYPES_MEMBER = "[Content_Types].xml"
 _WORKBOOK_MEMBER = "xl/workbook.xml"
 _WORKBOOK_RELATIONSHIPS_MEMBER = "xl/_rels/workbook.xml.rels"
-_RELATIONSHIP_ID = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_CONTENT_TYPES_NAMESPACES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/package/2006/content-types",
+        "http://purl.oclc.org/ooxml/package/content-types",
+        "https://purl.oclc.org/ooxml/package/content-types",
+    }
+)
+_PACKAGE_RELATIONSHIPS_NAMESPACES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/package/2006/relationships",
+        "http://purl.oclc.org/ooxml/package/relationships",
+        "https://purl.oclc.org/ooxml/package/relationships",
+    }
+)
+_SPREADSHEET_NAMESPACES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "http://purl.oclc.org/ooxml/spreadsheetml/main",
+        "https://purl.oclc.org/ooxml/spreadsheetml/main",
+    }
+)
+_OFFICE_RELATIONSHIPS_NAMESPACES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "http://purl.oclc.org/ooxml/officeDocument/relationships",
+        "https://purl.oclc.org/ooxml/officeDocument/relationships",
+    }
+)
+_CRITICAL_RELATIONSHIP_TYPES = {
+    relationship_type: frozenset(
+        f"{namespace}/{relationship_type}" for namespace in _OFFICE_RELATIONSHIPS_NAMESPACES
+    )
+    for relationship_type in ("worksheet", "styles", "sharedStrings")
+}
 _WORKBOOK_TYPES = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml": "xlsx",
     "application/vnd.ms-excel.sheet.macroEnabled.main+xml": "xlsm",
@@ -56,8 +94,59 @@ class _WorkbookMetadata:
     sheets: tuple[_WorkbookSheet, ...]
 
 
-def _local_name(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1]
+def _qualified_name(tag: str) -> tuple[str, str]:
+    if tag.startswith("{") and "}" in tag:
+        namespace, local_name = tag[1:].split("}", 1)
+        return namespace, local_name
+    return "", tag
+
+
+def _raise_namespace_error(member: str, tag: str) -> None:
+    namespace, local_name = _qualified_name(tag)
+    raise FormatError(
+        "OOXML package contains malformed XML namespace",
+        member=member,
+        element=local_name,
+        namespace=namespace,
+    )
+
+
+def _root_namespace(
+    tag: str,
+    expected_local_name: str,
+    allowed_namespaces: frozenset[str],
+    member: str,
+) -> str:
+    namespace, local_name = _qualified_name(tag)
+    if local_name != expected_local_name or namespace not in allowed_namespaces:
+        _raise_namespace_error(member, tag)
+    return namespace
+
+
+def _validated_local_name(
+    tag: str,
+    namespace: str | None,
+    namespaced_elements: frozenset[str],
+    member: str,
+) -> str:
+    element_namespace, local_name = _qualified_name(tag)
+    if (
+        namespace is not None
+        and local_name in namespaced_elements
+        and element_namespace != namespace
+    ):
+        _raise_namespace_error(member, tag)
+    return local_name
+
+
+def _open_archive_member(package: ZipFile, member: str) -> IO[bytes]:
+    try:
+        return package.open(member)
+    except (BadZipFile, NotImplementedError, RuntimeError, OSError) as error:
+        raise FormatError(
+            "OOXML archive member cannot be read",
+            member=member,
+        ) from error
 
 
 def _required_member(package: ZipFile, member: str) -> None:
@@ -74,12 +163,23 @@ def _read_workbook_type(package: ZipFile, limits: OoxmlLimits) -> str:
     member = _CONTENT_TYPES_MEMBER
     _required_member(package, member)
     workbook_types: list[str] = []
-    with package.open(member) as source:
+    namespace: str | None = None
+    with _open_archive_member(package, member) as source:
         for event, element in safe_iterparse(source, member, limits):
+            element_namespace, local_name = _qualified_name(element.tag)
+            if event == "start" and namespace is None:
+                namespace = _root_namespace(
+                    element.tag,
+                    "Types",
+                    _CONTENT_TYPES_NAMESPACES,
+                    member,
+                )
+            elif local_name == "Override" and element_namespace != namespace:
+                _raise_namespace_error(member, element.tag)
             if (
                 event == "end"
-                and _local_name(element.tag) == "Override"
-                and element.attrib.get("PartName") == "/xl/workbook.xml"
+                and local_name == "Override"
+                and (element.attrib.get("PartName") == "/xl/workbook.xml")
             ):
                 content_type = element.attrib.get("ContentType")
                 if content_type is None:
@@ -152,6 +252,26 @@ def _relationship_type_name(relationship_type: str) -> str:
     return relationship_type.rstrip("/").rsplit("/", 1)[-1]
 
 
+def _relationship_has_type(relationship_type: str, expected_type: str) -> bool:
+    return relationship_type in _CRITICAL_RELATIONSHIP_TYPES[expected_type]
+
+
+def _validate_critical_relationship_type(
+    relationship_type: str,
+    relationship_id: str,
+    member: str,
+) -> None:
+    type_name = _relationship_type_name(relationship_type)
+    allowed = _CRITICAL_RELATIONSHIP_TYPES.get(type_name)
+    if allowed is not None and relationship_type not in allowed:
+        raise FormatError(
+            "OOXML package contains unsupported relationship type",
+            member=member,
+            relationship_id=relationship_id,
+            relationship_type=relationship_type,
+        )
+
+
 def _read_relationships(
     package: ZipFile,
     member: str,
@@ -160,11 +280,28 @@ def _read_relationships(
     _required_member(package, member)
     relationships: dict[str, _Relationship] = {}
     external_targets: list[str] = []
-    archive_names = set(package.namelist())
+    archive_names = {
+        canonical_archive_name(archive_name): archive_name for archive_name in package.namelist()
+    }
+    namespace: str | None = None
+    namespaced_elements = frozenset({"Relationships", "Relationship"})
 
-    with package.open(member) as source:
+    with _open_archive_member(package, member) as source:
         for event, element in safe_iterparse(source, member, limits):
-            if event == "end" and _local_name(element.tag) == "Relationship":
+            if event == "start" and namespace is None:
+                namespace = _root_namespace(
+                    element.tag,
+                    "Relationships",
+                    _PACKAGE_RELATIONSHIPS_NAMESPACES,
+                    member,
+                )
+            local_name = _validated_local_name(
+                element.tag,
+                namespace,
+                namespaced_elements,
+                member,
+            )
+            if event == "end" and local_name == "Relationship":
                 relationship_id = element.attrib.get("Id")
                 relationship_type = element.attrib.get("Type")
                 target = element.attrib.get("Target")
@@ -179,6 +316,11 @@ def _read_relationships(
                         member=member,
                         relationship_id=relationship_id,
                     )
+                _validate_critical_relationship_type(
+                    relationship_type,
+                    relationship_id,
+                    member,
+                )
 
                 external = element.attrib.get("TargetMode", "Internal").lower() == "external"
                 resolved_target = None if external else _internal_target(target)
@@ -188,6 +330,8 @@ def _read_relationships(
                         member=resolved_target,
                         relationship_id=relationship_id,
                     )
+                if resolved_target is not None:
+                    resolved_target = archive_names[resolved_target]
                 if external:
                     external_targets.append(target)
 
@@ -210,7 +354,7 @@ def _relationship_for_type(
     matches = [
         relationship
         for relationship in relationships.values()
-        if _relationship_type_name(relationship.relationship_type) == relationship_type
+        if _relationship_has_type(relationship.relationship_type, relationship_type)
         and not relationship.external
     ]
     if len(matches) > 1:
@@ -221,6 +365,20 @@ def _relationship_for_type(
     return matches[0] if matches else None
 
 
+def _sheet_relationship_id(attributes: Mapping[str, str], member: str) -> str | None:
+    relationship_ids = [
+        value
+        for namespace in _OFFICE_RELATIONSHIPS_NAMESPACES
+        if (value := attributes.get(f"{{{namespace}}}id")) is not None
+    ]
+    if len(relationship_ids) > 1:
+        raise FormatError(
+            "OOXML workbook contains ambiguous sheet relationship",
+            member=member,
+        )
+    return relationship_ids[0] if relationship_ids else None
+
+
 def _read_workbook_xml(
     package: ZipFile,
     member: str,
@@ -229,10 +387,24 @@ def _read_workbook_xml(
     _required_member(package, member)
     date_system = "1900"
     sheets: list[_WorkbookSheet] = []
+    namespace: str | None = None
+    namespaced_elements = frozenset({"workbook", "workbookPr", "sheets", "sheet"})
 
-    with package.open(member) as source:
+    with _open_archive_member(package, member) as source:
         for event, element in safe_iterparse(source, member, limits):
-            local_name = _local_name(element.tag)
+            if event == "start" and namespace is None:
+                namespace = _root_namespace(
+                    element.tag,
+                    "workbook",
+                    _SPREADSHEET_NAMESPACES,
+                    member,
+                )
+            local_name = _validated_local_name(
+                element.tag,
+                namespace,
+                namespaced_elements,
+                member,
+            )
             if event == "start" and local_name == "workbookPr":
                 date1904 = element.attrib.get("date1904", "0").lower()
                 if date1904 in {"1", "true", "on"}:
@@ -245,7 +417,7 @@ def _read_workbook_xml(
                     )
             elif event == "end" and local_name == "sheet":
                 name = element.attrib.get("name")
-                relationship_id = element.attrib.get(f"{{{_RELATIONSHIP_ID}}}id")
+                relationship_id = _sheet_relationship_id(element.attrib, member)
                 state = element.attrib.get("state", "visible")
                 if not name or not relationship_id:
                     raise FormatError(
@@ -285,7 +457,7 @@ def _build_sheet_descriptors(
                 sheet=sheet.name,
                 relationship_id=sheet.relationship_id,
             )
-        if _relationship_type_name(relationship.relationship_type) != "worksheet":
+        if not _relationship_has_type(relationship.relationship_type, "worksheet"):
             raise FormatError(
                 "OOXML sheet relationship has unexpected type",
                 sheet=sheet.name,
@@ -344,9 +516,23 @@ def _read_styles(
     date_styles: list[int] = []
     in_cell_xfs = False
     style_index = 0
-    with package.open(member) as source:
+    namespace: str | None = None
+    namespaced_elements = frozenset({"styleSheet", "numFmt", "cellXfs", "xf"})
+    with _open_archive_member(package, member) as source:
         for event, element in safe_iterparse(source, member, limits):
-            local_name = _local_name(element.tag)
+            if event == "start" and namespace is None:
+                namespace = _root_namespace(
+                    element.tag,
+                    "styleSheet",
+                    _SPREADSHEET_NAMESPACES,
+                    member,
+                )
+            local_name = _validated_local_name(
+                element.tag,
+                namespace,
+                namespaced_elements,
+                member,
+            )
             if event == "start" and local_name == "cellXfs":
                 in_cell_xfs = True
             elif event == "end" and local_name == "numFmt":

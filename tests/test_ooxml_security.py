@@ -80,6 +80,57 @@ def test_unsafe_member_paths_are_rejected(name: str) -> None:
     assert raised.value.context["member"] == name
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "xl/",
+        "./xl/workbook.xml",
+        "xl//workbook.xml",
+        "%2e%2e/escape.xml",
+    ],
+)
+def test_directory_alias_and_encoded_traversal_members_are_rejected(name: str) -> None:
+    package = _metadata_archive(_member(name))
+
+    with pytest.raises(FormatError, match="unsafe archive path") as raised:
+        validate_archive(package, OoxmlLimits())
+
+    assert raised.value.context["member"] == name
+
+
+def test_normalized_duplicate_member_aliases_are_rejected() -> None:
+    package = _metadata_archive(
+        _member("xl/workbook.xml"),
+        _member("xl/./workbook.xml"),
+    )
+
+    with pytest.raises(FormatError, match="duplicate") as raised:
+        validate_archive(package, OoxmlLimits())
+
+    assert raised.value.context["member"] == "xl/./workbook.xml"
+
+
+def test_encrypted_members_are_rejected_before_reading() -> None:
+    member = _member("xl/workbook.xml")
+    member.flag_bits = 0x1
+
+    with pytest.raises(FormatError, match="encrypted") as raised:
+        validate_archive(_metadata_archive(member), OoxmlLimits())
+
+    assert raised.value.context["member"] == "xl/workbook.xml"
+
+
+def test_unsupported_compression_is_rejected_before_reading() -> None:
+    member = _member("xl/workbook.xml")
+    member.compress_type = 99
+
+    with pytest.raises(FormatError, match="unsupported compression") as raised:
+        validate_archive(_metadata_archive(member), OoxmlLimits())
+
+    assert raised.value.context["member"] == "xl/workbook.xml"
+    assert raised.value.context["compression"] == 99
+
+
 def test_member_count_limit_uses_declared_archive_index() -> None:
     package = _metadata_archive(_member("one.xml"), _member("two.xml"))
 

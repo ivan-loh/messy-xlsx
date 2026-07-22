@@ -21,6 +21,16 @@ WORKBOOK_CONTENT_TYPES: Final[dict[str, str]] = {
     "xltx": "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
     "xltm": "application/vnd.ms-excel.template.macroEnabled.main+xml",
 }
+CONTENT_TYPES_NS: Final = "http://schemas.openxmlformats.org/package/2006/content-types"
+PACKAGE_RELATIONSHIPS_NS: Final = "http://schemas.openxmlformats.org/package/2006/relationships"
+SPREADSHEET_NS: Final = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+OFFICE_RELATIONSHIPS_NS: Final = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+)
+STRICT_CONTENT_TYPES_NS: Final = "http://purl.oclc.org/ooxml/package/content-types"
+STRICT_PACKAGE_RELATIONSHIPS_NS: Final = "http://purl.oclc.org/ooxml/package/relationships"
+STRICT_SPREADSHEET_NS: Final = "http://purl.oclc.org/ooxml/spreadsheetml/main"
+STRICT_OFFICE_RELATIONSHIPS_NS: Final = "http://purl.oclc.org/ooxml/officeDocument/relationships"
 
 
 def _content_types(workbook_type: str = "xlsx") -> bytes:
@@ -218,6 +228,76 @@ def test_workbook_type_comes_from_content_types(workbook_type: str) -> None:
     assert _build(_entries(workbook_type=workbook_type)).workbook_type == workbook_type
 
 
+@pytest.mark.parametrize(
+    ("member", "namespace"),
+    [
+        ("[Content_Types].xml", CONTENT_TYPES_NS),
+        ("xl/_rels/workbook.xml.rels", PACKAGE_RELATIONSHIPS_NS),
+        ("xl/workbook.xml", SPREADSHEET_NS),
+        ("xl/styles.xml", SPREADSHEET_NS),
+    ],
+)
+def test_spoofed_metadata_element_namespaces_are_rejected(
+    member: str,
+    namespace: str,
+) -> None:
+    entries = _entries()
+    entries[member] = entries[member].replace(
+        namespace.encode(),
+        b"https://attacker.invalid/ooxml",
+    )
+
+    with pytest.raises(FormatError, match="namespace") as raised:
+        _build(entries)
+
+    assert raised.value.context["member"] == member
+
+
+def test_spoofed_worksheet_relationship_type_is_rejected() -> None:
+    relationships = _relationships().replace(
+        f"{OFFICE_RELATIONSHIPS_NS}/worksheet".encode(),
+        b"https://attacker.invalid/types/worksheet",
+    )
+
+    with pytest.raises(FormatError, match="relationship type") as raised:
+        _build(_entries(relationships=relationships))
+
+    assert raised.value.context["relationship_type"] == ("https://attacker.invalid/types/worksheet")
+
+
+def test_strict_ooxml_namespaces_and_relationship_types_are_supported() -> None:
+    entries = _entries()
+    replacements = {
+        "[Content_Types].xml": [(CONTENT_TYPES_NS, STRICT_CONTENT_TYPES_NS)],
+        "xl/_rels/workbook.xml.rels": [
+            (PACKAGE_RELATIONSHIPS_NS, STRICT_PACKAGE_RELATIONSHIPS_NS),
+            (OFFICE_RELATIONSHIPS_NS, STRICT_OFFICE_RELATIONSHIPS_NS),
+        ],
+        "xl/workbook.xml": [
+            (SPREADSHEET_NS, STRICT_SPREADSHEET_NS),
+            (OFFICE_RELATIONSHIPS_NS, STRICT_OFFICE_RELATIONSHIPS_NS),
+        ],
+        "xl/styles.xml": [(SPREADSHEET_NS, STRICT_SPREADSHEET_NS)],
+    }
+    for member, member_replacements in replacements.items():
+        for old, new in member_replacements:
+            entries[member] = entries[member].replace(old.encode(), new.encode())
+
+    manifest = _build(entries)
+
+    assert [sheet.name for sheet in manifest.sheets] == ["Second", "First"]
+    assert manifest.styles.date_style_ids == (1, 2)
+
+
+def test_percent_encoded_legitimate_part_name_resolves_to_archive_member() -> None:
+    entries = _entries(relationships=_relationships(first_target="worksheets/sheet%201.xml"))
+    entries["xl/worksheets/sheet%201.xml"] = entries.pop("xl/worksheets/sheet1.xml")
+
+    manifest = _build(entries)
+
+    assert manifest.sheets[1].target == "xl/worksheets/sheet%201.xml"
+
+
 @pytest.mark.parametrize(("date1904", "expected"), [(None, "1900"), ("0", "1900"), ("1", "1904")])
 def test_date_system_comes_from_workbook_properties(
     date1904: str | None,
@@ -252,10 +332,16 @@ def test_optional_styles_and_shared_strings_have_empty_metadata() -> None:
 @pytest.mark.parametrize(
     ("member", "replacement"),
     [
-        ("[Content_Types].xml", b"<Types>"),
-        ("xl/workbook.xml", b"<workbook>"),
-        ("xl/_rels/workbook.xml.rels", b"<Relationships>"),
-        ("xl/styles.xml", b"<styleSheet>"),
+        (
+            "[Content_Types].xml",
+            f'<Types xmlns="{CONTENT_TYPES_NS}">'.encode(),
+        ),
+        ("xl/workbook.xml", f'<workbook xmlns="{SPREADSHEET_NS}">'.encode()),
+        (
+            "xl/_rels/workbook.xml.rels",
+            f'<Relationships xmlns="{PACKAGE_RELATIONSHIPS_NS}">'.encode(),
+        ),
+        ("xl/styles.xml", f'<styleSheet xmlns="{SPREADSHEET_NS}">'.encode()),
     ],
 )
 def test_malformed_metadata_xml_becomes_contextual_format_error(
@@ -394,3 +480,49 @@ def test_build_manifest_opens_source_once(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert calls == 1
     assert OoxmlLimits() == manifest_module.DEFAULT_LIMITS
+
+
+@pytest.mark.parametrize(
+    "read_error",
+    [
+        NotImplementedError("unsupported compression"),
+        RuntimeError("encrypted member"),
+        zipfile.BadZipFile("bad CRC"),
+    ],
+)
+def test_archive_member_read_errors_become_contextual_format_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    read_error: Exception,
+) -> None:
+    content = _package(_entries())
+    original_open = zipfile.ZipFile.open
+
+    def failing_open(
+        package: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        mode: str = "r",
+        pwd: bytes | None = None,
+        *,
+        force_zip64: bool = False,
+    ):
+        member = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if member == "[Content_Types].xml":
+            raise read_error
+        return original_open(
+            package,
+            name,
+            mode=mode,
+            pwd=pwd,
+            force_zip64=force_zip64,
+        )
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", failing_open)
+
+    with (
+        SourceHandle(io.BytesIO(content), filename="broken.xlsx") as source,
+        pytest.raises(FormatError, match="archive member") as raised,
+    ):
+        build_manifest(source)
+
+    assert raised.value.context["member"] == "[Content_Types].xml"
+    assert raised.value.__cause__ is read_error
