@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+from array import array
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -15,6 +16,7 @@ from openpyxl.utils.cell import get_column_letter
 
 from messy_xlsx._source import SourceHandle
 from messy_xlsx.exceptions import FormatError
+from messy_xlsx.ooxml import manifest as manifest_module
 from messy_xlsx.ooxml.manifest import ManifestReader
 from messy_xlsx.ooxml.models import (
     DEFAULT_LIMITS,
@@ -45,12 +47,6 @@ def _synthetic_sheet_manifest(
     row_numbers: range,
     max_column: int,
 ):
-    descriptor = SheetDescriptor(
-        name="Data",
-        relationship_id="rId1",
-        target="xl/worksheets/sheet1.xml",
-        state="visible",
-    )
     rows: list[str] = []
     for row in row_numbers:
         cells = "".join(
@@ -61,7 +57,20 @@ def _synthetic_sheet_manifest(
     xml = (
         '<worksheet xmlns="http://schemas.openxmlformats.org/'
         'spreadsheetml/2006/main"><sheetData>' + "".join(rows) + "</sheetData></worksheet>"
-    ).encode()
+    )
+    return _parse_synthetic_sheet(xml)
+
+
+def _parse_synthetic_sheet(
+    xml: str,
+    number_format_codes: tuple[str, ...] = ("General",),
+):
+    descriptor = SheetDescriptor(
+        name="Data",
+        relationship_id="rId1",
+        target="xl/worksheets/sheet1.xml",
+        state="visible",
+    )
     reader = object.__new__(ManifestReader)
     reader._limits = DEFAULT_LIMITS
     reader.workbook = WorkbookManifest(
@@ -70,9 +79,9 @@ def _synthetic_sheet_manifest(
         sheets=(descriptor,),
         has_shared_strings=False,
         shared_strings_uncompressed_size=0,
-        styles=StyleManifest((), (), ("General",)),
+        styles=StyleManifest((), (), number_format_codes),
     )
-    return reader._parse_sheet_xml(descriptor, io.BytesIO(xml))
+    return reader._parse_sheet_xml(descriptor, io.BytesIO(xml.encode()))
 
 
 def test_interval_index_normalizes_ranges_without_expanding_cells() -> None:
@@ -152,7 +161,7 @@ def test_sheet_metadata_compacts_hidden_ranges_and_indexes_dimensions(metadata_x
     assert sheet.hidden_rows.intervals == (Interval(2, 3), Interval(5, 5))
     assert sheet.hidden_columns.intervals == (Interval(2, 4), Interval(6, 6))
     assert sheet.merged_ranges == (MergeRange(2, 2, 3, 3),)
-    assert sheet.number_format_codes == ("#.##0,00",)
+    assert not hasattr(sheet, "number_format_codes")
     assert not hasattr(sheet, "values")
 
 
@@ -195,6 +204,201 @@ def test_retained_provenance_is_bounded_by_scoring_shape_not_populated_cells(
     assert len(sheet.semantic_nonempty_rows.bits) == 131_072
 
 
+def test_sheet_does_not_retain_unique_formats_outside_scoring_window() -> None:
+    def styled_sheet(style_count: int):
+        formats = (
+            "General",
+            *(f'0.00"style-{index}"' for index in range(style_count)),
+        )
+        styled_rows = "".join(
+            f'<row r="{row}"><c r="A{row}" s="{style}"><v>1</v></c></row>'
+            for style, row in enumerate(range(52, 52 + style_count), start=1)
+        )
+        xml = (
+            '<worksheet xmlns="http://schemas.openxmlformats.org/'
+            'spreadsheetml/2006/main"><sheetData>'
+            '<row r="1"><c r="A1"><v>1</v></c></row>'
+            f"{styled_rows}</sheetData></worksheet>"
+        )
+        return _parse_synthetic_sheet(xml, formats)
+
+    small = styled_sheet(5)
+    large = styled_sheet(1_000)
+
+    assert not hasattr(small, "number_format_codes")
+    assert not hasattr(large, "number_format_codes")
+    assert len(small.cell_evidence) == len(large.cell_evidence) == 51
+    assert small.locale_has_european_format is large.locale_has_european_format is False
+
+
+@pytest.mark.parametrize(
+    ("coordinate", "expected"),
+    [("A1", (1, 1)), ("XFD1048576", (1_048_576, 16_384))],
+)
+def test_cell_coordinate_accepts_exact_excel_bounds(
+    coordinate: str,
+    expected: tuple[int, int],
+) -> None:
+    assert manifest_module._coordinate(coordinate, "xl/worksheets/sheet1.xml") == expected
+
+
+@pytest.mark.parametrize(
+    ("coordinate", "expected"),
+    [
+        ("A1:A1", (1, 1, 1, 1)),
+        ("A1:XFD1048576", (1, 1, 1_048_576, 16_384)),
+    ],
+)
+def test_range_coordinate_accepts_exact_excel_bounds(
+    coordinate: str,
+    expected: tuple[int, int, int, int],
+) -> None:
+    assert manifest_module._range(coordinate, "xl/worksheets/sheet1.xml") == expected
+
+
+@pytest.mark.parametrize("coordinate", ["A0", "XFE1", "A1048577"])
+def test_cell_coordinate_rejects_lower_and_upper_bounds_with_context(coordinate: str) -> None:
+    with pytest.raises(FormatError, match="out-of-bounds") as raised:
+        manifest_module._coordinate(coordinate, "xl/worksheets/sheet1.xml")
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+    assert raised.value.context["coordinate"] == coordinate
+
+
+@pytest.mark.parametrize("coordinate", ["A0:A1", "0:0", "A1:A0", "A1:XFE1"])
+def test_range_coordinate_rejects_lower_and_upper_bounds_with_context(coordinate: str) -> None:
+    with pytest.raises(FormatError, match="out-of-bounds") as raised:
+        manifest_module._range(coordinate, "xl/worksheets/sheet1.xml")
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+    assert raised.value.context["coordinate"] == coordinate
+
+
+def test_range_coordinate_rejects_reversed_bounds_with_context() -> None:
+    with pytest.raises(FormatError, match="malformed") as raised:
+        manifest_module._range("B2:A1", "xl/worksheets/sheet1.xml")
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+    assert raised.value.context["coordinate"] == "B2:A1"
+
+
+@pytest.mark.parametrize(
+    ("xml_fragment", "coordinate"),
+    [
+        ('<dimension ref="A0:A1"/>', "A0:A1"),
+        ('<dimension ref="0:0"/>', "0:0"),
+        ('<mergeCells><mergeCell ref="A0:A1"/></mergeCells>', "A0:A1"),
+        ('<mergeCells><mergeCell ref="0:0"/></mergeCells>', "0:0"),
+    ],
+)
+def test_sheet_parser_rejects_zero_bound_dimensions_and_merges(
+    xml_fragment: str,
+    coordinate: str,
+) -> None:
+    xml = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        f'spreadsheetml/2006/main">{xml_fragment}</worksheet>'
+    )
+
+    with pytest.raises(FormatError, match="out-of-bounds") as raised:
+        _parse_synthetic_sheet(xml)
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+    assert raised.value.context["coordinate"] == coordinate
+
+
+def test_sheet_parser_rejects_row_zero_before_bitset_mutation() -> None:
+    xml = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        'spreadsheetml/2006/main"><sheetData>'
+        '<row r="0"><c r="A0"><v>1</v></c></row>'
+        "</sheetData></worksheet>"
+    )
+
+    with pytest.raises(FormatError, match="out-of-bounds") as raised:
+        _parse_synthetic_sheet(xml)
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+
+
+@pytest.mark.parametrize("row", [0, 1_048_577])
+def test_row_bitset_mutation_rejects_out_of_bounds_rows_defensively(row: int) -> None:
+    with pytest.raises(FormatError, match="out-of-bounds") as raised:
+        manifest_module._set_row_bit(bytearray(131_072), row, "xl/worksheets/sheet1.xml")
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+    assert raised.value.context["coordinate"] == row
+
+
+@pytest.mark.parametrize("offset", [-1, 1])
+def test_packed_mutation_rejects_out_of_bounds_offsets_defensively(offset: int) -> None:
+    with pytest.raises(FormatError, match="packed") as raised:
+        manifest_module._set_packed_code(
+            bytearray(1),
+            offset,
+            1,
+            "xl/worksheets/sheet1.xml",
+            "A0",
+        )
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+    assert raised.value.context["coordinate"] == "A0"
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        (
+            '<row r="1"><c r="A1"><v>1</v></c></row><row r="1"><c r="B1"><v>2</v></c></row>',
+            "strictly increasing worksheet row",
+        ),
+        (
+            '<row r="2"><c r="A2"><v>1</v></c></row><row r="1"><c r="A1"><v>2</v></c></row>',
+            "strictly increasing worksheet row",
+        ),
+        (
+            '<row r="1"><c r="A1"><v>1</v></c><c r="A1"><v>2</v></c></row>',
+            "strictly increasing worksheet cell",
+        ),
+        (
+            '<row r="1"><c r="B1"><v>1</v></c><c r="A1"><v>2</v></c></row>',
+            "strictly increasing worksheet cell",
+        ),
+        (
+            '<row r="2"><c r="A1"><v>1</v></c></row>',
+            "disagrees with enclosing row",
+        ),
+    ],
+)
+def test_sheet_parser_rejects_duplicate_out_of_order_and_mismatched_coordinates(
+    rows: str,
+    message: str,
+) -> None:
+    xml = (
+        '<worksheet xmlns="http://schemas.openxmlformats.org/'
+        f'spreadsheetml/2006/main"><sheetData>{rows}</sheetData></worksheet>'
+    )
+
+    with pytest.raises(FormatError, match=message) as raised:
+        _parse_synthetic_sheet(xml)
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+
+
+def test_sparse_counter_overflow_is_rejected_as_contextual_format_error() -> None:
+    counts = array("H", [65_535])
+
+    with pytest.raises(FormatError, match="sparse") as raised:
+        manifest_module._increment_sparse_counts(
+            counts,
+            {1},
+            "xl/worksheets/sheet1.xml",
+        )
+
+    assert raised.value.context["member"] == "xl/worksheets/sheet1.xml"
+    assert raised.value.context["column"] == 1
+
+
 def test_excel_upper_coordinate_is_accepted(tmp_path) -> None:
     path = tmp_path / "upper-edge.xlsx"
     workbook = openpyxl.Workbook()
@@ -206,8 +410,8 @@ def test_excel_upper_coordinate_is_accepted(tmp_path) -> None:
         "xl/worksheets/sheet1.xml",
         lambda xml: _replace_required(
             _replace_required(xml, b'ref="A1:A1"', b'ref="XFD1048576:XFD1048576"'),
-            b'r="A1"',
-            b'r="XFD1048576"',
+            b'<row r="1"><c r="A1"',
+            b'<row r="1048576"><c r="XFD1048576"',
         ),
     )
 

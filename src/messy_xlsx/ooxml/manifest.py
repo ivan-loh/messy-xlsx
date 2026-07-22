@@ -844,7 +844,7 @@ def _coordinate(value: str | None, member: str) -> tuple[int, int]:
             member=member,
             coordinate=value,
         ) from error
-    if row > _MAX_EXCEL_ROW or column > _MAX_EXCEL_COLUMN:
+    if row < 1 or column < 1 or row > _MAX_EXCEL_ROW or column > _MAX_EXCEL_COLUMN:
         raise FormatError(
             "OOXML worksheet contains out-of-bounds cell coordinate",
             member=member,
@@ -864,14 +864,26 @@ def _range(value: str | None, member: str) -> tuple[int, int, int, int]:
         ) from error
     if None in {min_col, min_row, max_col, max_row}:
         raise FormatError(
-            "OOXML worksheet contains malformed range coordinate",
+            "OOXML worksheet contains out-of-bounds range coordinate",
             member=member,
             coordinate=value,
         )
     parsed = int(min_row), int(min_col), int(max_row), int(max_col)
-    if parsed[2] > _MAX_EXCEL_ROW or parsed[3] > _MAX_EXCEL_COLUMN:
+    if (
+        min(parsed) < 1
+        or parsed[0] > _MAX_EXCEL_ROW
+        or parsed[2] > _MAX_EXCEL_ROW
+        or parsed[1] > _MAX_EXCEL_COLUMN
+        or parsed[3] > _MAX_EXCEL_COLUMN
+    ):
         raise FormatError(
             "OOXML worksheet contains out-of-bounds range coordinate",
+            member=member,
+            coordinate=value,
+        )
+    if parsed[2] < parsed[0] or parsed[3] < parsed[1]:
+        raise FormatError(
+            "OOXML worksheet contains malformed range coordinate",
             member=member,
             coordinate=value,
         )
@@ -926,9 +938,48 @@ class _SemanticRegionState:
         return self.first_row, end_row, self.start_col, self.end_col
 
 
-def _set_row_bit(bits: bytearray, row: int) -> None:
+def _set_row_bit(bits: bytearray, row: int, member: str) -> None:
+    if row < 1 or row > _MAX_EXCEL_ROW or row > len(bits) * 8:
+        raise FormatError(
+            "OOXML worksheet contains out-of-bounds row bit coordinate",
+            member=member,
+            coordinate=row,
+        )
     bit = row - 1
     bits[bit >> 3] |= 1 << (bit & 7)
+
+
+def _set_packed_code(
+    codes: bytearray,
+    offset: int,
+    code: int,
+    member: str,
+    coordinate: str,
+) -> None:
+    if offset < 0 or offset >= len(codes):
+        raise FormatError(
+            "OOXML worksheet contains out-of-bounds packed coordinate",
+            member=member,
+            coordinate=coordinate,
+        )
+    codes[offset] = code
+
+
+def _increment_sparse_counts(
+    counts: array,
+    columns: set[int],
+    member: str,
+) -> None:
+    ordered_columns = sorted(columns)
+    for column in ordered_columns:
+        if column < 1 or column > len(counts) or counts[column - 1] >= 65_535:
+            raise FormatError(
+                "OOXML worksheet sparse count exceeds bounded storage",
+                member=member,
+                column=column,
+            )
+    for column in ordered_columns:
+        counts[column - 1] += 1
 
 
 def _packed_cell_code(
@@ -1082,8 +1133,6 @@ class ManifestReader:
         hidden_columns: list[Interval] = []
         merged_ranges: list[MergeRange] = []
         formula_samples: list[str] = []
-        number_format_codes: list[str] = []
-        seen_number_format_codes: set[str] = set()
         region_state = _SemanticRegionState()
         semantic_row_bits = bytearray(_ROW_BITSET_BYTES)
         scoring_candidates: bytearray | None = None
@@ -1100,6 +1149,9 @@ class ManifestReader:
         current_number_format = "General"
         current_has_value = False
         current_has_formula = False
+        enclosing_row = 0
+        last_worksheet_row = 0
+        last_cell_column = 0
         namespace: str | None = None
         namespaced_elements = frozenset(
             {"worksheet", "dimension", "row", "col", "c", "f", "v", "t", "mergeCell"}
@@ -1119,15 +1171,47 @@ class ManifestReader:
                 namespaced_elements,
                 member,
             )
-            if event == "start" and local_name == "c":
+            if event == "start" and local_name == "row":
+                row = _one_based_int(element.attrib.get("r"), member, "r", _MAX_EXCEL_ROW)
+                if row <= last_worksheet_row:
+                    raise FormatError(
+                        "OOXML worksheet requires strictly increasing worksheet row coordinates",
+                        member=member,
+                        coordinate=row,
+                        previous_coordinate=last_worksheet_row,
+                    )
+                enclosing_row = row
+                last_worksheet_row = row
+                last_cell_column = 0
+            elif event == "start" and local_name == "c":
                 current_cell = element.attrib.get("r")
                 current_row, current_column = _coordinate(current_cell, member)
+                if enclosing_row == 0:
+                    raise FormatError(
+                        "OOXML worksheet cell has no enclosing row",
+                        member=member,
+                        coordinate=current_cell,
+                    )
+                if current_row != enclosing_row:
+                    raise FormatError(
+                        "OOXML worksheet cell coordinate disagrees with enclosing row",
+                        member=member,
+                        coordinate=current_cell,
+                        enclosing_row=enclosing_row,
+                    )
+                if current_column <= last_cell_column:
+                    raise FormatError(
+                        "OOXML worksheet requires strictly increasing worksheet cell coordinates",
+                        member=member,
+                        coordinate=current_cell,
+                        previous_column=last_cell_column,
+                    )
+                last_cell_column = current_column
                 if region_state.first_row is None and current_row != pre_semantic_row:
                     pre_semantic_codes[:] = b"\x00" * _MAX_EXCEL_COLUMN
                     pre_semantic_row = current_row
                 if sparse_row and current_row != sparse_row:
-                    for column in sparse_row_columns:
-                        sparse_counts[column - 1] += 1
+                    _increment_sparse_counts(sparse_counts, sparse_row_columns, member)
                     sparse_row_columns.clear()
                 sparse_row = current_row
                 observed_max_row = max(observed_max_row, current_row)
@@ -1144,14 +1228,6 @@ class ManifestReader:
                 style_codes = self.workbook.styles.number_format_codes
                 if style_index < len(style_codes):
                     current_number_format = style_codes[style_index]
-                    format_code = current_number_format
-                    if (
-                        format_code
-                        and format_code != "General"
-                        and format_code not in seen_number_format_codes
-                    ):
-                        seen_number_format_codes.add(format_code)
-                        number_format_codes.append(format_code)
                 elif style_index:
                     raise FormatError(
                         "OOXML worksheet references an unknown style",
@@ -1162,13 +1238,12 @@ class ManifestReader:
                     current_number_format = "General"
             elif event == "end" and local_name == "dimension":
                 declared_dimension = _range(element.attrib.get("ref"), member)
-            elif (
-                event == "end"
-                and local_name == "row"
-                and _xml_boolean(element.attrib.get("hidden"))
-            ):
-                row = _one_based_int(element.attrib.get("r"), member, "r", _MAX_EXCEL_ROW)
-                hidden_rows.append(Interval(row, row))
+            elif event == "end" and local_name == "row":
+                if _xml_boolean(element.attrib.get("hidden")):
+                    row = _one_based_int(element.attrib.get("r"), member, "r", _MAX_EXCEL_ROW)
+                    hidden_rows.append(Interval(row, row))
+                enclosing_row = 0
+                last_cell_column = 0
             elif (
                 event == "end"
                 and local_name == "col"
@@ -1203,7 +1278,7 @@ class ManifestReader:
                 )
                 in_region = False
                 if current_has_value:
-                    _set_row_bit(semantic_row_bits, current_row)
+                    _set_row_bit(semantic_row_bits, current_row, member)
                     in_region = region_state.observe(current_row, current_column)
                 if (
                     in_region
@@ -1216,7 +1291,13 @@ class ManifestReader:
                     if pre_semantic_row == region_state.first_row:
                         scoring_candidates[:_MAX_EXCEL_COLUMN] = pre_semantic_codes
                 if region_state.first_row is None:
-                    pre_semantic_codes[current_column - 1] = packed_code
+                    _set_packed_code(
+                        pre_semantic_codes,
+                        current_column - 1,
+                        packed_code,
+                        member,
+                        current_cell or "",
+                    )
                 if (
                     scoring_candidates is not None
                     and region_state.first_row is not None
@@ -1229,13 +1310,18 @@ class ManifestReader:
                         + current_column
                         - 1
                     )
-                    scoring_candidates[offset] = packed_code
+                    _set_packed_code(
+                        scoring_candidates,
+                        offset,
+                        packed_code,
+                        member,
+                        current_cell or "",
+                    )
                 current_cell = None
             if event == "end":
                 element.clear()
 
-        for column in sparse_row_columns:
-            sparse_counts[column - 1] += 1
+        _increment_sparse_counts(sparse_counts, sparse_row_columns, member)
         semantic_data_region = region_state.finish(observed_max_row)
         cell_evidence, locale_has_european_format = _cell_evidence_index(
             scoring_candidates,
@@ -1263,7 +1349,6 @@ class ManifestReader:
             merged_ranges=tuple(merged_ranges),
             has_formulas=has_formulas,
             formula_samples=tuple(formula_samples),
-            number_format_codes=tuple(number_format_codes),
             observed_min_col=observed_min_col,
             semantic_data_region=semantic_data_region,
             semantic_nonempty_rows=RowBitSet(bytes(semantic_row_bits)),

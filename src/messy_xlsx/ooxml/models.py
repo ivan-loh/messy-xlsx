@@ -155,7 +155,6 @@ class SheetManifest:
     merged_ranges: tuple[MergeRange, ...]
     has_formulas: bool
     formula_samples: tuple[str, ...]
-    number_format_codes: tuple[str, ...] = ()
     observed_min_col: int = 0
     semantic_data_region: tuple[int, int, int, int] = (1, 1, 1, 1)
     semantic_nonempty_rows: RowBitSet = field(default_factory=RowBitSet)
