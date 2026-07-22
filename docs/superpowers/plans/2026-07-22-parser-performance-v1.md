@@ -88,7 +88,7 @@
 | Slice | Deliverable | Depends on | Status |
 |---:|---|---|:---:|
 | 1 | v0.10.0 compatibility and performance contract | — | [x] |
-| 2 | Legacy warning and API classification | 1 | [ ] |
+| 2 | Legacy warning and API classification | 1 | [x] |
 | 3 | Spillable source lifecycle | 1 | [ ] |
 | 4 | OOXML archive security and eager manifest | 3 | [ ] |
 | 5 | Lazy sheet metadata, interval indexes, and bounded structure sampling | 4 | [ ] |
@@ -425,7 +425,7 @@ git commit -m "test: freeze v0.10 parser compatibility"
 - Produces: `LegacyAPIWarning(DeprecationWarning)` and `warn_legacy(api_name: str) -> None`.
 - Preserves: extension SPI calls remain warning-free; direct listed legacy entry points emit exactly one warning with the user's filename.
 
-- [ ] **Step 1: Write failing warning-boundary tests**
+- [x] **Step 1: Write failing warning-boundary tests**
 
 ```python
 # tests/compatibility/test_legacy_warnings.py
@@ -462,7 +462,7 @@ Run: `.venv/bin/pytest tests/compatibility/test_legacy_warnings.py -q`
 
 Expected: collection fails because `LegacyAPIWarning` is not defined.
 
-- [ ] **Step 2: Add the public warning type and helper**
+- [x] **Step 2: Add the public warning type and helper**
 
 ```python
 # src/messy_xlsx/warnings.py
@@ -485,7 +485,7 @@ def warn_legacy(api_name: str) -> None:
 
 Export `LegacyAPIWarning` from `messy_xlsx.__all__`.
 
-- [ ] **Step 3: Put warnings only at public boundaries**
+- [x] **Step 3: Put warnings only at public boundaries**
 
 Refactor each legacy method into a warning boundary plus a private implementation. Use this exact pattern:
 
@@ -502,13 +502,13 @@ def _to_dataframe_compat(self, sheet=None, config=None):
 
 Make `read_excel()` call `_to_dataframe_compat()`, `read_all_sheets()` call `MultiSheetParser._parse_all_compat()`, and `read_excel_tables()` call a private table conversion method so nested adapters cannot emit duplicates. Apply the same boundary to every API listed in the design spec.
 
-- [ ] **Step 4: Run focused warnings and compatibility tests**
+- [x] **Step 4: Run focused warnings and compatibility tests**
 
 Run: `.venv/bin/pytest tests/compatibility/test_legacy_warnings.py tests/compatibility/test_v010_contract.py -q`
 
 Expected: warning tests and all golden contracts pass.
 
-- [ ] **Step 5: Commit the warning contract**
+- [x] **Step 5: Commit the warning contract**
 
 ```bash
 git add src/messy_xlsx/warnings.py src/messy_xlsx/__init__.py src/messy_xlsx/workbook.py src/messy_xlsx/sheet.py src/messy_xlsx/multi_sheet.py tests/compatibility/test_legacy_warnings.py
