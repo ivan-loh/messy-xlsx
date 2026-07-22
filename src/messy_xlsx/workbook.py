@@ -89,7 +89,7 @@ class _StreamOperationLease:
         return partial
 
     def bind(self, stream: Any) -> Any:
-        """Transfer cleanup to a stream and register it with the token owner."""
+        """Register a stream while retaining lease-owned reader cleanup."""
         if self._released or self._bound:
             raise RuntimeError("Stream operation lease is no longer available")
         stream_ref = weakref.ref(stream)
@@ -98,7 +98,6 @@ class _StreamOperationLease:
         if workbook is None:
             raise _operation_error("MessyWorkbook is closed")
         workbook._register_stream(self._token, stream)
-        self._partial = None
         self._bound = True
         return stream
 
@@ -107,11 +106,18 @@ class _StreamOperationLease:
         if self._released:
             return
         self._released = True
+        partial = self._partial
         self._partial = None
         self._stream_ref = None
         workbook = self._workbook_ref()
+        cleanups: list[tuple[str, Any]] = []
+        if partial is not None:
+            cleanups.append(("owned stream reader cleanup", lambda: _close_if_present(partial)))
         if workbook is not None:
-            workbook._end_operation(self._token)
+            cleanups.append(
+                ("stream reservation release", lambda: workbook._end_operation(self._token))
+            )
+        _run_cleanups(cleanups)
 
     def __enter__(self) -> "_StreamOperationLease":
         return self
@@ -127,15 +133,11 @@ class _StreamOperationLease:
             return
 
         stream = self._stream_ref() if self._stream_ref is not None else None
-        partial = self._partial
-        self._partial = None
         cleanups: list[tuple[str, Any]] = []
         if stream is not None:
             cleanups.append(
                 ("partially registered stream cleanup", lambda: _close_if_present(stream))
             )
-        elif partial is not None:
-            cleanups.append(("partial stream reader cleanup", lambda: _close_if_present(partial)))
         cleanups.append(("stream reservation release", self.release))
         _run_cleanups(
             cleanups,

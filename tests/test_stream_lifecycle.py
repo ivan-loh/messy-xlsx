@@ -404,7 +404,6 @@ def test_stream_termination_releases_matching_workbook_token_once(
         iteration_error=iteration_error,
     )
     with workbook._stream_operation() as lease:
-        lease.own(source)
         stream = BatchStream(source, pa.schema([]), lease.release)
         lease.bind(stream)
 
@@ -586,6 +585,73 @@ def test_failed_stale_bind_closes_created_child_without_releasing_new_operation(
     assert workbook._active_operation_token is new_token
     assert workbook._active_stream is new_child
     workbook._end_operation(new_token)
+    workbook.close()
+
+
+def test_failed_stale_bind_closes_unstarted_adapter_and_distinct_owned_reader_once(
+    sample_xlsx: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workbook = MessyWorkbook(sample_xlsx)
+    real_end = workbook._end_operation
+    releases: list[object] = []
+
+    def record_end(token: object) -> None:
+        releases.append(token)
+        real_end(token)
+
+    monkeypatch.setattr(workbook, "_end_operation", record_end)
+    lease = workbook._stream_operation()
+    reader = _EventResource("reader", [])
+
+    def reader_batches() -> Iterator[pa.RecordBatch]:
+        try:
+            yield _batch()
+        finally:
+            reader.close()
+
+    lease.own(reader)
+    stream = BatchStream(reader_batches(), _batch().schema, lease.release)
+    workbook._end_operation(lease._token)
+    new_token = workbook._begin_operation()
+    new_child = object()
+    workbook._register_stream(new_token, new_child)
+    releases.clear()
+
+    with pytest.raises(RuntimeError, match="reservation is no longer active"), lease:
+        lease.bind(stream)
+
+    assert reader.calls == 1
+    assert releases == [lease._token]
+    assert workbook._active_operation_token is new_token
+    assert workbook._active_stream is new_child
+    workbook._end_operation(new_token)
+    workbook.close()
+
+
+def test_explicit_close_before_first_adapter_read_closes_owned_reader_once(
+    sample_xlsx: Any,
+) -> None:
+    workbook = MessyWorkbook(sample_xlsx)
+    reader = _EventResource("reader", [])
+
+    def reader_batches() -> Iterator[pa.RecordBatch]:
+        try:
+            yield _batch()
+        finally:
+            reader.close()
+
+    with workbook._stream_operation() as lease:
+        lease.own(reader)
+        stream = BatchStream(reader_batches(), _batch().schema, lease.release)
+        lease.bind(stream)
+
+    stream.close()
+    stream.close()
+
+    assert reader.calls == 1
+    assert workbook._active_operation_token is None
+    assert workbook._active_stream is None
     workbook.close()
 
 
