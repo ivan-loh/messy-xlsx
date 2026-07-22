@@ -30,16 +30,18 @@ def _run_cleanups(
     *,
     primary_error: BaseException | None = None,
     primary_traceback: TracebackType | None = None,
-) -> None:
+) -> bool:
     """Attempt every cleanup and apply the shared process-failure policy."""
     winner = primary_error
     winner_traceback = primary_traceback
     process_cleanup_won = primary_error is not None and _contains_process_failure(primary_error)
+    cleanup_failed = False
 
     for label, cleanup in cleanups:
         try:
             cleanup()
         except BaseException as cleanup_error:
+            cleanup_failed = True
             cleanup_traceback = _exception_traceback(cleanup_error)
             if winner is None:
                 winner = cleanup_error
@@ -75,8 +77,9 @@ def _run_cleanups(
             )
 
     if winner is None or winner is primary_error:
-        return
+        return cleanup_failed
     _raise_with_traceback(winner, winner_traceback)
+    return cleanup_failed
 
 
 def _close_if_present(owner: object) -> None:

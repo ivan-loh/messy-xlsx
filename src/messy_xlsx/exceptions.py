@@ -4,7 +4,13 @@
 # Imports
 # ============================================================================
 
+import re
 from typing import Any
+
+from messy_xlsx._fallback_signals import (
+    _FallbackBlockReason,
+    _mark_fallback_blocked,
+)
 
 # ============================================================================
 # Base Exception
@@ -116,6 +122,69 @@ class NormalizationError(MessyXlsxError):
         }
         context = {k: v for k, v in context.items() if v is not None}
         super().__init__(message, context)
+
+
+class StreamingTypeError(NormalizationError):
+    """A streamed value cannot fit the schema fixed before iteration."""
+
+    _MAX_CONTEXT_TEXT = 160
+    _MESSAGE = "streamed value is incompatible with the fixed schema"
+    _STRUCTURAL_TEXT = re.compile(
+        r"^(?:str|bytes)(?: label)?\(length=\d+\)$|^(?:int|float|bool|date|datetime|time|unsupported value|non-string label)$"
+    )
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        ordinal: int,
+        display_label: str,
+        row_offset: int,
+        value_description: str,
+        expected_type: str,
+    ) -> None:
+        if type(ordinal) is not int or ordinal < 0:
+            raise TypeError("ordinal must be a non-negative exact int")
+        if type(row_offset) is not int or row_offset < 0:
+            raise TypeError("row_offset must be a non-negative exact int")
+        context_values = {
+            "display_label": display_label,
+            "value_description": value_description,
+            "expected_type": expected_type,
+        }
+        if any(type(value) is not str for value in context_values.values()):
+            raise TypeError("streaming error text context must use exact strings")
+        del message
+        safe_label = self._safe_label(display_label)
+        safe_value = self._safe_value_description(value_description)
+        safe_expected = self._safe_expected_type(expected_type)
+        super().__init__(
+            self._MESSAGE,
+            value=None,
+            expected_type=safe_expected,
+            ordinal=ordinal,
+            display_label=safe_label,
+            row_offset=row_offset,
+            value_description=safe_value,
+        )
+        _mark_fallback_blocked(self, _FallbackBlockReason.CONFIGURATION)
+
+    @classmethod
+    def _safe_label(cls, value: str) -> str:
+        bounded = value[: cls._MAX_CONTEXT_TEXT]
+        if cls._STRUCTURAL_TEXT.fullmatch(bounded):
+            return bounded
+        return f"str label(length={len(value)})"
+
+    @classmethod
+    def _safe_value_description(cls, value: str) -> str:
+        bounded = value[: cls._MAX_CONTEXT_TEXT]
+        return bounded if cls._STRUCTURAL_TEXT.fullmatch(bounded) else "unsupported value"
+
+    @classmethod
+    def _safe_expected_type(cls, value: str) -> str:
+        bounded = value[: cls._MAX_CONTEXT_TEXT]
+        return bounded if re.fullmatch(r"[A-Za-z0-9_+\-.,: =\[\]()]+", bounded) else "arrow type"
 
 
 # ============================================================================
