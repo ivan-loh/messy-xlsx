@@ -218,6 +218,25 @@ def test_private_handler_behavior_flag_override_is_detected(
     assert registry._uses_builtin_components() is True
 
 
+def test_contextmanager_wrapper_closure_mutation_and_restore_is_detected() -> None:
+    registry = HandlerRegistry()
+    wrapper = vars(HandlerRegistry)["_source_handle"]
+    assert wrapper.__closure__ is not None
+    closure_cell = wrapper.__closure__[0]
+    original = closure_cell.cell_contents
+
+    def replacement(*_args: object, **_kwargs: object) -> object:
+        return object()
+
+    try:
+        closure_cell.cell_contents = replacement
+        assert registry._uses_builtin_components() is False
+    finally:
+        closure_cell.cell_contents = original
+
+    assert registry._uses_builtin_components() is True
+
+
 def test_private_descriptor_override_before_construction_and_restore_is_detected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

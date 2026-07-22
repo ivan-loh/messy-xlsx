@@ -168,10 +168,31 @@ class _BehaviorFingerprinter:
         if isinstance(value, Enum):
             return ("enum", type(value), value.name)
         if isinstance(value, FunctionType):
+            identity = id(value)
+            if identity in self._seen:
+                return ("ref", self._seen[identity])
+            if len(self._seen) >= _MAX_FINGERPRINT_NODES:
+                raise _FingerprintError("class behavior exceeds fingerprint limit")
+            node = len(self._seen)
+            self._seen[identity] = node
+            closure: list[tuple[str, object]] = []
+            for name, cell in zip(
+                value.__code__.co_freevars,
+                value.__closure__ or (),
+                strict=True,
+            ):
+                try:
+                    contents = cell.cell_contents
+                except ValueError:
+                    closure.append((name, ("empty-cell",)))
+                else:
+                    closure.append((name, self.token(contents)))
             return (
                 "function",
+                node,
                 id(value),
                 id(value.__code__),
+                tuple(closure),
                 self.token(value.__defaults__),
                 self.token(value.__kwdefaults__),
                 self.token(value.__annotations__),
