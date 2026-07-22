@@ -72,7 +72,10 @@ _COMMA_DECIMAL_SPACE_THOUSANDS: Final = frozenset(
 class FrozenDataclassValue:
     """Deterministic immutable projection of a supported dataclass value."""
 
-    dataclass_type: type[Any]
+    type_identity: int
+    type_module: str
+    type_qualname: str
+    dataclass_type: type[Any] = field(compare=False, hash=False, repr=False)
     attribute_values: tuple[tuple[str, Any], ...]
 
 
@@ -133,7 +136,10 @@ class _FrozenIdentityReference:
 
 @dataclass(frozen=True, slots=True)
 class _FrozenObject:
-    object_type: type[Any]
+    type_identity: int
+    type_module: str
+    type_qualname: str
+    object_type: type[Any] = field(compare=False, hash=False, repr=False)
     attribute_values: tuple[tuple[str, Any], ...]
 
 
@@ -485,8 +491,13 @@ def _freeze(  # noqa: C901
             if not _is_safely_reconstructable_python_object(value):
                 raise TypeError(f"opaque mutable configuration value: {type(value).__name__}")
             attributes = _object_attributes(value)
+            value_type = type(value)
+            type_module, type_qualname = _safe_type_description(value_type)
             return FrozenDataclassValue(
-                dataclass_type=type(value),
+                type_identity=id(value_type),
+                type_module=type_module,
+                type_qualname=type_qualname,
+                dataclass_type=value_type,
                 attribute_values=tuple(
                     (
                         name,
@@ -506,8 +517,13 @@ def _freeze(  # noqa: C901
         if attributes:
             if not _is_safely_reconstructable_python_object(value):
                 raise TypeError(f"opaque mutable configuration value: {type(value).__name__}")
+            value_type = type(value)
+            type_module, type_qualname = _safe_type_description(value_type)
             return _FrozenObject(
-                object_type=type(value),
+                type_identity=id(value_type),
+                type_module=type_module,
+                type_qualname=type_qualname,
+                object_type=value_type,
                 attribute_values=tuple(
                     (
                         name,
@@ -632,15 +648,17 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
     if isinstance(value, _FrozenObject):
         return (
             "object",
-            value.object_type.__module__,
-            value.object_type.__qualname__,
+            value.type_module,
+            value.type_qualname,
+            value.type_identity,
             tuple((name, _stable_token(item)) for name, item in value.attribute_values),
         )
     if isinstance(value, FrozenDataclassValue):
         return (
             "dataclass",
-            value.dataclass_type.__module__,
-            value.dataclass_type.__qualname__,
+            value.type_module,
+            value.type_qualname,
+            value.type_identity,
             tuple((name, _stable_token(item)) for name, item in value.attribute_values),
         )
     if (

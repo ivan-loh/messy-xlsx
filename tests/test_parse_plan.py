@@ -1071,6 +1071,19 @@ class _HostileMetaclassIdentityCondition(metaclass=_HostileIdentityMetaclass):
     pass
 
 
+@dataclass
+class _HostileMetaclassDataclass(metaclass=_HostileIdentityMetaclass):
+    values: list[str]
+
+
+class _HostileMetaclassObject(metaclass=_HostileIdentityMetaclass):
+    def __init__(self, values: list[str]) -> None:
+        self.values = values
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _HostileMetaclassObject) and self.values == other.values
+
+
 class _CustomNewValue:
     def __new__(cls, value: str) -> _CustomNewValue:
         del value
@@ -1507,6 +1520,38 @@ def test_identity_drop_token_uses_nonvirtual_stable_type_identity() -> None:
     assert hash(first) == hash(same_reference)
     assert hash(first) == hash(first)
     assert first.thaw_drop_conditions()[0][1] is condition
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [_HostileMetaclassDataclass, _HostileMetaclassObject],
+    ids=["dataclass", "custom-object"],
+)
+def test_value_snapshot_type_metadata_never_invokes_live_metaclass_semantics(
+    factory: type[object],
+) -> None:
+    first = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"value": factory(["target"])},  # type: ignore[call-arg,dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+    same_value = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"value": factory(["target"])},  # type: ignore[call-arg,dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+    _HostileIdentityMetaclass.hash_calls = 0
+
+    assert first == same_value
+    assert hash(first) == hash(same_value)
+    assert hash(first) == hash(first)
+    assert first.thaw_type_hints()["value"].values == ["target"]  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize("container_kind", ["list", "tuple", "mapping", "set"])
