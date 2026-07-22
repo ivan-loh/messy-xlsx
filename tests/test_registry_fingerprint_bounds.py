@@ -12,6 +12,22 @@ import pytest
 import messy_xlsx.parsing.handler_registry as registry_module
 
 
+class _BehaviorChangingInt(int):
+    def __add__(self, _other: object) -> int:
+        return -1
+
+
+class _HostileScalarInt(int):
+    hash_calls = 0
+
+    def __hash__(self) -> int:
+        type(self).hash_calls += 1
+        raise AssertionError("fingerprint must not invoke scalar subclass hash")
+
+    def __eq__(self, _other: object) -> bool:
+        raise AssertionError("fingerprint must not invoke scalar subclass equality")
+
+
 def test_oversized_instance_namespace_fails_before_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -45,6 +61,29 @@ def test_small_instance_namespace_still_uses_normal_copy_path(
     registry_module._CompositionFingerprinter(include_identity=True).token(component)
 
     assert copy_calls == 1
+
+
+def test_component_scalar_subclass_mutation_and_restore_changes_token() -> None:
+    component = SimpleNamespace(limit=1)
+    expected = registry_module._CompositionFingerprinter(include_identity=False).token(component)
+
+    component.limit = _BehaviorChangingInt(1)
+    changed = registry_module._CompositionFingerprinter(include_identity=False).token(component)
+    component.limit = 1
+    restored = registry_module._CompositionFingerprinter(include_identity=False).token(component)
+
+    assert changed != expected
+    assert restored == expected
+
+
+def test_scalar_subclass_fingerprint_never_invokes_virtual_hash_or_equality() -> None:
+    component = SimpleNamespace(limit=_HostileScalarInt(1))
+    _HostileScalarInt.hash_calls = 0
+
+    token = registry_module._CompositionFingerprinter(include_identity=False).token(component)
+
+    hash(token)
+    assert _HostileScalarInt.hash_calls == 0
 
 
 @pytest.mark.parametrize(

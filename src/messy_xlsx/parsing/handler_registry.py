@@ -99,20 +99,20 @@ class _CompositionFingerprinter(_FingerprintBudget):
 
     def token(self, value: object) -> object:  # noqa: C901
         self._charge()
-        if isinstance(value, bytes):
+        if type(value) is bytes:
             self._charge(len(value))
             return (bytes, value)
-        if value is None or isinstance(value, bool):
+        if value is None or type(value) is bool:
             return (type(value), value)
-        if isinstance(value, int):
+        if type(value) is int:
             self._charge(max(1, (value.bit_length() + 7) // 8))
             return (int, value)
-        if isinstance(value, str):
+        if type(value) is str:
             self._charge(len(value))
             return (str, value)
-        if isinstance(value, float):
+        if type(value) is float:
             return (float, value.hex())
-        if isinstance(value, complex):
+        if type(value) is complex:
             return (complex, value.real.hex(), value.imag.hex())
         if isinstance(value, Enum):
             return ("enum", type(value), value.name)
@@ -248,20 +248,20 @@ class _BehaviorFingerprinter(_FingerprintBudget):
 
     def token(self, value: object) -> object:  # noqa: C901
         self._charge()
-        if isinstance(value, bytes):
+        if type(value) is bytes:
             self._charge(len(value))
             return (bytes, value)
-        if value is None or isinstance(value, bool):
+        if value is None or type(value) is bool:
             return (type(value), value)
-        if isinstance(value, int):
+        if type(value) is int:
             self._charge(max(1, (value.bit_length() + 7) // 8))
             return (int, value)
-        if isinstance(value, str):
+        if type(value) is str:
             self._charge(len(value))
             return (str, value)
-        if isinstance(value, float):
+        if type(value) is float:
             return (float, value.hex())
-        if isinstance(value, complex):
+        if type(value) is complex:
             return (complex, value.real.hex(), value.imag.hex())
         if isinstance(value, Enum):
             return ("enum", type(value), value.name)
@@ -411,10 +411,8 @@ class _BehaviorFingerprinter(_FingerprintBudget):
             return ("callable", type(value), id(value))
         if (
             value is None
-            or isinstance(
-                value,
-                (bool, int, float, complex, str, bytes, Enum),
-            )
+            or type(value) in {bool, int, float, complex, str, bytes}
+            or isinstance(value, Enum)
             or type(value) in {dict, list, tuple, set, frozenset, bytearray, memoryview}
         ):
             return self.token(value)
@@ -560,7 +558,8 @@ class _BehaviorFingerprinter(_FingerprintBudget):
             return ("callable", type(value), id(value))
         if (
             value is None
-            or isinstance(value, (bool, int, float, complex, str, bytes, Enum))
+            or type(value) in {bool, int, float, complex, str, bytes}
+            or isinstance(value, Enum)
             or type(value) in {dict, list, tuple, set, frozenset, bytearray, memoryview}
         ):
             return self.token(value)
@@ -600,9 +599,10 @@ def _project_component_types(  # noqa: C901
     discovered: set[type[object]] = {HandlerRegistry}
 
     def visit(value: object) -> None:  # noqa: C901
-        if value is None or isinstance(
-            value,
-            (bool, int, float, complex, str, bytes, Enum, type, FunctionType),
+        if (
+            value is None
+            or type(value) in {bool, int, float, complex, str, bytes}
+            or isinstance(value, (Enum, type, FunctionType))
         ):
             return
         identity = id(value)
