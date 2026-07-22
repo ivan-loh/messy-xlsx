@@ -87,7 +87,7 @@
 
 | Slice | Deliverable | Depends on | Status |
 |---:|---|---|:---:|
-| 1 | v0.10.0 compatibility and performance contract | — | [ ] |
+| 1 | v0.10.0 compatibility and performance contract | — | [x] |
 | 2 | Legacy warning and API classification | 1 | [ ] |
 | 3 | Spillable source lifecycle | 1 | [ ] |
 | 4 | OOXML archive security and eager manifest | 3 | [ ] |
@@ -129,7 +129,7 @@
 - Produces: `frame_contract(df: pd.DataFrame) -> dict[str, object]` and immutable v0.10.0 golden records used by every replacement task.
 - Produces: pytest marker `compatibility` and reference performance metadata for the maintained 100,000-row XLSX sample and 300,000-row generated CSV.
 
-- [ ] **Step 1: Add deterministic DataFrame contract serialization**
+- [x] **Step 1: Add deterministic DataFrame contract serialization**
 
 ```python
 # tests/compatibility/_contract.py
@@ -179,7 +179,7 @@ def exception_contract(callable_object) -> dict[str, Any]:
     raise AssertionError("expected callable to raise")
 ```
 
-- [ ] **Step 2: Add and run the baseline capture script before runtime changes**
+- [x] **Step 2: Add and run the baseline capture script before runtime changes**
 
 ```python
 # scripts/capture_v010_contract.py
@@ -311,7 +311,7 @@ results to `v010-structures.json` and `v010-cells.json`, then call all four
 writers at the end of `main()`. The unsupported-format contract uses a byte
 payload whose temporary filename is normalized by `exception_contract()`.
 
-- [ ] **Step 3: Add the characterization test**
+- [x] **Step 3: Add the characterization test**
 
 ```python
 # tests/compatibility/test_v010_contract.py
@@ -380,7 +380,7 @@ def test_cell_rows_and_tables_match_v010() -> None:
     assert _cell_contracts() == expected
 ```
 
-- [ ] **Step 4: Register the compatibility marker and run the frozen contract**
+- [x] **Step 4: Register the compatibility marker and run the frozen contract**
 
 Add `"compatibility: v0.10.0 public behavior contract"` to `tool.pytest.ini_options.markers` in `pyproject.toml`.
 
@@ -388,7 +388,7 @@ Run: `.venv/bin/pytest tests/compatibility/test_v010_contract.py -q`
 
 Expected: all maintained sample, exception, and public-signature cases pass against the freshly captured v0.10.0 contract.
 
-- [ ] **Step 5: Record the reference benchmark metadata**
+- [x] **Step 5: Record the reference benchmark metadata**
 
 Write `benchmarks/v010-reference.json` from the already measured baseline:
 
@@ -402,7 +402,7 @@ Write `benchmarks/v010-reference.json` from the already measured baseline:
 }
 ```
 
-- [ ] **Step 6: Commit the compatibility checkpoint**
+- [x] **Step 6: Commit the compatibility checkpoint**
 
 ```bash
 git add pyproject.toml benchmarks/v010-reference.json scripts/capture_v010_contract.py tests/compatibility
