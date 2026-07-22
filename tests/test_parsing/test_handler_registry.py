@@ -210,3 +210,117 @@ class TestHandlerRegistry:
 
         assert captured.value is primary_error
         assert fallback_calls == 0
+
+    @pytest.mark.parametrize(
+        "primary_error",
+        [
+            ExceptionGroup(
+                "outer",
+                [ExceptionGroup("inner", [MemoryError("capacity")])],
+            ),
+            ExceptionGroup(
+                "outer",
+                [
+                    ExceptionGroup(
+                        "inner",
+                        [
+                            _mark_fallback_blocked(
+                                ValueError("paramètre non valide"),
+                                _FallbackBlockReason.CONFIGURATION,
+                            )
+                        ],
+                    )
+                ],
+            ),
+        ],
+    )
+    def test_nested_unsafe_group_blocks_legacy_registry_retry(
+        self,
+        sample_xlsx,
+        primary_error: ExceptionGroup,
+    ):
+        fallback_calls = 0
+
+        class PrimaryHandler(FormatHandler):
+            def can_handle(self, format_type):
+                return format_type == "xlsx"
+
+            def parse(self, file_source, sheet, options):
+                raise primary_error
+
+            def get_sheet_names(self, file_source):
+                return ["Data"]
+
+            def validate(self, file_source):
+                return True, None
+
+        class FallbackHandler(PrimaryHandler):
+            def parse(self, file_source, sheet, options):
+                nonlocal fallback_calls
+                fallback_calls += 1
+                return pd.DataFrame({"wrong": [True]})
+
+        registry = HandlerRegistry(handlers=[PrimaryHandler(), FallbackHandler()])
+
+        with pytest.raises(ExceptionGroup) as captured:
+            registry.parse(sample_xlsx, format_type="xlsx")
+
+        assert captured.value is primary_error
+        assert fallback_calls == 0
+
+    @pytest.mark.parametrize(
+        "primary_error",
+        [
+            ExceptionGroup(
+                "outer",
+                [ExceptionGroup("inner", [MemoryError("capacity")])],
+            ),
+            ExceptionGroup(
+                "outer",
+                [
+                    ExceptionGroup(
+                        "inner",
+                        [
+                            _mark_fallback_blocked(
+                                RuntimeError("source occupée"),
+                                _FallbackBlockReason.SOURCE_OWNERSHIP,
+                            )
+                        ],
+                    )
+                ],
+            ),
+        ],
+    )
+    def test_nested_unsafe_group_blocks_legacy_sheet_name_retry(
+        self,
+        sample_xlsx,
+        primary_error: ExceptionGroup,
+    ):
+        fallback_calls = 0
+
+        class PrimaryHandler(FormatHandler):
+            def can_handle(self, format_type):
+                return format_type == "xlsx"
+
+            def parse(self, file_source, sheet, options):
+                return pd.DataFrame()
+
+            def get_sheet_names(self, file_source):
+                raise primary_error
+
+            def validate(self, file_source):
+                return True, None
+
+        class FallbackHandler(PrimaryHandler):
+            def get_sheet_names(self, file_source):
+                nonlocal fallback_calls
+                fallback_calls += 1
+                return ["Wrong"]
+
+        registry = HandlerRegistry(handlers=[PrimaryHandler(), FallbackHandler()])
+
+        with pytest.raises(ExceptionGroup) as captured:
+            registry.get_sheet_names(sample_xlsx, format_type="xlsx")
+
+        assert captured.value is primary_error
+        assert fallback_calls == 0

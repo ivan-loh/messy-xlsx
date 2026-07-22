@@ -1151,6 +1151,108 @@ def test_excluded_errors_are_never_sent_to_the_classifier(error: BaseException) 
 
 
 @pytest.mark.parametrize(
+    "group",
+    [
+        ExceptionGroup(
+            "outer",
+            [ExceptionGroup("inner", [MemoryError("capacity")])],
+        ),
+        BaseExceptionGroup(
+            "outer",
+            [BaseExceptionGroup("inner", [KeyboardInterrupt()])],
+        ),
+    ],
+)
+def test_nested_process_groups_are_not_classified_suppressed_or_retried(
+    group: BaseExceptionGroup,
+) -> None:
+    fallback_calls = 0
+
+    def classifier(_error: Exception) -> bool:
+        pytest.fail("process-level group reached classifier")
+
+    def fallback_factory() -> object:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        FallbackCoordinator(classifier).materialize(
+            lambda: _MaterializedReaderFake(
+                [],
+                "primary",
+                read_error=group,
+                suppress=True,
+            ),
+            fallback_factory,
+        )
+
+    assert captured.value is group
+    traceback = BaseException.__getattribute__(group, "__traceback__")
+    assert traceback is not None
+    frame_names: list[str] = []
+    while traceback is not None:
+        frame_names.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    assert "read_table" in frame_names
+    assert fallback_calls == 0
+
+
+def test_nested_marked_group_blocks_schema_fallback_and_preserves_identity() -> None:
+    marked = _mark_fallback_blocked(
+        ValueError("paramètre non valide"),
+        _FallbackBlockReason.CONFIGURATION,
+    )
+    group = ExceptionGroup("outer", [ExceptionGroup("inner", [marked])])
+    fallback_calls = 0
+
+    def fallback_factory() -> _StreamingReaderFake:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return _StreamingReaderFake([], "fallback", [None])
+
+    with pytest.raises(ExceptionGroup) as captured:
+        list(
+            FallbackCoordinator(lambda _error: True).batches(
+                lambda: _StreamingReaderFake(
+                    [],
+                    "primary",
+                    [None],
+                    schema_error=group,
+                ),
+                fallback_factory,
+            )
+        )
+
+    assert captured.value is group
+    assert fallback_calls == 0
+
+
+def test_nested_process_group_blocks_stream_read_fallback() -> None:
+    group = ExceptionGroup(
+        "outer",
+        [ExceptionGroup("inner", [MemoryError("capacity")])],
+    )
+    fallback_calls = 0
+
+    def fallback_factory() -> _StreamingReaderFake:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return _StreamingReaderFake([], "fallback", [None])
+
+    with pytest.raises(ExceptionGroup) as captured:
+        list(
+            FallbackCoordinator(lambda _error: True).batches(
+                lambda: _StreamingReaderFake([], "primary", [group]),
+                fallback_factory,
+            )
+        )
+
+    assert captured.value is group
+    assert fallback_calls == 0
+
+
+@pytest.mark.parametrize(
     ("error", "reason"),
     [
         (ValueError("paramètre non valide"), _FallbackBlockReason.CONFIGURATION),

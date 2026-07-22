@@ -19,7 +19,7 @@ from typing import cast
 
 import pandas as pd
 
-from messy_xlsx._fallback_signals import _is_fallback_blocked
+from messy_xlsx._fallback_signals import _blocks_backend_retry
 from messy_xlsx._source import SourceHandle, SourceInput
 from messy_xlsx.detection.format_detector import FormatDetector
 from messy_xlsx.exceptions import FormatError
@@ -647,7 +647,7 @@ class HandlerRegistry:
             except (PermissionError, FileNotFoundError, MemoryError):
                 raise
             except Exception as error:
-                if _is_fallback_blocked(error):
+                if _blocks_backend_retry(error):
                     raise
                 pass
 
@@ -662,7 +662,7 @@ class HandlerRegistry:
                 except (PermissionError, FileNotFoundError, MemoryError):
                     raise
                 except Exception as error:
-                    if _is_fallback_blocked(error):
+                    if _blocks_backend_retry(error):
                         raise
                     continue
 
@@ -695,7 +695,7 @@ class HandlerRegistry:
             except (PermissionError, FileNotFoundError, MemoryError):
                 raise
             except Exception as error:
-                if _is_fallback_blocked(error):
+                if _blocks_backend_retry(error):
                     raise
                 pass
 
@@ -708,7 +708,7 @@ class HandlerRegistry:
                 except (PermissionError, FileNotFoundError, MemoryError):
                     raise
                 except Exception as error:
-                    if _is_fallback_blocked(error):
+                    if _blocks_backend_retry(error):
                         raise
                     continue
 

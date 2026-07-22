@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, NoReturn
 
-from messy_xlsx._fallback_signals import _is_fallback_blocked
+from messy_xlsx._fallback_signals import (
+    _blocks_backend_retry,
+    _contains_process_failure,
+)
 from messy_xlsx.parsing.contracts import ParseMetrics
 
 _MISSING_SPECIAL = object()
@@ -188,11 +191,11 @@ class FallbackCoordinator:
         return _Attempt(value=value)
 
     def _can_fallback(self, error: BaseException) -> bool:
+        if _blocks_backend_retry(error):
+            return False
         if not isinstance(error, Exception):
             return False
         if isinstance(error, (PermissionError, FileNotFoundError, MemoryError)):
-            return False
-        if _is_fallback_blocked(error):
             return False
         try:
             return self._is_compatibility_error(error)
@@ -410,15 +413,12 @@ def _close_reader(
 
 def _cleanup_takes_precedence(error: BaseException) -> bool:
     """Return whether teardown must replace an operation failure."""
-    return isinstance(error, (MemoryError, KeyboardInterrupt, SystemExit)) or not isinstance(
-        error,
-        Exception,
-    )
+    return _contains_process_failure(error)
 
 
 def _is_suppressible_parse_failure(error: BaseException) -> bool:
     """Limit context suppression to ordinary, recoverable parse failures."""
-    return isinstance(error, Exception) and not isinstance(error, MemoryError)
+    return isinstance(error, Exception) and not _contains_process_failure(error)
 
 
 def _failure_summary(error: BaseException) -> dict[str, str]:
