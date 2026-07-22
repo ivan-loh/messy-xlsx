@@ -392,9 +392,9 @@ class _BehaviorFingerprinter(_FingerprintBudget):
         return ("project-type", node, value_type, tuple(attributes))
 
     def _class_attribute_token(self, value: object) -> object:
-        """Fingerprint raw class behavior without expanding another global graph."""
+        """Fingerprint raw class behavior and bounded project-global references."""
         if isinstance(value, FunctionType):
-            return self._shallow_function_token(value)
+            return self._project_function_token(value)
         if isinstance(value, staticmethod):
             return ("staticmethod", self._class_attribute_token(value.__func__))
         if isinstance(value, classmethod):
@@ -408,8 +408,8 @@ class _BehaviorFingerprinter(_FingerprintBudget):
             )
         return self.token(value)
 
-    def _shallow_function_token(self, value: FunctionType) -> object:
-        """Capture code, closure, defaults, and state but not transitive globals."""
+    def _project_function_token(self, value: FunctionType) -> object:
+        """Capture project method behavior and its bounded referenced globals."""
         identity = id(value)
         if identity in self._seen:
             return ("ref", self._seen[identity])
@@ -438,9 +438,62 @@ class _BehaviorFingerprinter(_FingerprintBudget):
             identity,
             id(value.__code__),
             tuple(closure),
+            self._project_function_globals(value),
             self.token(value.__defaults__),
             self.token(value.__kwdefaults__),
         )
+
+    def _project_function_globals(
+        self,
+        function: FunctionType,
+    ) -> tuple[tuple[str, object], ...]:
+        """Fingerprint only globals directly named by project-method bytecode."""
+        references: list[tuple[str, object]] = []
+        namespace = function.__globals__
+        for name in sorted(set(function.__code__.co_names)):
+            if name in _FINGERPRINT_BOOTSTRAP_GLOBALS or name not in namespace:
+                continue
+            self._charge(len(name))
+            references.append(
+                (
+                    name,
+                    self._project_global_reference_token(
+                        dict.__getitem__(namespace, name),
+                    ),
+                )
+            )
+        return tuple(references)
+
+    def _project_global_reference_token(self, value: object) -> object:
+        """Recurse through project functions without reopening project type graphs."""
+        if isinstance(value, FunctionType):
+            if isinstance(value.__module__, str) and value.__module__.startswith("messy_xlsx"):
+                return self._project_function_token(value)
+            return ("external-function", id(value), id(value.__code__))
+        if isinstance(value, type):
+            try:
+                module = type.__getattribute__(value, "__module__")
+            except BaseException:
+                module = "<unknown>"
+            return ("global-type", module, id(value))
+        if isinstance(value, ModuleType):
+            return ("module", value.__name__, id(value))
+        if isinstance(
+            value,
+            (
+                BuiltinFunctionType,
+                MethodDescriptorType,
+                WrapperDescriptorType,
+            ),
+        ):
+            return ("callable", type(value), id(value))
+        if (
+            value is None
+            or isinstance(value, (bool, int, float, complex, str, bytes, Enum))
+            or type(value) in {dict, list, tuple, set, frozenset, bytearray, memoryview}
+        ):
+            return self.token(value)
+        return ("global", type(value), id(value))
 
 
 def _component_token(
