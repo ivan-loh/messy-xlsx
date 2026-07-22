@@ -181,15 +181,15 @@ class _CompositionFingerprinter(_FingerprintBudget):
             )
 
         if hasattr(value, "__dict__"):
-            namespace = vars(value)
-            self._charge(len(namespace))
-            state = dict(namespace)
+            instance_namespace = vars(value)
+            self._charge(len(instance_namespace))
+            state = dict(instance_namespace)
         else:
             state = {}
         for owner in type(value).__mro__:
-            namespace = vars(owner)
-            self._charge(len(namespace))
-            for name, descriptor in namespace.items():
+            class_namespace = vars(owner)
+            self._charge(len(class_namespace))
+            for name, descriptor in class_namespace.items():
                 if isinstance(descriptor, MemberDescriptorType):
                     try:
                         state.setdefault(name, descriptor.__get__(value, type(value)))
