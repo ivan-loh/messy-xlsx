@@ -19,6 +19,7 @@ from messy_xlsx._source import SourceHandle
 from messy_xlsx.enums import FormatType, HeaderDetectionMode, HeaderFallback, MergeStrategy
 from messy_xlsx.exceptions import StructureError
 from messy_xlsx.parsing import ParseOptions
+from messy_xlsx.parsing.contracts import OutputMode
 from messy_xlsx.parsing.parse_plan import (
     ParsePlan,
     compile_parse_plan,
@@ -896,6 +897,92 @@ def test_parse_plan_snapshots_consumed_config_collections() -> None:
     assert plan.skip_footer == 9
     assert plan.merge_strategy == MergeStrategy.FIRST_ONLY
     assert plan.ignore_hidden is True
+
+
+@pytest.mark.parametrize("batch_size", [None, 0, -1, 1.5, True])
+def test_streaming_batch_size_is_validated_during_plan_compilation(
+    batch_size: object,
+) -> None:
+    config = SheetConfig(auto_detect=False)
+
+    with pytest.raises(ValueError, match="batch_size must be >= 1"):
+        compile_parse_plan(
+            config,
+            None,
+            "xlsx",
+            output_mode=OutputMode.STREAMING,
+            batch_size=batch_size,  # type: ignore[arg-type]
+        )
+
+
+def test_materialized_plan_preserves_the_legacy_three_argument_call() -> None:
+    legacy = compile_parse_plan(SheetConfig(auto_detect=False), None, "xlsx")
+    explicit = compile_parse_plan(
+        SheetConfig(auto_detect=False),
+        None,
+        "xlsx",
+        output_mode=OutputMode.MATERIALIZED,
+        batch_size=None,
+    )
+
+    assert legacy == explicit
+    assert legacy.output_mode is OutputMode.MATERIALIZED
+    assert legacy.batch_size is None
+
+
+def test_plan_recursively_snapshots_nested_mutable_configuration_values() -> None:
+    nested_hint = {
+        "members": ["amount", {"precision": [2, 4]}],
+        "labels": {"gross", "net"},
+    }
+    nested_condition = {
+        "groups": [{"names": ["open", "closed"]}],
+        "thresholds": ({"minimum": [1, 2]},),
+    }
+    config = SheetConfig(
+        auto_detect=False,
+        type_hints={"amount": nested_hint},  # type: ignore[dict-item]
+        drop_conditions=[{"column": "metadata", "value": nested_condition}],
+    )
+
+    plan = compile_parse_plan(config, None, "xlsx")
+    type_hints_before = deepcopy(plan.type_hints)
+    conditions_before = deepcopy(plan.drop_conditions)
+
+    nested_hint["members"][1]["precision"].append(8)
+    nested_hint["labels"].add("tax")
+    nested_condition["groups"][0]["names"].append("pending")
+    nested_condition["thresholds"][0]["minimum"].append(3)
+
+    assert plan.type_hints == type_hints_before
+    assert plan.drop_conditions == conditions_before
+
+
+def test_recursive_snapshots_are_deterministic_across_mapping_and_set_order() -> None:
+    first = SheetConfig(
+        auto_detect=False,
+        type_hints={
+            "payload": {
+                "mapping": {"second": [2], "first": [1]},
+                "labels": {"beta", "alpha"},
+            }
+        },  # type: ignore[dict-item]
+    )
+    second = SheetConfig(
+        auto_detect=False,
+        type_hints={
+            "payload": {
+                "labels": {"alpha", "beta"},
+                "mapping": {"first": [1], "second": [2]},
+            }
+        },  # type: ignore[dict-item]
+    )
+
+    assert compile_parse_plan(first, None, "xlsx") == compile_parse_plan(
+        second,
+        None,
+        "xlsx",
+    )
 
 
 def test_parse_plan_preserves_identity_sensitive_drop_condition_values() -> None:

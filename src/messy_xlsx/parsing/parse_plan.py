@@ -7,7 +7,9 @@ projections consumed by the existing parsing and normalization layers.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping, Set
+from dataclasses import dataclass, fields, is_dataclass
+from enum import Enum
 from typing import Any, Final
 
 from messy_xlsx.enums import (
@@ -19,6 +21,7 @@ from messy_xlsx.enums import (
 from messy_xlsx.exceptions import StructureError
 from messy_xlsx.models import SheetConfig, StructureInfo
 from messy_xlsx.parsing.base_handler import ParseOptions
+from messy_xlsx.parsing.contracts import OutputMode
 
 _STRUCTURE_FORMATS: Final = frozenset({"xlsx", "xlsm", "xltx", "xltm"})
 _TEXT_FORMATS: Final = frozenset({"csv", "tsv", "txt"})
@@ -59,6 +62,38 @@ _COMMA_DECIMAL_SPACE_THOUSANDS: Final = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
+class FrozenDataclassValue:
+    """Deterministic immutable projection of a supported dataclass value."""
+
+    type_name: str
+    field_values: tuple[tuple[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigSnapshot:
+    """Deep immutable snapshot of collection-valued sheet configuration."""
+
+    type_hints: tuple[tuple[Any, Any], ...]
+    column_renames: tuple[tuple[Any, Any], ...]
+    drop_conditions: tuple[tuple[Any, Any], ...]
+
+    @classmethod
+    def from_config(cls, config: SheetConfig) -> ConfigSnapshot:
+        """Copy every consumed configuration collection recursively."""
+        return cls(
+            type_hints=_freeze_mapping(config.type_hints),
+            column_renames=_freeze_mapping(config.column_renames),
+            drop_conditions=tuple(
+                (
+                    _freeze(condition.get("column")),
+                    _freeze(condition.get("value")),
+                )
+                for condition in config.drop_conditions
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ParsePlan:
     """Frozen internal decisions for one sheet parse.
 
@@ -82,14 +117,19 @@ class ParsePlan:
     thousands_separator: str | None
     use_extended_missing_list: bool
     preserve_types: bool
-    type_hints: tuple[tuple[str, str], ...]
+    type_hints: tuple[tuple[Any, Any], ...]
     skip_normalization_steps: tuple[str, ...]
 
     # Projection for post-processing.
     sanitize_column_names: bool
-    column_renames: tuple[tuple[str, str], ...]
+    column_renames: tuple[tuple[Any, Any], ...]
     drop_regex: str | None
     drop_conditions: tuple[tuple[Any, Any], ...]
+
+    # Projection for backend orchestration. Defaults preserve the established
+    # three-argument compiler and direct ParsePlan construction behavior.
+    output_mode: OutputMode = OutputMode.MATERIALIZED
+    batch_size: int | None = None
 
     def to_parse_options(self) -> ParseOptions:
         """Return a fresh mutable projection for the existing handler API."""
@@ -117,8 +157,14 @@ def compile_parse_plan(
     config: SheetConfig,
     structure: StructureInfo | None,
     format_type: FormatType | str,
+    output_mode: OutputMode = OutputMode.MATERIALIZED,
+    batch_size: int | None = None,
 ) -> ParsePlan:
     """Compile configuration and optional structure evidence without mutation or I/O."""
+    output_mode = OutputMode(output_mode)
+    batch_size = _validated_batch_size(output_mode, batch_size)
+    snapshot = ConfigSnapshot.from_config(config)
+
     use_structure = requires_structure_analysis(config, format_type)
     if use_structure and structure is None:
         raise ValueError("StructureInfo is required for auto-detected OOXML parsing")
@@ -168,19 +214,63 @@ def compile_parse_plan(
         thousands_separator=thousands_separator,
         use_extended_missing_list=config.use_extended_missing_list,
         preserve_types=config.preserve_types,
-        type_hints=tuple(config.type_hints.items()),
+        type_hints=snapshot.type_hints,
         skip_normalization_steps=tuple(skipped_steps),
         sanitize_column_names=config.sanitize_column_names,
-        column_renames=tuple(config.column_renames.items()),
+        column_renames=snapshot.column_renames,
         drop_regex=config.drop_regex,
-        drop_conditions=tuple(
-            (
-                condition.get("column"),
-                condition.get("value"),
-            )
-            for condition in config.drop_conditions
-        ),
+        drop_conditions=snapshot.drop_conditions,
+        output_mode=output_mode,
+        batch_size=batch_size,
     )
+
+
+def _validated_batch_size(
+    mode: OutputMode,
+    batch_size: int | None,
+) -> int | None:
+    """Reject an unusable streaming window before any backend work can start."""
+    if mode is OutputMode.STREAMING and (type(batch_size) is not int or batch_size < 1):
+        raise ValueError("batch_size must be >= 1 for streaming output")
+    return batch_size
+
+
+def _freeze_mapping(value: Mapping[Any, Any]) -> tuple[tuple[Any, Any], ...]:
+    """Return a deterministic immutable mapping projection."""
+    frozen_items = [(_freeze(key), _freeze(item)) for key, item in value.items()]
+    return tuple(sorted(frozen_items, key=lambda pair: _ordering_key(pair[0])))
+
+
+def _freeze(value: Any) -> Any:
+    """Recursively snapshot supported mutable values without retaining aliases."""
+    if isinstance(value, Mapping):
+        return _freeze_mapping(value)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, Set) and not isinstance(value, (str, bytes, bytearray)):
+        frozen_items = (_freeze(item) for item in value)
+        return tuple(sorted(frozen_items, key=_ordering_key))
+    if is_dataclass(value) and not isinstance(value, type):
+        value_type = type(value)
+        return FrozenDataclassValue(
+            type_name=f"{value_type.__module__}.{value_type.__qualname__}",
+            field_values=tuple(
+                (field.name, _freeze(getattr(value, field.name))) for field in fields(value)
+            ),
+        )
+    if isinstance(value, (bytearray, memoryview)):
+        return bytes(value)
+    return value
+
+
+def _ordering_key(value: Any) -> tuple[str, str]:
+    """Order supported frozen values without requiring cross-type comparison."""
+    value_type = type(value)
+    if isinstance(value, Enum):
+        representation = f"{value_type.__module__}.{value_type.__qualname__}:{value.value!r}"
+    else:
+        representation = repr(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}", representation
 
 
 def _resolve_header_rows(
