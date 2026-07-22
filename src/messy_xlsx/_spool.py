@@ -290,7 +290,14 @@ class ReplaySpool:
         memory_limit: int = DEFAULT_MEMORY_LIMIT,
     ) -> ReplaySpool:
         """Copy *stream* once, restoring seekable caller cursor state."""
-        seekable, entry = _capture_position(stream)
+        try:
+            seekable, entry = _capture_position(stream)
+        except BaseException as error:
+            _mark_fallback_blocked(
+                error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
+            raise
         buffer = bytearray()
         path: Path | None = None
         opened: BinaryIO | None = None
@@ -318,6 +325,10 @@ class ReplaySpool:
             completed = cls(bytes(buffer) if path is None else None, path)
         except BaseException as error:
             primary_error = error
+            _mark_fallback_blocked(
+                error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
             _cleanup_spill(opened, path, error)
             raise
         finally:

@@ -129,6 +129,37 @@ def test_spool_restores_cursor_when_read_fails() -> None:
     assert source.tell() == 2
 
 
+@pytest.mark.parametrize(
+    "source_error",
+    [
+        OSError("initial rewind failed"),
+        ExceptionGroup("outer", [OSError("nested initial rewind failed")]),
+    ],
+)
+def test_initial_source_seek_failure_is_marked_without_replacement(
+    source_error: BaseException,
+) -> None:
+    class InitialRewindFailure(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__(b"source")
+            self.seek_calls = 0
+
+        def seek(self, position: int, whence: int = 0) -> int:
+            self.seek_calls += 1
+            if self.seek_calls == 2 and position == 0 and whence == 0:
+                raise source_error
+            return super().seek(position, whence)
+
+    source = InitialRewindFailure()
+    io.BytesIO.seek(source, 3)
+
+    with pytest.raises(type(source_error)) as captured:
+        ReplaySpool.from_stream(source)
+
+    assert captured.value is source_error
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
+
+
 def test_spill_file_is_removed_when_a_later_source_read_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
