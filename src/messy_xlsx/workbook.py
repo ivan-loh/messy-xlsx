@@ -6,15 +6,22 @@
 
 import logging
 import re
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import TracebackType
 from typing import Any, BinaryIO
 
 import openpyxl
 import pandas as pd
 
-from messy_xlsx._fallback_signals import _blocks_backend_retry
+from messy_xlsx._fallback_signals import (
+    _blocks_backend_retry,
+    _exception_traceback,
+    _FallbackBlockReason,
+    _mark_fallback_blocked,
+)
 from messy_xlsx._source import BackendSource, SourceHandle, describe_source
 from messy_xlsx.cache import get_structure_cache
 from messy_xlsx.detection.structure_analyzer import StructureAnalyzer
@@ -33,6 +40,7 @@ from messy_xlsx.parsing.parse_plan import (
     compile_parse_plan,
     requires_structure_analysis,
 )
+from messy_xlsx.parsing.streams import _close_if_present, _run_cleanups
 from messy_xlsx.parsing.xlsx_handler import (
     XLSXHandler,
     _is_fastexcel_materialized_plan,
@@ -46,6 +54,93 @@ from messy_xlsx.warnings import warn_legacy
 
 logger = logging.getLogger(__name__)
 _NO_BUILTIN_MATERIALIZATION = object()
+
+
+class _ActiveOperationError(RuntimeError):
+    """Identify a rejected concurrent or re-entrant workbook operation."""
+
+
+def _operation_error(message: str) -> _ActiveOperationError:
+    error = _ActiveOperationError(message)
+    _mark_fallback_blocked(
+        error,
+        _FallbackBlockReason.CONFIGURATION,
+    )
+    return error
+
+
+class _StreamOperationLease:
+    """Weak workbook lease used while constructing and owning one child stream."""
+
+    def __init__(self, workbook: "MessyWorkbook", token: object) -> None:
+        self._workbook_ref = weakref.ref(workbook)
+        self._token = token
+        self._partial: object | None = None
+        self._stream_ref: weakref.ReferenceType[Any] | None = None
+        self._bound = False
+        self._released = False
+
+    def own(self, partial: object) -> object:
+        """Register a partially opened reader for construction-failure cleanup."""
+        if self._released or self._bound or self._partial is not None:
+            raise RuntimeError("Stream operation lease already owns a resource")
+        self._partial = partial
+        return partial
+
+    def bind(self, stream: Any) -> Any:
+        """Transfer cleanup to a stream and register it with the token owner."""
+        if self._released or self._bound:
+            raise RuntimeError("Stream operation lease is no longer available")
+        stream_ref = weakref.ref(stream)
+        self._stream_ref = stream_ref
+        workbook = self._workbook_ref()
+        if workbook is None:
+            raise _operation_error("MessyWorkbook is closed")
+        workbook._register_stream(self._token, stream)
+        self._partial = None
+        self._bound = True
+        return stream
+
+    def release(self) -> None:
+        """Release the matching reservation at most once."""
+        if self._released:
+            return
+        self._released = True
+        self._partial = None
+        self._stream_ref = None
+        workbook = self._workbook_ref()
+        if workbook is not None:
+            workbook._end_operation(self._token)
+
+    def __enter__(self) -> "_StreamOperationLease":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type
+        if self._bound and exc_value is None:
+            return
+
+        stream = self._stream_ref() if self._stream_ref is not None else None
+        partial = self._partial
+        self._partial = None
+        cleanups: list[tuple[str, Any]] = []
+        if stream is not None:
+            cleanups.append(
+                ("partially registered stream cleanup", lambda: _close_if_present(stream))
+            )
+        elif partial is not None:
+            cleanups.append(("partial stream reader cleanup", lambda: _close_if_present(partial)))
+        cleanups.append(("stream reservation release", self.release))
+        _run_cleanups(
+            cleanups,
+            primary_error=exc_value,
+            primary_traceback=traceback,
+        )
 
 
 class MessyWorkbook:
@@ -68,6 +163,18 @@ class MessyWorkbook:
             filename: Optional filename hint when using file-like objects (for format detection)
             registry: Optional format-handler registry for custom parsing behavior
         """
+        self._closed = False
+        self._active_operation_token: object | None = None
+        self._active_stream: Any | None = None
+        self._sheets: dict[str, MessySheet] = {}
+        self._formula_loaded = False
+        self._wb: openpyxl.Workbook | None = None
+        self._cached_wb: openpyxl.Workbook | None = None
+        self._wb_source: BinaryIO | None = None
+        self._cached_wb_source: BinaryIO | None = None
+        self._fastexcel_session: FastexcelSession | None = None
+        self._manifest_reader: ManifestReader | None = None
+
         self._sheet_config = sheet_config or SheetConfig()
         self._formula_config = formula_config or FormulaConfig()
 
@@ -83,19 +190,49 @@ class MessyWorkbook:
                 f"Cannot read from file object: {e}",
                 file_path=file_desc,
             ) from e
-        self._sheets: dict[str, MessySheet] = {}
-        self._formula_loaded = False
-        self._wb: openpyxl.Workbook | None = None
-        self._cached_wb: openpyxl.Workbook | None = None
-        self._wb_source: BinaryIO | None = None
-        self._cached_wb_source: BinaryIO | None = None
-        self._fastexcel_session: FastexcelSession | None = None
-        self._manifest_reader: ManifestReader | None = None
-
         try:
             self._initialize_source()
+        except BaseException as error:
+            self._close(
+                primary_error=error,
+                primary_traceback=_exception_traceback(error),
+            )
+            raise
+
+    def _begin_operation(self) -> object:
+        """Reserve the workbook for one parse or child stream."""
+        if getattr(self, "_closed", False):
+            raise _operation_error("MessyWorkbook is closed")
+        if getattr(self, "_active_operation_token", None) is not None:
+            raise _operation_error("MessyWorkbook already has an active parse or stream")
+        token = object()
+        self._active_operation_token = token
+        return token
+
+    def _end_operation(self, token: object) -> None:
+        """Release only the exact current token; stale callbacks are harmless."""
+        if getattr(self, "_active_operation_token", None) is not token:
+            return
+        self._active_operation_token = None
+        self._active_stream = None
+
+    def _register_stream(self, token: object, stream: Any) -> None:
+        """Register a child only while its exact operation token is current."""
+        if getattr(self, "_closed", False):
+            raise _operation_error("MessyWorkbook is closed")
+        if getattr(self, "_active_operation_token", None) is not token:
+            raise _operation_error("MessyWorkbook stream reservation is no longer active")
+        if getattr(self, "_active_stream", None) is not None:
+            raise _operation_error("MessyWorkbook already has an active parse or stream")
+        self._active_stream = stream
+
+    def _stream_operation(self) -> _StreamOperationLease:
+        """Reserve a future child stream with construction-failure cleanup."""
+        token = self._begin_operation()
+        try:
+            return _StreamOperationLease(self, token)
         except BaseException:
-            self.close()
+            self._end_operation(token)
             raise
 
     @contextmanager
@@ -258,28 +395,36 @@ class MessyWorkbook:
         config: SheetConfig | None = None,
         include_errors: bool = False,
     ) -> dict[str, pd.DataFrame] | tuple[dict[str, pd.DataFrame], list[SheetError]]:
-        result = {}
-        errors: list[SheetError] = []
-        for name in self._sheet_names:
-            try:
-                result[name] = self._parse_sheet(name, config)
-            except Exception as e:
-                logger.warning("Failed to parse sheet %r, skipping", name, exc_info=True)
-                if include_errors:
-                    context = {}
-                    if hasattr(e, "context"):
-                        context = e.context
-                    errors.append(
-                        SheetError(
-                            sheet_name=name,
-                            error_type=type(e).__name__,
-                            message=str(e),
-                            context=context,
+        token = self._begin_operation()
+        try:
+            result = {}
+            errors: list[SheetError] = []
+            for name in self._sheet_names:
+                try:
+                    result[name] = self._parse_sheet_unreserved(name, config)
+                except _ActiveOperationError:
+                    raise
+                except Exception as e:
+                    if _blocks_backend_retry(e):
+                        raise
+                    logger.warning("Failed to parse sheet %r, skipping", name, exc_info=True)
+                    if include_errors:
+                        context = {}
+                        if hasattr(e, "context"):
+                            context = e.context
+                        errors.append(
+                            SheetError(
+                                sheet_name=name,
+                                error_type=type(e).__name__,
+                                message=str(e),
+                                context=context,
+                            )
                         )
-                    )
-        if include_errors:
-            return result, errors
-        return result
+            if include_errors:
+                return result, errors
+            return result
+        finally:
+            self._end_operation(token)
 
     def get_structure(self, sheet: str | None = None) -> StructureInfo:
         """Get detected structure for a sheet."""
@@ -353,6 +498,18 @@ class MessyWorkbook:
         config: SheetConfig | None = None,
     ) -> pd.DataFrame:
         """Parse a sheet to DataFrame with normalization."""
+        token = self._begin_operation()
+        try:
+            return self._parse_sheet_unreserved(sheet, config)
+        finally:
+            self._end_operation(token)
+
+    def _parse_sheet_unreserved(
+        self,
+        sheet: str,
+        config: SheetConfig | None = None,
+    ) -> pd.DataFrame:
+        """Parse one sheet while the caller owns the workbook reservation."""
         config = config or self._sheet_config
         format_type = self.format_type
 
@@ -661,12 +818,28 @@ class MessyWorkbook:
 
     def close(self) -> None:
         """Close the workbook and release resources."""
+        self._close()
+
+    def _close(
+        self,
+        *,
+        primary_error: BaseException | None = None,
+        primary_traceback: TracebackType | None = None,
+    ) -> None:
+        """Close once, preserving operations unless process cleanup must win."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+
+        active_stream = getattr(self, "_active_stream", None)
         fastexcel_session = getattr(self, "_fastexcel_session", None)
-        workbook = self._wb
-        cached_workbook = self._cached_wb
+        workbook = getattr(self, "_wb", None)
+        cached_workbook = getattr(self, "_cached_wb", None)
         workbook_source = getattr(self, "_wb_source", None)
         cached_workbook_source = getattr(self, "_cached_wb_source", None)
         source_handle = getattr(self, "_source_handle", None)
+        self._active_stream = None
+        self._active_operation_token = None
         self._fastexcel_session = None
         self._manifest_reader = None
         self._wb = None
@@ -674,67 +847,44 @@ class MessyWorkbook:
         self._wb_source = None
         self._cached_wb_source = None
 
-        close_error: BaseException | None = None
+        cleanups: list[tuple[str, Any]] = []
+        if active_stream is not None:
+            invalidate = getattr(active_stream, "invalidate_from_owner", None)
+            if callable(invalidate):
+                cleanups.append(("active stream invalidation", invalidate))
         if fastexcel_session is not None:
-            try:
-                fastexcel_session.close()
-            except BaseException as error:
-                close_error = error
-
+            cleanups.append(
+                ("fastexcel session cleanup", lambda: _close_if_present(fastexcel_session))
+            )
         if workbook is not None:
-            try:
-                workbook.close()
-            except BaseException as error:
-                if close_error is None:
-                    close_error = error
-                else:
-                    logger.debug(
-                        "Workbook also failed to close",
-                        exc_info=True,
-                    )
-
+            cleanups.append(("workbook cleanup", lambda: _close_if_present(workbook)))
         if cached_workbook is not None:
-            try:
-                cached_workbook.close()
-            except BaseException as error:
-                if close_error is None:
-                    close_error = error
-                else:
-                    logger.debug(
-                        "Cached workbook also failed to close",
-                        exc_info=True,
-                    )
-
-        for label, owned_source in (
-            ("Workbook source", workbook_source),
-            ("Cached workbook source", cached_workbook_source),
-        ):
-            if owned_source is None:
-                continue
-            try:
-                owned_source.close()
-            except BaseException as error:
-                if close_error is None:
-                    close_error = error
-                else:
-                    logger.debug("%s also failed to close", label, exc_info=True)
-
+            cleanups.append(("cached workbook cleanup", lambda: _close_if_present(cached_workbook)))
+        if workbook_source is not None:
+            cleanups.append(("workbook source cleanup", lambda: _close_if_present(workbook_source)))
+        if cached_workbook_source is not None:
+            cleanups.append(
+                (
+                    "cached workbook source cleanup",
+                    lambda: _close_if_present(cached_workbook_source),
+                )
+            )
         if source_handle is not None:
-            try:
-                source_handle.close()
-            except BaseException as error:
-                if close_error is None:
-                    close_error = error
-                else:
-                    logger.debug("Source handle also failed to close", exc_info=True)
-
-        if close_error is not None:
-            raise close_error
+            cleanups.append(("source handle cleanup", lambda: _close_if_present(source_handle)))
+        _run_cleanups(
+            cleanups,
+            primary_error=primary_error,
+            primary_traceback=primary_traceback,
+        )
 
     def __enter__(self) -> "MessyWorkbook":
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        del exc_type
+        if isinstance(exc_val, BaseException):
+            self._close(primary_error=exc_val, primary_traceback=exc_tb)
+            return
         self.close()
 
     def __repr__(self) -> str:

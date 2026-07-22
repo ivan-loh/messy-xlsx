@@ -46,6 +46,16 @@ class _CloseTracker:
             raise _ExpectedFailure(f"{self.name} close")
 
 
+class _BaseCloseTracker:
+    def __init__(self, error: BaseException):
+        self.error = error
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        raise self.error
+
+
 class _TrackedStringIO(io.StringIO):
     instances: ClassVar[list[_TrackedStringIO]] = []
 
@@ -335,6 +345,84 @@ def test_workbook_close_is_idempotent_for_both_resources() -> None:
     assert cached.close_calls == 1
     assert workbook._wb is None
     assert workbook._cached_wb is None
+
+
+def test_workbook_lifecycle_exists_before_initialization_and_preserves_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    sample_xlsx: Path,
+) -> None:
+    primary = ValueError("initialization failure")
+    cleanup = _CloseTracker("initialization", fail_on_close=True)
+    observed: dict[str, object] = {}
+
+    def fail_initialization(workbook: api.MessyWorkbook) -> None:
+        observed["closed"] = workbook._closed
+        observed["token"] = workbook._active_operation_token
+        observed["stream"] = workbook._active_stream
+        workbook._wb = cleanup  # type: ignore[assignment]
+        raise primary
+
+    monkeypatch.setattr(api.MessyWorkbook, "_initialize_source", fail_initialization)
+
+    with pytest.raises(ValueError) as captured:
+        api.MessyWorkbook(sample_xlsx)
+
+    assert captured.value is primary
+    assert observed == {"closed": False, "token": None, "stream": None}
+    assert cleanup.close_calls == 1
+    assert primary.__dict__["backend_context"]["cleanup_failure"] == {"type": "_ExpectedFailure"}
+
+
+def test_workbook_context_preserves_body_error_under_ordinary_cleanup() -> None:
+    workbook = object.__new__(api.MessyWorkbook)
+    cleanup = _CloseTracker("workbook", fail_on_close=True)
+    body_error = ValueError("body failure")
+    workbook._wb = cleanup  # type: ignore[assignment]
+    workbook._cached_wb = None
+
+    with pytest.raises(ValueError) as captured, workbook:
+        raise body_error
+
+    assert captured.value is body_error
+    assert cleanup.close_calls == 1
+    assert body_error.__dict__["backend_context"]["cleanup_failure"] == {"type": "_ExpectedFailure"}
+    assert "workbook close" not in " ".join(getattr(body_error, "__notes__", ()))
+
+
+def test_workbook_context_process_cleanup_wins_over_ordinary_body() -> None:
+    workbook = object.__new__(api.MessyWorkbook)
+    body_error = ValueError("body failure")
+    cleanup_error = MemoryError("process cleanup")
+    cleanup = _BaseCloseTracker(cleanup_error)
+    workbook._fastexcel_session = cleanup  # type: ignore[assignment]
+    workbook._wb = None
+    workbook._cached_wb = None
+
+    with pytest.raises(MemoryError) as captured, workbook:
+        raise body_error
+
+    assert captured.value is cleanup_error
+    assert cleanup.close_calls == 1
+    assert cleanup_error.__dict__["backend_context"]["operation_failure"] == {"type": "ValueError"}
+
+
+def test_workbook_context_keeps_first_process_failure_and_attempts_cleanup() -> None:
+    workbook = object.__new__(api.MessyWorkbook)
+    body_error = KeyboardInterrupt("process body")
+    cleanup_error = MemoryError("later process cleanup")
+    session = _BaseCloseTracker(cleanup_error)
+    workbook_resource = _CloseTracker("workbook")
+    workbook._fastexcel_session = session  # type: ignore[assignment]
+    workbook._wb = workbook_resource  # type: ignore[assignment]
+    workbook._cached_wb = None
+
+    with pytest.raises(KeyboardInterrupt) as captured, workbook:
+        raise body_error
+
+    assert captured.value is body_error
+    assert session.close_calls == 1
+    assert workbook_resource.close_calls == 1
+    assert body_error.__dict__["backend_context"]["cleanup_failure"] == {"type": "MemoryError"}
 
 
 def test_structure_analyzer_closes_workbook_when_detection_helper_raises(
