@@ -3,6 +3,10 @@
 import pandas as pd
 import pytest
 
+from messy_xlsx._fallback_signals import (
+    _FallbackBlockReason,
+    _mark_fallback_blocked,
+)
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.parsing import CSVHandler, HandlerRegistry, XLSXHandler
 from messy_xlsx.parsing.base_handler import FormatHandler, ParseOptions
@@ -132,3 +136,77 @@ class TestHandlerRegistry:
         result = registry.parse(sample_xlsx, "Data", ParseOptions(), format_type="xlsx")
 
         assert result.to_dict(orient="list") == {"recovered": [True]}
+
+    def test_structured_parse_failure_blocks_legacy_registry_fallback(
+        self,
+        sample_xlsx,
+    ):
+        primary_error = _mark_fallback_blocked(
+            ValueError("paramètre non valide"),
+            _FallbackBlockReason.CONFIGURATION,
+        )
+        fallback_calls = 0
+
+        class PrimaryHandler(FormatHandler):
+            def can_handle(self, format_type):
+                return format_type == "xlsx"
+
+            def parse(self, file_source, sheet, options):
+                raise primary_error
+
+            def get_sheet_names(self, file_source):
+                raise primary_error
+
+            def validate(self, file_source):
+                return True, None
+
+        class FallbackHandler(PrimaryHandler):
+            def parse(self, file_source, sheet, options):
+                nonlocal fallback_calls
+                fallback_calls += 1
+                return pd.DataFrame({"wrong": [True]})
+
+        registry = HandlerRegistry(handlers=[PrimaryHandler(), FallbackHandler()])
+
+        with pytest.raises(ValueError) as captured:
+            registry.parse(sample_xlsx, format_type="xlsx")
+
+        assert captured.value is primary_error
+        assert fallback_calls == 0
+
+    def test_structured_sheet_name_failure_blocks_legacy_registry_fallback(
+        self,
+        sample_xlsx,
+    ):
+        primary_error = _mark_fallback_blocked(
+            RuntimeError("source occupée"),
+            _FallbackBlockReason.SOURCE_OWNERSHIP,
+        )
+        fallback_calls = 0
+
+        class PrimaryHandler(FormatHandler):
+            def can_handle(self, format_type):
+                return format_type == "xlsx"
+
+            def parse(self, file_source, sheet, options):
+                return pd.DataFrame()
+
+            def get_sheet_names(self, file_source):
+                raise primary_error
+
+            def validate(self, file_source):
+                return True, None
+
+        class FallbackHandler(PrimaryHandler):
+            def get_sheet_names(self, file_source):
+                nonlocal fallback_calls
+                fallback_calls += 1
+                return ["Wrong"]
+
+        registry = HandlerRegistry(handlers=[PrimaryHandler(), FallbackHandler()])
+
+        with pytest.raises(RuntimeError) as captured:
+            registry.get_sheet_names(sample_xlsx, format_type="xlsx")
+
+        assert captured.value is primary_error
+        assert fallback_calls == 0

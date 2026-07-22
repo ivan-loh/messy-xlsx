@@ -15,6 +15,10 @@ from itertools import pairwise
 from types import MethodDescriptorType, WrapperDescriptorType
 from typing import Any, Final
 
+from messy_xlsx._fallback_signals import (
+    _FallbackBlockReason,
+    _mark_fallback_blocked,
+)
 from messy_xlsx.enums import (
     FormatType,
     HeaderDetectionMode,
@@ -245,13 +249,19 @@ def compile_parse_plan(
     batch_size: int | None = None,
 ) -> ParsePlan:
     """Compile configuration and optional structure evidence without mutation or I/O."""
-    output_mode = OutputMode(output_mode)
-    batch_size = _validated_batch_size(output_mode, batch_size)
-    snapshot = ConfigSnapshot.from_config(config)
+    output_mode, batch_size, snapshot = _validated_plan_inputs(
+        config,
+        output_mode,
+        batch_size,
+    )
 
     use_structure = requires_structure_analysis(config, format_type)
     if use_structure and structure is None:
-        raise ValueError("StructureInfo is required for auto-detected OOXML parsing")
+        error = ValueError("StructureInfo is required for auto-detected OOXML parsing")
+        raise _mark_fallback_blocked(
+            error,
+            _FallbackBlockReason.CONFIGURATION,
+        )
 
     active_structure = structure if use_structure else None
 
@@ -263,7 +273,7 @@ def compile_parse_plan(
     locale = config.locale
 
     if active_structure is not None:
-        skip_rows, header_rows = _resolve_header_rows(config, active_structure)
+        skip_rows, header_rows = _configured_header_rows(config, active_structure)
         skip_footer = _resolve_skip_footer(config, active_structure)
         locale = config.locale or active_structure.detected_locale
 
@@ -307,6 +317,34 @@ def compile_parse_plan(
         output_mode=output_mode,
         batch_size=batch_size,
     )
+
+
+def _validated_plan_inputs(
+    config: SheetConfig,
+    output_mode: OutputMode,
+    batch_size: int | None,
+) -> tuple[OutputMode, int | None, ConfigSnapshot]:
+    """Validate and snapshot caller configuration with a typed failure signal."""
+    try:
+        mode = OutputMode(output_mode)
+        size = _validated_batch_size(mode, batch_size)
+        snapshot = ConfigSnapshot.from_config(config)
+    except (TypeError, ValueError) as error:
+        _mark_fallback_blocked(error, _FallbackBlockReason.CONFIGURATION)
+        raise
+    return mode, size, snapshot
+
+
+def _configured_header_rows(
+    config: SheetConfig,
+    structure: StructureInfo,
+) -> tuple[int, int]:
+    """Resolve header configuration with a typed failure signal."""
+    try:
+        return _resolve_header_rows(config, structure)
+    except (StructureError, ValueError) as error:
+        _mark_fallback_blocked(error, _FallbackBlockReason.CONFIGURATION)
+        raise
 
 
 def _validated_batch_size(

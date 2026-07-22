@@ -18,6 +18,10 @@ from pandas.testing import assert_frame_equal
 
 import messy_xlsx.workbook as workbook_module
 from messy_xlsx import MessyWorkbook, SheetConfig, StructureInfo
+from messy_xlsx._fallback_signals import (
+    _fallback_block_reason,
+    _FallbackBlockReason,
+)
 from messy_xlsx._source import SourceHandle
 from messy_xlsx.enums import FormatType, HeaderDetectionMode, HeaderFallback, MergeStrategy
 from messy_xlsx.exceptions import StructureError
@@ -908,7 +912,7 @@ def test_streaming_batch_size_is_validated_during_plan_compilation(
 ) -> None:
     config = SheetConfig(auto_detect=False)
 
-    with pytest.raises(ValueError, match="batch_size must be >= 1"):
+    with pytest.raises(ValueError, match="batch_size must be >= 1") as captured:
         compile_parse_plan(
             config,
             None,
@@ -916,6 +920,8 @@ def test_streaming_batch_size_is_validated_during_plan_compilation(
             output_mode=OutputMode.STREAMING,
             batch_size=batch_size,  # type: ignore[arg-type]
         )
+
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
 
 
 def test_materialized_plan_preserves_the_legacy_three_argument_call() -> None:

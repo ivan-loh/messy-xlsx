@@ -7,19 +7,9 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, NoReturn
 
+from messy_xlsx._fallback_signals import _is_fallback_blocked
 from messy_xlsx.parsing.contracts import ParseMetrics
 
-_CONFIGURATION_MARKERS = (
-    "batch_size",
-    "invalid config",
-    "invalid configuration",
-)
-_OWNERSHIP_MARKERS = (
-    "active borrow",
-    "caller-owned",
-    "cursor restoration",
-    "source ownership",
-)
 _MISSING_SPECIAL = object()
 
 
@@ -202,15 +192,7 @@ class FallbackCoordinator:
             return False
         if isinstance(error, (PermissionError, FileNotFoundError, MemoryError)):
             return False
-
-        message = str(error).lower()
-        if isinstance(error, ValueError) and any(
-            marker in message for marker in _CONFIGURATION_MARKERS
-        ):
-            return False
-        if isinstance(error, RuntimeError) and any(
-            marker in message for marker in _OWNERSHIP_MARKERS
-        ):
+        if _is_fallback_blocked(error):
             return False
         try:
             return self._is_compatibility_error(error)

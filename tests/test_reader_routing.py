@@ -9,6 +9,10 @@ import pyarrow as pa
 import pytest
 
 import messy_xlsx.parsing.handler_registry as handler_registry_module
+from messy_xlsx._fallback_signals import (
+    _FallbackBlockReason,
+    _mark_fallback_blocked,
+)
 from messy_xlsx.detection.format_detector import FormatDetector
 from messy_xlsx.parsing.contracts import BackendKind, OutputMode, ParseMetrics
 from messy_xlsx.parsing.csv_handler import CSVHandler, MetadataRowDetector
@@ -1098,8 +1102,6 @@ def test_streaming_classifier_failure_propagates_after_exact_once_cleanup() -> N
         PermissionError("denied"),
         FileNotFoundError("missing"),
         MemoryError("capacity"),
-        ValueError("invalid configuration"),
-        RuntimeError("SourceHandle already has an active borrow"),
     ],
 )
 def test_excluded_errors_are_never_sent_to_the_classifier(error: BaseException) -> None:
@@ -1111,6 +1113,94 @@ def test_excluded_errors_are_never_sent_to_the_classifier(error: BaseException) 
             lambda: _MaterializedReaderFake([], "primary", read_error=error),
             pytest.fail,
         )
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (ValueError("paramètre non valide"), _FallbackBlockReason.CONFIGURATION),
+        (RuntimeError("source occupée"), _FallbackBlockReason.SOURCE_OWNERSHIP),
+    ],
+)
+def test_structured_exclusions_preserve_exact_errors_and_skip_classification(
+    error: Exception,
+    reason: _FallbackBlockReason,
+) -> None:
+    original_args = error.args
+    original_message = str(error)
+    fallback_calls = 0
+
+    def classifier(_error: Exception) -> bool:
+        pytest.fail("structured failure reached classifier")
+
+    def fallback_factory() -> object:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return object()
+
+    assert _mark_fallback_blocked(error, reason) is error
+    with pytest.raises(type(error)) as captured:
+        FallbackCoordinator(classifier).materialize(
+            lambda: _MaterializedReaderFake([], "primary", read_error=error),
+            fallback_factory,
+        )
+
+    assert captured.value is error
+    assert type(captured.value) is type(error)
+    assert captured.value.args == original_args
+    assert str(captured.value) == original_message
+    assert fallback_calls == 0
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("invalid configuration"),
+        RuntimeError("SourceHandle already has an active borrow"),
+    ],
+)
+def test_unmarked_legacy_message_lookalikes_follow_the_classifier(
+    error: Exception,
+) -> None:
+    classified: list[Exception] = []
+
+    def classifier(candidate: Exception) -> bool:
+        classified.append(candidate)
+        return True
+
+    result = FallbackCoordinator(classifier).materialize(
+        lambda: _MaterializedReaderFake([], "primary", read_error=error),
+        lambda: _MaterializedReaderFake(
+            [],
+            "fallback",
+            result=pa.table({"value": [2]}),
+        ),
+    )
+
+    assert result.to_pydict() == {"value": [2]}
+    assert classified == [error]
+
+
+def test_unmarked_hostile_failure_reaches_classifier_without_stringification() -> None:
+    primary_error = _HostileDiagnosticError("unsupported")
+
+    class HostileFailureReader:
+        def read_table(self) -> pa.Table:
+            raise primary_error
+
+        def close(self) -> None:
+            pass
+
+    result = FallbackCoordinator(lambda error: error is primary_error).materialize(
+        HostileFailureReader,
+        lambda: _MaterializedReaderFake(
+            [],
+            "fallback",
+            result=pa.table({"value": [3]}),
+        ),
+    )
+
+    assert result.to_pydict() == {"value": [3]}
 
 
 def test_fallback_cleanup_context_merges_without_leaking_messages() -> None:

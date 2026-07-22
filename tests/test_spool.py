@@ -8,7 +8,27 @@ from typing import BinaryIO, NoReturn
 import pytest
 
 import messy_xlsx._spool as spool_module
+from messy_xlsx._fallback_signals import (
+    _fallback_block_reason,
+    _FallbackBlockReason,
+)
 from messy_xlsx._spool import ReplaySpool
+
+
+class _HostilePrimaryError(RuntimeError):
+    def __getattribute__(self, name: str) -> object:
+        if name == "add_note":
+            raise AssertionError("cleanup diagnostics must bypass add_note lookup")
+        return BaseException.__getattribute__(self, name)
+
+    def add_note(self, note: str) -> None:
+        del note
+        raise AssertionError("cleanup diagnostics must bypass add_note overrides")
+
+
+class _HostileCleanupError(RuntimeError):
+    def __repr__(self) -> str:
+        raise AssertionError("cleanup diagnostics must tolerate hostile repr")
 
 
 def _descriptor_is_closed(descriptor: int) -> bool:
@@ -238,6 +258,45 @@ def test_non_oserror_remains_primary_when_spill_cleanup_also_fails(
             "RuntimeError('injected descriptor cleanup failure')",
             "temporary file removal also failed: RuntimeError('injected path cleanup failure')",
         ]
+        assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
+    finally:
+        if created:
+            descriptor, path = created[0]
+            try:
+                original_close(descriptor)
+            except OSError:
+                pass
+            try:
+                original_unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def test_hostile_spill_cleanup_diagnostics_never_mask_the_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _track_temp_creation(monkeypatch)
+    original_close = os.close
+    original_unlink = os.unlink
+    primary_error = _HostilePrimaryError("setup failed")
+
+    def fail_fdopen(_descriptor: int, _mode: str) -> BinaryIO:
+        raise primary_error
+
+    def fail_close(_descriptor: int) -> None:
+        raise _HostileCleanupError("cleanup failed")
+
+    monkeypatch.setattr(spool_module.os, "fdopen", fail_fdopen)
+    monkeypatch.setattr(spool_module.os, "close", fail_close)
+
+    try:
+        with pytest.raises(RuntimeError) as captured:
+            ReplaySpool.from_stream(io.BytesIO(b"x" * 32), memory_limit=8)
+
+        assert captured.value is primary_error
+        notes = BaseException.__getattribute__(primary_error, "__notes__")
+        assert notes == ["temporary descriptor close also failed: <_HostileCleanupError>"]
+        assert _fallback_block_reason(primary_error) is _FallbackBlockReason.SOURCE_OWNERSHIP
     finally:
         if created:
             descriptor, path = created[0]

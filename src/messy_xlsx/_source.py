@@ -14,6 +14,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Literal, TypeAlias, cast
 
+from messy_xlsx._fallback_signals import (
+    _FallbackBlockReason,
+    _mark_fallback_blocked,
+)
 from messy_xlsx._spool import ReplaySpool, _SpoolStorageError
 from messy_xlsx.exceptions import FileError
 
@@ -66,9 +70,13 @@ def _coerce_bytes(value: object) -> bytes:
         return bytes(value)
     if isinstance(value, memoryview):
         return value.tobytes()
-    raise TypeError(
+    error = TypeError(
         "Binary source read() must return bytes, bytearray, or memoryview; "
         f"got {type(value).__name__}"
+    )
+    raise _mark_fallback_blocked(
+        error,
+        _FallbackBlockReason.SOURCE_OWNERSHIP,
     )
 
 
@@ -327,10 +335,14 @@ class SourceHandle:
         try:
             spool = ReplaySpool.from_stream(self._require_stream())
         except _SpoolStorageError as error:
-            raise FileError(
+            source_error = FileError(
                 f"Cannot spool source: {error}",
                 file_path=self.description,
                 operation="spool",
+            )
+            raise _mark_fallback_blocked(
+                source_error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
             ) from error
         self._spool = spool
         return spool
@@ -339,7 +351,11 @@ class SourceHandle:
     def _borrow(self) -> Iterator[None]:
         self._ensure_open()
         if self._active_borrow:
-            raise RuntimeError("SourceHandle already has an active borrow")
+            error = RuntimeError("SourceHandle already has an active borrow")
+            raise _mark_fallback_blocked(
+                error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
         self._active_borrow = True
         try:
             yield
@@ -359,27 +375,43 @@ class SourceHandle:
 
         caller_stream = self._require_stream()
         entry_position = caller_stream.tell()
-        consumer_failed = False
+        consumer_error: BaseException | None = None
         try:
             caller_stream.seek(0)
             yield caller_stream
-        except BaseException:
-            consumer_failed = True
+        except BaseException as error:
+            consumer_error = error
             raise
         finally:
             try:
                 caller_stream.seek(entry_position)
-            except Exception:
-                if not consumer_failed:
+            except BaseException as restore_error:
+                if consumer_error is None or _cleanup_takes_precedence(restore_error):
+                    _mark_fallback_blocked(
+                        restore_error,
+                        _FallbackBlockReason.SOURCE_OWNERSHIP,
+                    )
                     raise
+                _mark_fallback_blocked(
+                    consumer_error,
+                    _FallbackBlockReason.SOURCE_OWNERSHIP,
+                )
 
     def _ensure_open(self) -> None:
         if self._closed:
-            raise ValueError("SourceHandle is closed")
+            error = ValueError("SourceHandle is closed")
+            raise _mark_fallback_blocked(
+                error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
 
     def _require_stream(self) -> BinaryIO:
         if self._stream is None:
-            raise ValueError("SourceHandle does not contain a stream")
+            error = ValueError("SourceHandle does not contain a stream")
+            raise _mark_fallback_blocked(
+                error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
         return self._stream
 
     def __enter__(self) -> SourceHandle:
@@ -388,3 +420,8 @@ class SourceHandle:
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         self.close()
+
+
+def _cleanup_takes_precedence(error: BaseException) -> bool:
+    """Return whether source teardown must replace an operation failure."""
+    return isinstance(error, MemoryError) or not isinstance(error, Exception)

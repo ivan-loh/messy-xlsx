@@ -19,6 +19,7 @@ from typing import cast
 
 import pandas as pd
 
+from messy_xlsx._fallback_signals import _is_fallback_blocked
 from messy_xlsx._source import SourceHandle, SourceInput
 from messy_xlsx.detection.format_detector import FormatDetector
 from messy_xlsx.exceptions import FormatError
@@ -467,7 +468,7 @@ class HandlerRegistry:
         with self._source_handle(file_source, filename) as source:
             return self._detect(source, filename)
 
-    def parse(
+    def parse(  # noqa: C901
         self,
         file_source: SourceInput | SourceHandle,
         sheet: str | None = None,
@@ -496,7 +497,9 @@ class HandlerRegistry:
                 return self._parse_with(handler, source, sheet, options)
             except (PermissionError, FileNotFoundError, MemoryError):
                 raise
-            except Exception:
+            except Exception as error:
+                if _is_fallback_blocked(error):
+                    raise
                 pass
 
             attempted_handlers = [handler.__class__.__name__]
@@ -509,7 +512,9 @@ class HandlerRegistry:
                     return self._parse_with(fallback_handler, source, sheet, options)
                 except (PermissionError, FileNotFoundError, MemoryError):
                     raise
-                except Exception:
+                except Exception as error:
+                    if _is_fallback_blocked(error):
+                        raise
                     continue
 
             name = source.path.name if source.path is not None else file_desc
@@ -520,7 +525,7 @@ class HandlerRegistry:
                 attempted_formats=attempted_handlers,
             )
 
-    def get_sheet_names(
+    def get_sheet_names(  # noqa: C901
         self,
         file_source: SourceInput | SourceHandle,
         format_type: str | None = None,
@@ -540,7 +545,9 @@ class HandlerRegistry:
                 return self._sheet_names_with(handler, source)
             except (PermissionError, FileNotFoundError, MemoryError):
                 raise
-            except Exception:
+            except Exception as error:
+                if _is_fallback_blocked(error):
+                    raise
                 pass
 
             for fallback_handler in self.handlers:
@@ -551,7 +558,9 @@ class HandlerRegistry:
                     return self._sheet_names_with(fallback_handler, source)
                 except (PermissionError, FileNotFoundError, MemoryError):
                     raise
-                except Exception:
+                except Exception as error:
+                    if _is_fallback_blocked(error):
+                        raise
                     continue
 
             return ["Sheet1"]

@@ -20,6 +20,10 @@ from pandas.testing import assert_frame_equal
 import messy_xlsx._spool as spool_module
 import messy_xlsx.workbook as workbook_module
 from messy_xlsx import FormatInfo, MessyWorkbook, SheetConfig, read_excel
+from messy_xlsx._fallback_signals import (
+    _fallback_block_reason,
+    _FallbackBlockReason,
+)
 from messy_xlsx._source import SourceHandle
 from messy_xlsx._spool import DEFAULT_MEMORY_LIMIT
 from messy_xlsx.detection import FormatDetector, StructureAnalyzer
@@ -92,6 +96,25 @@ class RestoreFailureBytesIO(io.BytesIO):
         if self.fail_restoration and whence == 0 and position == self.restoration_position:
             raise OSError("restore failed")
         return super().seek(position, whence)
+
+
+class ProcessRestoreFailureBytesIO(io.BytesIO):
+    """Raise a selected process-level failure only on final restoration."""
+
+    def __init__(self, content: bytes, restoration_error: BaseException):
+        super().__init__(content)
+        self.restoration_error = restoration_error
+        self.restoration_position = 0
+        self.fail_restoration = False
+
+    def seek(self, position: int, whence: int = 0) -> int:
+        if self.fail_restoration and whence == 0 and position == self.restoration_position:
+            raise self.restoration_error
+        return super().seek(position, whence)
+
+
+class _FatalRestore(BaseException):
+    pass
 
 
 class NthRestoreFailureBytesIO(io.BytesIO):
@@ -577,11 +600,12 @@ def test_source_handle_rejects_nested_active_borrows() -> None:
             pytest.raises(
                 RuntimeError,
                 match="SourceHandle already has an active borrow",
-            ),
+            ) as captured,
             handle.open_path_or_bytes(),
         ):
             pass
 
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
     assert source.tell() == 5
     assert source.closed is False
 
@@ -638,11 +662,32 @@ def test_consumer_failure_remains_primary_when_cursor_restoration_also_fails() -
     handle = SourceHandle(source)
     source.fail_restoration = True
 
-    with (
-        pytest.raises(RuntimeError, match="consumer failed"),
-        handle.open_binary(),
-    ):
+    primary_error = RuntimeError("consumer failed")
+    with pytest.raises(RuntimeError, match="consumer failed") as captured, handle.open_binary():
+        raise primary_error
+
+    assert captured.value is primary_error
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
+
+
+@pytest.mark.parametrize(
+    "restore_error",
+    [MemoryError("capacity"), KeyboardInterrupt(), SystemExit(2), _FatalRestore()],
+)
+def test_process_level_cursor_restoration_failure_wins_over_consumer_error(
+    restore_error: BaseException,
+) -> None:
+    source = ProcessRestoreFailureBytesIO(b"complete source", restore_error)
+    source.seek(5)
+    source.restoration_position = 5
+    handle = SourceHandle(source)
+    source.fail_restoration = True
+
+    with pytest.raises(type(restore_error)) as captured, handle.open_binary():
         raise RuntimeError("consumer failed")
+
+    assert captured.value is restore_error
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
 
 
 def test_cursor_restoration_failure_is_reported_after_successful_consumption() -> None:
@@ -653,10 +698,12 @@ def test_cursor_restoration_failure_is_reported_after_successful_consumption() -
     source.fail_restoration = True
 
     with (
-        pytest.raises(OSError, match="restore failed"),
+        pytest.raises(OSError, match="restore failed") as captured,
         handle.open_binary() as borrowed,
     ):
         assert borrowed.read(4) == b"comp"
+
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.SOURCE_OWNERSHIP
 
 
 def test_structure_analysis_preserves_consumer_error_when_restoration_fails(

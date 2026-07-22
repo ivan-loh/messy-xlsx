@@ -10,6 +10,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, cast
 
+from messy_xlsx._fallback_signals import (
+    _FallbackBlockReason,
+    _mark_fallback_blocked,
+)
+
 DEFAULT_MEMORY_LIMIT = 8 * 1024 * 1024
 COPY_CHUNK_SIZE = 1024 * 1024
 
@@ -26,14 +31,43 @@ def _coerce_bytes(value: object) -> bytes:
         return bytes(value)
     if isinstance(value, memoryview):
         return value.tobytes()
-    raise TypeError(
+    error = TypeError(
         "Binary source read() must return bytes, bytearray, or memoryview; "
         f"got {type(value).__name__}"
+    )
+    raise _mark_fallback_blocked(
+        error,
+        _FallbackBlockReason.SOURCE_OWNERSHIP,
     )
 
 
 def _storage_error(error: OSError) -> _SpoolStorageError:
     return _SpoolStorageError(str(error))
+
+
+def _safe_error_repr(error: BaseException) -> str:
+    """Return a cleanup description without allowing diagnostics to raise."""
+    try:
+        return repr(error)
+    except BaseException:
+        try:
+            name = type.__getattribute__(type(error), "__name__")
+        except BaseException:
+            name = "unknown"
+        return f"<{name}>"
+
+
+def _safe_add_note(error: BaseException, note: str) -> None:
+    """Attach secondary cleanup context on a best-effort basis."""
+    try:
+        BaseException.add_note(error, note)
+    except BaseException:
+        pass
+
+
+def _cleanup_takes_precedence(error: BaseException) -> bool:
+    """Return whether source teardown must replace an operation failure."""
+    return isinstance(error, MemoryError) or not isinstance(error, Exception)
 
 
 def _is_seekable(stream: BinaryIO) -> bool:
@@ -57,7 +91,11 @@ def _capture_position(stream: BinaryIO) -> tuple[bool, int]:
     except (AttributeError, OSError, ValueError):
         position = 0
     if position != 0:
-        raise ValueError("A non-seekable source must be positioned at byte 0")
+        error = ValueError("A non-seekable source must be positioned at byte 0")
+        raise _mark_fallback_blocked(
+            error,
+            _FallbackBlockReason.SOURCE_OWNERSHIP,
+        )
     return False, 0
 
 
@@ -71,16 +109,28 @@ def _cleanup_pending_spill(
         try:
             opened.close()
         except BaseException as cleanup_error:
-            error.add_note(f"temporary file close also failed: {cleanup_error!r}")
+            _mark_fallback_blocked(error, _FallbackBlockReason.SOURCE_OWNERSHIP)
+            _safe_add_note(
+                error,
+                f"temporary file close also failed: {_safe_error_repr(cleanup_error)}",
+            )
     elif descriptor is not None:
         try:
             os.close(descriptor)
         except BaseException as cleanup_error:
-            error.add_note(f"temporary descriptor close also failed: {cleanup_error!r}")
+            _mark_fallback_blocked(error, _FallbackBlockReason.SOURCE_OWNERSHIP)
+            _safe_add_note(
+                error,
+                f"temporary descriptor close also failed: {_safe_error_repr(cleanup_error)}",
+            )
     try:
         os.unlink(raw_path)
     except BaseException as cleanup_error:
-        error.add_note(f"temporary file removal also failed: {cleanup_error!r}")
+        _mark_fallback_blocked(error, _FallbackBlockReason.SOURCE_OWNERSHIP)
+        _safe_add_note(
+            error,
+            f"temporary file removal also failed: {_safe_error_repr(cleanup_error)}",
+        )
 
 
 def _create_spill() -> tuple[Path, BinaryIO]:
@@ -131,12 +181,20 @@ def _cleanup_spill(
         try:
             opened.close()
         except BaseException as cleanup_error:
-            error.add_note(f"temporary file close also failed: {cleanup_error!r}")
+            _mark_fallback_blocked(error, _FallbackBlockReason.SOURCE_OWNERSHIP)
+            _safe_add_note(
+                error,
+                f"temporary file close also failed: {_safe_error_repr(cleanup_error)}",
+            )
     if path is not None:
         try:
             path.unlink(missing_ok=True)
         except BaseException as cleanup_error:
-            error.add_note(f"temporary file removal also failed: {cleanup_error!r}")
+            _mark_fallback_blocked(error, _FallbackBlockReason.SOURCE_OWNERSHIP)
+            _safe_add_note(
+                error,
+                f"temporary file removal also failed: {_safe_error_repr(cleanup_error)}",
+            )
 
 
 def _restore_position(
@@ -149,13 +207,33 @@ def _restore_position(
         stream.seek(entry)
     except BaseException as restore_error:
         if primary_error is not None:
-            primary_error.add_note(f"cursor restoration also failed: {restore_error!r}")
+            if _cleanup_takes_precedence(restore_error):
+                _mark_fallback_blocked(
+                    restore_error,
+                    _FallbackBlockReason.SOURCE_OWNERSHIP,
+                )
+                raise
+            _mark_fallback_blocked(
+                primary_error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
+            _safe_add_note(
+                primary_error,
+                f"cursor restoration also failed: {_safe_error_repr(restore_error)}",
+            )
             return
+        _mark_fallback_blocked(
+            restore_error,
+            _FallbackBlockReason.SOURCE_OWNERSHIP,
+        )
         if completed is not None:
             try:
                 completed.close()
             except BaseException as cleanup_error:
-                restore_error.add_note(f"temporary spool cleanup also failed: {cleanup_error!r}")
+                _safe_add_note(
+                    restore_error,
+                    f"temporary spool cleanup also failed: {_safe_error_repr(cleanup_error)}",
+                )
         raise
 
 
@@ -240,4 +318,8 @@ class ReplaySpool:
 
     def _ensure_open(self) -> None:
         if self._closed:
-            raise ValueError("ReplaySpool is closed")
+            error = ValueError("ReplaySpool is closed")
+            raise _mark_fallback_blocked(
+                error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
