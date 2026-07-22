@@ -15,7 +15,7 @@ from enum import Enum
 from inspect import isbuiltin, isfunction
 from itertools import pairwise
 from types import MethodDescriptorType, WrapperDescriptorType
-from typing import Any, Final
+from typing import Any, Final, TypeVar, cast
 from uuid import UUID
 
 from messy_xlsx._fallback_signals import (
@@ -36,6 +36,8 @@ from messy_xlsx.parsing.contracts import OutputMode
 _STRUCTURE_FORMATS: Final = frozenset({"xlsx", "xlsm", "xltx", "xltm"})
 _TEXT_FORMATS: Final = frozenset({"csv", "tsv", "txt"})
 _PY_TPFLAGS_IMMUTABLETYPE: Final = 1 << 8
+_ENUM_SNAPSHOT_ERROR: Final = "Enum values require drop-condition identity semantics"
+_ChoiceEnum = TypeVar("_ChoiceEnum", bound=Enum)
 
 _COMMA_DECIMAL_DOT_THOUSANDS: Final = frozenset(
     {
@@ -116,6 +118,13 @@ class _FrozenBytearray:
 @dataclass(frozen=True, slots=True)
 class _FrozenMemoryview:
     value: bytes
+    format: str
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    suboffsets: tuple[int, ...]
+    itemsize: int
+    ndim: int
+    readonly: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +227,21 @@ class ConfigSnapshot:
 
     @classmethod
     def from_config(cls, config: SheetConfig) -> ConfigSnapshot:
-        """Copy every consumed configuration collection recursively."""
+        """Copy typed built-in configuration collections recursively.
+
+        ``SheetConfig`` exposes concrete ``dict``/``list`` fields. Requiring
+        those exact container types keeps snapshotting independent of
+        caller-controlled collection hooks.
+        """
+        if type(config.type_hints) is not dict:
+            raise TypeError("type_hints must be an exact dict")
+        if type(config.column_renames) is not dict:
+            raise TypeError("column_renames must be an exact dict")
+        if type(config.drop_conditions) is not list:
+            raise TypeError("drop_conditions must be an exact list")
+        for index, condition in enumerate(config.drop_conditions):
+            if type(condition) is not dict:
+                raise TypeError(f"drop_conditions[{index}] must be an exact dict")
         return cls(
             type_hints=_freeze_mapping(config.type_hints),
             column_renames=_freeze_mapping(config.column_renames),
@@ -245,6 +268,36 @@ class ConfigSnapshot:
     def thaw_drop_conditions(self) -> list[tuple[Any, Any]]:
         """Return fresh comparison values for legacy row filtering."""
         return [(_thaw(column), _thaw(value)) for column, value in self.drop_conditions]
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedConfigProjection:
+    """Exact immutable scalar projection used while compiling a plan."""
+
+    skip_rows: int
+    header_rows: int
+    skip_footer: int
+    cell_range: str | None
+    auto_detect: bool
+    include_hidden: bool
+    merge_strategy: MergeStrategy
+    locale: str | None
+    evaluate_formulas: bool
+    drop_regex: str | None
+    header_detection_mode: HeaderDetectionMode
+    header_confidence_threshold: float
+    header_fallback: HeaderFallback
+    normalize: bool
+    normalize_dates: bool
+    normalize_numbers: bool
+    normalize_whitespace: bool
+    use_extended_missing_list: bool
+    preserve_types: bool
+    ensure_type_consistency: bool
+    decimal_separator: str | None
+    thousands_separator: str | None
+    sanitize_column_names: bool
+    snapshot: ConfigSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,13 +382,13 @@ def compile_parse_plan(
     batch_size: int | None = None,
 ) -> ParsePlan:
     """Compile configuration and optional structure evidence without mutation or I/O."""
-    output_mode, batch_size, snapshot = _validated_plan_inputs(
+    output_mode, batch_size, projected = _validated_plan_inputs(
         config,
         output_mode,
         batch_size,
     )
 
-    use_structure = requires_structure_analysis(config, format_type)
+    use_structure = projected.auto_detect and format_type in _STRUCTURE_FORMATS
     if use_structure and structure is None:
         error = ValueError("StructureInfo is required for auto-detected OOXML parsing")
         raise _mark_fallback_blocked(
@@ -345,78 +398,215 @@ def compile_parse_plan(
 
     active_structure = structure if use_structure else None
 
-    skip_rows = config.skip_rows
-    header_rows = config.header_rows
-    skip_footer = config.skip_footer
-    merge_strategy = config.merge_strategy
-    ignore_hidden = not config.include_hidden
-    locale = config.locale
+    skip_rows = projected.skip_rows
+    header_rows = projected.header_rows
+    skip_footer = projected.skip_footer
+    merge_strategy = projected.merge_strategy
+    ignore_hidden = not projected.include_hidden
+    locale = projected.locale
 
     if active_structure is not None:
-        skip_rows, header_rows = _configured_header_rows(config, active_structure)
-        skip_footer = _resolve_skip_footer(config, active_structure)
-        locale = config.locale or active_structure.detected_locale
+        skip_rows, header_rows = _configured_header_rows(projected, active_structure)
+        skip_footer = _resolve_skip_footer(projected, active_structure)
+        locale = projected.locale or active_structure.detected_locale
 
         if not active_structure.merged_ranges:
-            merge_strategy = "skip"
+            merge_strategy = MergeStrategy.SKIP
         if not active_structure.hidden_rows and not active_structure.hidden_columns:
             ignore_hidden = False
 
-    decimal_separator, thousands_separator = _resolve_separators(config, locale)
+    decimal_separator, thousands_separator = _resolve_separators(projected, locale)
 
     skipped_steps: list[str] = []
-    if not config.normalize_whitespace:
+    if not projected.normalize_whitespace:
         skipped_steps.append("whitespace")
-    if not config.normalize_numbers:
+    if not projected.normalize_numbers:
         skipped_steps.append("numbers")
-    if not config.normalize_dates:
+    if not projected.normalize_dates:
         skipped_steps.append("dates")
-    if not config.ensure_type_consistency:
+    if not projected.ensure_type_consistency:
         skipped_steps.append("type_coercion")
 
-    return ParsePlan(
-        skip_rows=skip_rows,
-        header_rows=header_rows,
-        skip_footer=skip_footer,
-        merge_strategy=merge_strategy,
-        ignore_hidden=ignore_hidden,
-        cell_range=config.cell_range,
-        data_only=config.evaluate_formulas,
-        auto_detect_header=config.auto_detect and format_type in _TEXT_FORMATS,
-        normalize=config.normalize,
-        decimal_separator=decimal_separator,
-        thousands_separator=thousands_separator,
-        use_extended_missing_list=config.use_extended_missing_list,
-        preserve_types=config.preserve_types,
-        type_hints=snapshot.type_hints,
-        skip_normalization_steps=tuple(skipped_steps),
-        sanitize_column_names=config.sanitize_column_names,
-        column_renames=snapshot.column_renames,
-        drop_regex=config.drop_regex,
-        drop_conditions=snapshot.drop_conditions,
-        output_mode=output_mode,
-        batch_size=batch_size,
-    )
+    try:
+        return ParsePlan(
+            skip_rows=_project_nonnegative_int(skip_rows, "skip_rows"),
+            header_rows=_project_nonnegative_int(header_rows, "header_rows"),
+            skip_footer=_project_nonnegative_int(skip_footer, "skip_footer"),
+            merge_strategy=_project_choice(
+                merge_strategy,
+                MergeStrategy,
+                "merge_strategy",
+            ),
+            ignore_hidden=_project_bool(ignore_hidden, "ignore_hidden"),
+            cell_range=projected.cell_range,
+            data_only=projected.evaluate_formulas,
+            auto_detect_header=projected.auto_detect and format_type in _TEXT_FORMATS,
+            normalize=projected.normalize,
+            decimal_separator=_project_optional_str(
+                decimal_separator,
+                "decimal_separator",
+            ),
+            thousands_separator=_project_optional_str(
+                thousands_separator,
+                "thousands_separator",
+            ),
+            use_extended_missing_list=projected.use_extended_missing_list,
+            preserve_types=projected.preserve_types,
+            type_hints=projected.snapshot.type_hints,
+            skip_normalization_steps=tuple(skipped_steps),
+            sanitize_column_names=projected.sanitize_column_names,
+            column_renames=projected.snapshot.column_renames,
+            drop_regex=projected.drop_regex,
+            drop_conditions=projected.snapshot.drop_conditions,
+            output_mode=output_mode,
+            batch_size=batch_size,
+        )
+    except (TypeError, ValueError) as error:
+        _mark_fallback_blocked(error, _FallbackBlockReason.CONFIGURATION)
+        raise
 
 
 def _validated_plan_inputs(
     config: SheetConfig,
     output_mode: OutputMode,
     batch_size: int | None,
-) -> tuple[OutputMode, int | None, ConfigSnapshot]:
+) -> tuple[OutputMode, int | None, _ValidatedConfigProjection]:
     """Validate and snapshot caller configuration with a typed failure signal."""
     try:
         mode = OutputMode(output_mode)
         size = _validated_batch_size(mode, batch_size)
-        snapshot = ConfigSnapshot.from_config(config)
+        projected = _ValidatedConfigProjection(
+            skip_rows=_project_nonnegative_int(config.skip_rows, "skip_rows"),
+            header_rows=_project_nonnegative_int(config.header_rows, "header_rows"),
+            skip_footer=_project_nonnegative_int(config.skip_footer, "skip_footer"),
+            cell_range=_project_optional_str(config.cell_range, "cell_range"),
+            auto_detect=_project_bool(config.auto_detect, "auto_detect"),
+            include_hidden=_project_bool(config.include_hidden, "include_hidden"),
+            merge_strategy=_project_choice(
+                config.merge_strategy,
+                MergeStrategy,
+                "merge_strategy",
+            ),
+            locale=_project_optional_str(config.locale, "locale"),
+            evaluate_formulas=_project_bool(
+                config.evaluate_formulas,
+                "evaluate_formulas",
+            ),
+            drop_regex=_project_optional_str(config.drop_regex, "drop_regex"),
+            header_detection_mode=_project_choice(
+                config.header_detection_mode,
+                HeaderDetectionMode,
+                "header_detection_mode",
+            ),
+            header_confidence_threshold=_project_confidence_threshold(
+                config.header_confidence_threshold
+            ),
+            header_fallback=_project_choice(
+                config.header_fallback,
+                HeaderFallback,
+                "header_fallback",
+            ),
+            normalize=_project_bool(config.normalize, "normalize"),
+            normalize_dates=_project_bool(config.normalize_dates, "normalize_dates"),
+            normalize_numbers=_project_bool(
+                config.normalize_numbers,
+                "normalize_numbers",
+            ),
+            normalize_whitespace=_project_bool(
+                config.normalize_whitespace,
+                "normalize_whitespace",
+            ),
+            use_extended_missing_list=_project_bool(
+                config.use_extended_missing_list,
+                "use_extended_missing_list",
+            ),
+            preserve_types=_project_bool(config.preserve_types, "preserve_types"),
+            ensure_type_consistency=_project_bool(
+                config.ensure_type_consistency,
+                "ensure_type_consistency",
+            ),
+            decimal_separator=_project_optional_str(
+                config.decimal_separator,
+                "decimal_separator",
+            ),
+            thousands_separator=_project_optional_str(
+                config.thousands_separator,
+                "thousands_separator",
+            ),
+            sanitize_column_names=_project_bool(
+                config.sanitize_column_names,
+                "sanitize_column_names",
+            ),
+            snapshot=ConfigSnapshot.from_config(config),
+        )
     except (TypeError, ValueError) as error:
         _mark_fallback_blocked(error, _FallbackBlockReason.CONFIGURATION)
         raise
-    return mode, size, snapshot
+    return mode, size, projected
+
+
+def _project_nonnegative_int(value: object, field_name: str) -> int:
+    """Copy an integer-like scalar to an owned exact ``int``."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be an int")
+    projected = value if type(value) is int else int.__int__(value)
+    if projected < 0:
+        raise ValueError(f"{field_name} must be >= 0, got {projected}")
+    return projected
+
+
+def _project_bool(value: object, field_name: str) -> bool:
+    """Require the exact immutable boolean type without truthiness coercion."""
+    if type(value) is not bool:
+        raise TypeError(f"{field_name} must be a bool")
+    return value
+
+
+def _project_str(value: object, field_name: str) -> str:
+    """Copy a string subclass to an owned exact ``str`` value."""
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a str")
+    return value if type(value) is str else str.__str__(value)
+
+
+def _project_optional_str(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _project_str(value, field_name)
+
+
+def _project_choice(
+    value: object,
+    choice_type: type[_ChoiceEnum],
+    field_name: str,
+) -> _ChoiceEnum:
+    """Canonicalize a string choice to the exact project Enum member."""
+    text = _project_str(value, field_name)
+    return choice_type(text)
+
+
+def _project_confidence_threshold(value: object) -> float:
+    """Copy the header threshold to an exact bounded float."""
+    if isinstance(value, bool):
+        raise TypeError("header_confidence_threshold must be a float")
+    if type(value) is float:
+        projected = value
+    elif isinstance(value, float):
+        projected = float.__float__(value)
+    elif isinstance(value, int):
+        integer = value if type(value) is int else int.__int__(value)
+        projected = float(integer)
+    else:
+        raise TypeError("header_confidence_threshold must be a float")
+    if not 0.0 <= projected <= 1.0:
+        raise ValueError(
+            f"header_confidence_threshold must be between 0.0 and 1.0, got {projected}"
+        )
+    return projected
 
 
 def _configured_header_rows(
-    config: SheetConfig,
+    config: _ValidatedConfigProjection,
     structure: StructureInfo,
 ) -> tuple[int, int]:
     """Resolve header configuration with a typed failure signal."""
@@ -431,10 +621,17 @@ def _validated_batch_size(
     mode: OutputMode,
     batch_size: int | None,
 ) -> int | None:
-    """Reject an unusable streaming window before any backend work can start."""
-    if mode is OutputMode.STREAMING and (type(batch_size) is not int or batch_size < 1):
-        raise ValueError("batch_size must be >= 1 for streaming output")
-    return batch_size
+    """Reject any invalid retained window before backend work can start."""
+    if batch_size is None:
+        if mode is OutputMode.STREAMING:
+            raise ValueError("batch_size must be >= 1 for streaming output")
+        return None
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool):
+        raise ValueError("batch_size must be >= 1")
+    size = int.__int__(batch_size)
+    if size < 1:
+        raise ValueError("batch_size must be >= 1")
+    return size
 
 
 def _freeze_mapping(value: Mapping[Any, Any]) -> tuple[tuple[Any, Any], ...]:
@@ -453,8 +650,9 @@ def _freeze(  # noqa: C901
     if active is None:
         active = set()
     if isinstance(value, Enum):
-        _validate_enum(value)
-        return value
+        if preserve_identity_reference:
+            return _freeze_identity_reference(value)
+        raise TypeError(_ENUM_SNAPSHOT_ERROR)
     if value is None or type(value) in {bool, int, str, bytes}:
         return value
     if type(value) is float:
@@ -507,15 +705,7 @@ def _freeze(  # noqa: C901
     is_dataclass_instance = is_dataclass(value) and not isinstance(value, type)
     uses_identity_semantics = _uses_legacy_identity_semantics(value)
     if preserve_identity_reference and uses_identity_semantics:
-        value_type = type(value)
-        type_module, type_qualname = _safe_type_description(value_type)
-        return _FrozenIdentityReference(
-            type_identity=id(value_type),
-            type_module=type_module,
-            type_qualname=type_qualname,
-            identity=id(value),
-            reference=value,
-        )
+        return _freeze_identity_reference(value)
 
     identity = id(value)
     if identity in active:
@@ -584,7 +774,7 @@ def _freeze(  # noqa: C901
         if type(value) is bytearray:
             return _FrozenBytearray(bytes(value))
         if type(value) is memoryview:
-            return _FrozenMemoryview(value.tobytes())
+            return _freeze_memoryview(value)
         if is_dataclass_instance:
             if not _is_safely_reconstructable_python_object(value):
                 raise TypeError(f"opaque mutable configuration value: {type(value).__name__}")
@@ -639,6 +829,65 @@ def _freeze(  # noqa: C901
         active.remove(identity)
 
 
+def _freeze_identity_reference(value: Any) -> _FrozenIdentityReference:
+    """Capture stable identity metadata without virtual class/member access."""
+    value_type = type(value)
+    type_module, type_qualname = _safe_type_description(value_type)
+    return _FrozenIdentityReference(
+        type_identity=id(value_type),
+        type_module=type_module,
+        type_qualname=type_qualname,
+        identity=id(value),
+        reference=value,
+    )
+
+
+def _freeze_memoryview(value: memoryview) -> _FrozenMemoryview:
+    """Snapshot a reconstructable C-contiguous view and its equality metadata."""
+    if not value.c_contiguous:
+        raise TypeError("unsupported non-contiguous memoryview configuration value")
+    if value.shape is None or value.strides is None or value.suboffsets is None:
+        raise TypeError("unsupported memoryview configuration value")
+    frozen = _FrozenMemoryview(
+        value=value.tobytes(),
+        format=value.format,
+        shape=tuple(value.shape),
+        strides=tuple(value.strides),
+        suboffsets=tuple(value.suboffsets),
+        itemsize=value.itemsize,
+        ndim=value.ndim,
+        readonly=value.readonly,
+    )
+    try:
+        reconstructed = _thaw_memoryview(frozen)
+    except (TypeError, ValueError) as error:
+        raise TypeError("unsupported memoryview configuration value") from error
+    try:
+        metadata = (
+            reconstructed.format,
+            reconstructed.shape,
+            reconstructed.strides,
+            reconstructed.suboffsets,
+            reconstructed.itemsize,
+            reconstructed.ndim,
+            reconstructed.readonly,
+        )
+        expected = (
+            frozen.format,
+            frozen.shape,
+            frozen.strides,
+            frozen.suboffsets,
+            frozen.itemsize,
+            frozen.ndim,
+            frozen.readonly,
+        )
+        if metadata != expected:
+            raise TypeError("unsupported memoryview configuration value")
+    finally:
+        reconstructed.release()
+    return frozen
+
+
 def _freeze_stdlib_timezone(
     value: object,
     scalar_name: str,
@@ -668,6 +917,24 @@ def _thaw_stdlib_timezone(value: _FrozenTimezone | None) -> timezone | None:
     )
 
 
+def _thaw_memoryview(value: _FrozenMemoryview) -> memoryview:
+    backing: bytes | bytearray
+    backing = value.value if value.readonly else bytearray(value.value)
+    shape = None if not value.value and value.ndim == 1 and value.shape == (0,) else value.shape
+    if shape is None:
+        return cast(
+            memoryview,
+            memoryview(backing).cast(value.format),  # type: ignore[call-overload]
+        )
+    return cast(
+        memoryview,
+        memoryview(backing).cast(  # type: ignore[call-overload]
+            value.format,
+            shape=value.shape,
+        ),
+    )
+
+
 def _thaw(value: Any) -> Any:  # noqa: C901
     """Return a fresh legacy value from a tagged immutable snapshot."""
     if isinstance(value, _FrozenMapping):
@@ -683,7 +950,7 @@ def _thaw(value: Any) -> Any:  # noqa: C901
     if isinstance(value, _FrozenBytearray):
         return bytearray(value.value)
     if isinstance(value, _FrozenMemoryview):
-        return memoryview(bytearray(value.value))
+        return _thaw_memoryview(value)
     if isinstance(value, _FrozenFloat):
         return float.fromhex(value.hexadecimal)
     if isinstance(value, _FrozenComplex):
@@ -854,7 +1121,17 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
     if isinstance(value, _FrozenBytearray):
         return ("bytearray", value.value.hex())
     if isinstance(value, _FrozenMemoryview):
-        return ("memoryview", value.value.hex())
+        return (
+            "memoryview",
+            value.value.hex(),
+            value.format,
+            value.shape,
+            value.strides,
+            value.suboffsets,
+            value.itemsize,
+            value.ndim,
+            value.readonly,
+        )
     if isinstance(value, _FrozenObject):
         return (
             "object",
@@ -876,21 +1153,6 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
     raise TypeError(
         f"configuration value cannot be ordered deterministically: {type(value).__name__}"
     )
-
-
-def _validate_enum(value: Enum) -> None:
-    """Allow only state-free enum members whose payload is deeply immutable."""
-    state_names = set(vars(value)) - {"_name_", "_value_", "__objclass__", "_sort_order_"}
-    if state_names or not _is_deeply_immutable(value.value):
-        raise TypeError(f"mutable Enum configuration value: {type(value).__name__}.{value.name}")
-
-
-def _is_deeply_immutable(value: Any) -> bool:
-    if value is None or type(value) in {bool, int, float, complex, str, bytes, type}:
-        return True
-    if type(value) in {tuple, frozenset}:
-        return all(_is_deeply_immutable(item) for item in value)
-    return isfunction(value) or isbuiltin(value) or _is_method_descriptor(value)
 
 
 def _object_attributes(value: Any) -> dict[str, Any]:
@@ -989,7 +1251,7 @@ def _is_method_descriptor(value: Any) -> bool:
 
 
 def _resolve_header_rows(
-    config: SheetConfig,
+    config: _ValidatedConfigProjection,
     structure: StructureInfo,
 ) -> tuple[int, int]:
     """Resolve row offsets while preserving existing header-mode semantics."""
@@ -1025,7 +1287,7 @@ def _resolve_header_rows(
 
 
 def _detected_header_rows(
-    config: SheetConfig,
+    config: _ValidatedConfigProjection,
     structure: StructureInfo,
 ) -> tuple[int, int]:
     """Convert a detected one-based header into handler row offsets."""
@@ -1040,7 +1302,10 @@ def _detected_header_rows(
     return skip_rows, structure.header_rows_count
 
 
-def _resolve_skip_footer(config: SheetConfig, structure: StructureInfo) -> int:
+def _resolve_skip_footer(
+    config: _ValidatedConfigProjection,
+    structure: StructureInfo,
+) -> int:
     """Resolve footer trimming with caller and detected-table precedence."""
     skip_footer = structure.suggested_skip_footer
     if config.skip_footer > 0:
@@ -1068,7 +1333,7 @@ def _resolve_skip_footer(config: SheetConfig, structure: StructureInfo) -> int:
 
 
 def _resolve_separators(
-    config: SheetConfig,
+    config: _ValidatedConfigProjection,
     locale: str | None,
 ) -> tuple[str | None, str | None]:
     """Resolve explicit or locale-derived number separators."""

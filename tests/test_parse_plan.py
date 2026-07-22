@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from array import array
 from collections import deque
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, dataclass, fields, replace
@@ -942,6 +944,19 @@ def test_materialized_plan_preserves_the_legacy_three_argument_call() -> None:
     assert legacy.batch_size is None
 
 
+def test_materialized_batch_size_is_validated_before_plan_creation() -> None:
+    with pytest.raises(ValueError, match="batch_size must be >= 1") as captured:
+        compile_parse_plan(
+            SheetConfig(auto_detect=False),
+            None,
+            "xlsx",
+            output_mode=OutputMode.MATERIALIZED,
+            batch_size=[],  # type: ignore[arg-type]
+        )
+
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
+
+
 def test_plan_recursively_snapshots_nested_mutable_configuration_values() -> None:
     nested_hint = {
         "members": ["amount", {"precision": [2, 4]}],
@@ -1013,6 +1028,20 @@ class _MutableObject:
 
 class _MutablePayloadEnum(Enum):
     ITEM: ClassVar[list[str]] = ["initial"]
+
+
+class _ImmutablePayloadEnum(Enum):
+    ITEM = ("stable", 1)
+    OTHER = ("other", 2)
+
+
+class _HostileNameEnum(Enum):
+    ITEM = "item"
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "name":
+            raise AssertionError("ordinary Enum rejection must not read member.name")
+        return super().__getattribute__(name)
 
 
 class _MutableInt(int):
@@ -1158,6 +1187,121 @@ class _StatelessHashableValue:
         return 1
 
 
+def test_plan_projects_retained_scalar_subclasses_to_exact_immutable_types() -> None:
+    config = SheetConfig(auto_detect=False)
+    config.skip_rows = _MutableHashInt(2)
+    config.header_rows = _MutableHashInt(3)
+    config.skip_footer = _MutableHashInt(4)
+    config.merge_strategy = _MutableStr("first_only")
+    config.cell_range = _MutableStr("A1:B8")
+    config.decimal_separator = _MutableStr(",")
+    config.thousands_separator = _MutableStr(".")
+    config.drop_regex = _MutableStr("^TOTAL$")
+
+    plan = compile_parse_plan(config, None, "xlsx")
+    initial_hash = hash(plan)
+
+    assert type(plan.skip_rows) is int
+    assert type(plan.header_rows) is int
+    assert type(plan.skip_footer) is int
+    assert plan.merge_strategy is MergeStrategy.FIRST_ONLY
+    assert plan.to_parse_options().merge_strategy is MergeStrategy.FIRST_ONLY
+    assert type(plan.cell_range) is str
+    assert type(plan.decimal_separator) is str
+    assert type(plan.thousands_separator) is str
+    assert type(plan.drop_regex) is str
+
+    original_string_hash = _MutableStr.__dict__.get("__hash__")
+    _MutableHashInt.hash_offset = 100
+    try:
+        _MutableStr.__hash__ = lambda _self: 0  # type: ignore[assignment]
+        assert hash(plan) == initial_hash
+    finally:
+        _MutableHashInt.hash_offset = 0
+        if original_string_hash is None:
+            del _MutableStr.__hash__
+        else:
+            _MutableStr.__hash__ = original_string_hash  # type: ignore[assignment]
+
+
+def test_structure_derived_plan_scalars_are_projected_to_exact_ints() -> None:
+    plan = compile_parse_plan(
+        SheetConfig(auto_detect=True, header_detection_mode="auto"),
+        _structure(
+            header_rows_count=_MutableHashInt(2),
+            suggested_skip_footer=_MutableHashInt(3),
+        ),
+        "xlsx",
+    )
+
+    assert type(plan.skip_rows) is int
+    assert type(plan.header_rows) is int
+    assert type(plan.skip_footer) is int
+    assert (plan.skip_rows, plan.header_rows, plan.skip_footer) == (3, 2, 3)
+
+
+def test_invalid_retained_scalar_is_marked_as_configuration_before_plan_creation() -> None:
+    config = SheetConfig(auto_detect=False)
+    config.normalize = []  # type: ignore[assignment]
+
+    with pytest.raises(TypeError, match="normalize must be a bool") as captured:
+        compile_parse_plan(config, None, "xlsx")
+
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
+
+
+@pytest.mark.parametrize(
+    ("field_name", "malformed", "message"),
+    [
+        ("type_hints", [], "type_hints must be an exact dict"),
+        ("column_renames", [], "column_renames must be an exact dict"),
+        ("drop_conditions", {}, "drop_conditions must be an exact list"),
+        ("drop_conditions", (), "drop_conditions must be an exact list"),
+        (
+            "drop_conditions",
+            [[]],
+            "drop_conditions[0] must be an exact dict",
+        ),
+    ],
+)
+def test_malformed_config_collection_shape_is_a_marked_configuration_error(
+    field_name: str,
+    malformed: object,
+    message: str,
+) -> None:
+    config = SheetConfig(auto_detect=False)
+    setattr(config, field_name, malformed)
+
+    with pytest.raises(TypeError, match=rf"^{re.escape(message)}\Z") as captured:
+        compile_parse_plan(config, None, "xlsx")
+
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
+
+
+def test_config_collection_subclasses_are_rejected_without_invoking_hooks() -> None:
+    class HostileDict(dict[str, str]):
+        def items(self):
+            raise AssertionError("items hook must not run")
+
+    class HostileList(list[dict[str, object]]):
+        def __iter__(self):
+            raise AssertionError("iteration hook must not run")
+
+    configs = [
+        ("type_hints", HostileDict()),
+        ("column_renames", HostileDict()),
+        ("drop_conditions", HostileList()),
+    ]
+    for field_name, value in configs:
+        config = SheetConfig(auto_detect=False)
+        setattr(config, field_name, value)
+
+        with pytest.raises(TypeError, match=rf"^{field_name} must be an exact") as captured:
+            compile_parse_plan(config, None, "xlsx")
+
+        assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
+
+
 def test_plan_thaws_fresh_values_with_original_supported_container_kinds() -> None:
     dataclass_value = _MutablePayload(["alpha"], {"codes": {1, 2}})
     object_value = _MutableObject(["original"])
@@ -1210,6 +1354,109 @@ def test_plan_thaws_fresh_values_with_original_supported_container_kinds() -> No
     first["dataclass"].labels.append("consumer mutation")
     assert second["list"] == [1, {"nested": [2]}]
     assert second["dataclass"].labels == ["alpha"]
+
+
+@pytest.mark.parametrize("readonly", [False, True], ids=["writable", "readonly"])
+def test_memoryview_snapshot_preserves_array_format_shape_and_mutability(
+    readonly: bool,
+) -> None:
+    source = array("I", [1, 2, 3])
+    configured_view = memoryview(source)
+    if readonly:
+        configured_view = configured_view.toreadonly()
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"view": configured_view},  # type: ignore[dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+    initial_hash = hash(plan)
+
+    source[0] = 99
+    first = plan.thaw_type_hints()["view"]
+    second = plan.thaw_type_hints()["view"]
+
+    assert isinstance(first, memoryview)
+    assert (first.format, first.shape, first.itemsize, first.ndim) == (
+        configured_view.format,
+        (3,),
+        configured_view.itemsize,
+        configured_view.ndim,
+    )
+    assert first.strides == configured_view.strides
+    assert first.readonly is readonly
+    assert first == memoryview(array("I", [1, 2, 3]))
+    if readonly:
+        with pytest.raises(TypeError):
+            first[0] = 7
+    else:
+        first[0] = 7
+        assert second[0] == 1
+        assert source[0] == 99
+    assert hash(plan) == initial_hash
+
+
+def test_non_contiguous_memoryview_is_rejected_before_plan_creation() -> None:
+    configured_view = memoryview(bytearray(b"abcdef"))[::2]
+
+    with pytest.raises(TypeError, match=r"unsupported.*memoryview") as captured:
+        compile_parse_plan(
+            SheetConfig(
+                auto_detect=False,
+                type_hints={"view": configured_view},  # type: ignore[dict-item]
+            ),
+            None,
+            "xlsx",
+        )
+
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
+
+
+@pytest.mark.parametrize("format_code", ["B", "I"])
+@pytest.mark.parametrize("readonly", [False, True], ids=["writable", "readonly"])
+def test_empty_one_dimensional_memoryview_round_trips_metadata(
+    format_code: str,
+    readonly: bool,
+) -> None:
+    if format_code == "I":
+        source: object = array("I")
+    else:
+        source = bytearray()
+    configured_view = memoryview(source)
+    if readonly:
+        configured_view = configured_view.toreadonly()
+
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={"view": configured_view},  # type: ignore[dict-item]
+        ),
+        None,
+        "xlsx",
+    )
+    thawed = plan.thaw_type_hints()["view"]
+
+    assert isinstance(thawed, memoryview)
+    assert thawed == configured_view
+    assert (
+        thawed.format,
+        thawed.shape,
+        thawed.strides,
+        thawed.itemsize,
+        thawed.ndim,
+        thawed.readonly,
+    ) == (
+        configured_view.format,
+        configured_view.shape,
+        configured_view.strides,
+        configured_view.itemsize,
+        configured_view.ndim,
+        readonly,
+    )
+    assert thawed.obj is not configured_view.obj
+    hash(plan)
 
 
 def test_mixed_mapping_keys_have_deterministic_plan_equality_and_hash() -> None:
@@ -1333,7 +1580,7 @@ def test_signed_and_finite_float_ordering_remains_deterministic() -> None:
 
 
 def test_mutable_enum_payload_is_rejected_before_a_plan_can_retain_its_alias() -> None:
-    with pytest.raises(TypeError, match="mutable Enum configuration value"):
+    with pytest.raises(TypeError, match="Enum values require drop-condition identity semantics"):
         compile_parse_plan(
             SheetConfig(
                 auto_detect=False,
@@ -1342,6 +1589,68 @@ def test_mutable_enum_payload_is_rejected_before_a_plan_can_retain_its_alias() -
             None,
             "xlsx",
         )
+
+
+def test_arbitrary_enum_fails_closed_before_live_member_semantics_are_retained() -> None:
+    with pytest.raises(
+        TypeError,
+        match=r"^Enum values require drop-condition identity semantics\Z",
+    ) as captured:
+        compile_parse_plan(
+            SheetConfig(
+                auto_detect=False,
+                type_hints={"enum": _HostileNameEnum.ITEM},  # type: ignore[dict-item]
+            ),
+            None,
+            "xlsx",
+        )
+
+    assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
+
+
+def test_drop_condition_enum_uses_stable_identity_token_and_exact_singleton_thaw() -> None:
+    condition = _ImmutablePayloadEnum.ITEM
+    other = _ImmutablePayloadEnum.OTHER
+    first = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": condition}],
+        ),
+        None,
+        "xlsx",
+    )
+    same_reference = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": condition}],
+        ),
+        None,
+        "xlsx",
+    )
+    different_reference = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": other}],
+        ),
+        None,
+        "xlsx",
+    )
+    initial_hash = hash(first)
+
+    try:
+        condition.mutable_state = ["changed"]  # type: ignore[attr-defined]
+        _ImmutablePayloadEnum.__hash__ = lambda _self: 0  # type: ignore[assignment]
+        _ImmutablePayloadEnum.__eq__ = lambda _self, _other: True  # type: ignore[assignment]
+
+        assert hash(first) == initial_hash
+        assert first == same_reference
+        assert first != different_reference
+        assert first.thaw_drop_conditions()[0][1] is condition
+        assert condition.mutable_state == ["changed"]  # type: ignore[attr-defined]
+    finally:
+        del condition.mutable_state  # type: ignore[attr-defined]
+        del _ImmutablePayloadEnum.__hash__
+        del _ImmutablePayloadEnum.__eq__
 
 
 @pytest.mark.parametrize(
@@ -1368,7 +1677,7 @@ def test_mutable_primitive_subclass_is_not_retained_by_fast_path(value: object) 
 
 
 def test_nested_enum_payload_rejects_mutable_scalar_subclass() -> None:
-    with pytest.raises(TypeError, match="mutable Enum configuration value"):
+    with pytest.raises(TypeError, match="Enum values require drop-condition identity semantics"):
         compile_parse_plan(
             SheetConfig(
                 auto_detect=False,
