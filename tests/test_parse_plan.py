@@ -1054,6 +1054,18 @@ class _IdentityCondition:
         self.mutable_state = ["initial"]
 
 
+class _CustomNewValue:
+    def __new__(cls, value: str) -> _CustomNewValue:
+        del value
+        return super().__new__(cls)
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _CustomNewValue) and self.value == other.value
+
+
 def test_plan_thaws_fresh_values_with_original_supported_container_kinds() -> None:
     dataclass_value = _MutablePayload(["alpha"], {"codes": {1, 2}})
     object_value = _MutableObject(["original"])
@@ -1263,7 +1275,7 @@ def test_identity_equal_dataclass_drop_condition_filters_same_object_row() -> No
     filtered = frame[frame["value"] != comparison_value].reset_index(drop=True)
 
     assert comparison_value is condition
-    assert plan.drop_conditions[0][1] is condition
+    assert plan.drop_conditions[0][1] is not condition
     assert filtered["value"].tolist() == [other]
 
 
@@ -1280,6 +1292,24 @@ def test_c_backed_dataclass_is_rejected_before_hidden_state_is_lost() -> None:
             None,
             "xlsx",
         )
+
+
+def test_pure_python_custom_new_value_remains_snapshot_reconstructable() -> None:
+    payload = _CustomNewValue("target")
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": payload}],
+        ),
+        None,
+        "xlsx",
+    )
+
+    payload.value = "changed"
+    thawed = plan.thaw_drop_conditions()[0][1]
+
+    assert thawed == _CustomNewValue("target")
+    assert thawed is not payload
 
 
 def test_dataclass_snapshot_preserves_inherited_name_mangled_private_slot() -> None:
@@ -1325,10 +1355,54 @@ def test_identity_semantic_drop_condition_preserves_legacy_identity() -> None:
 
     assert filtered["value"].tolist() == [other]
     assert comparison_value is condition
-    assert plan.drop_conditions[0][1] is condition
+    assert plan.drop_conditions[0][1] is not condition
     assert type(condition).__eq__ is object.__eq__
     assert type(condition).__hash__ is object.__hash__
     assert hash(plan) == initial_hash
+
+
+def test_identity_drop_token_stabilizes_plan_hash_and_equality_against_class_mutation() -> None:
+    condition = _IdentityCondition()
+    other = _IdentityCondition()
+    first = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": condition}],
+        ),
+        None,
+        "xlsx",
+    )
+    same_reference = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": condition}],
+        ),
+        None,
+        "xlsx",
+    )
+    different_reference = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            drop_conditions=[{"column": "value", "value": other}],
+        ),
+        None,
+        "xlsx",
+    )
+    first_hash = hash(first)
+
+    def unstable_hash(_self: object) -> int:
+        raise AssertionError("plan hash must not delegate to a caller value")
+
+    try:
+        _IdentityCondition.__eq__ = lambda _self, _other: True  # type: ignore[method-assign]
+        _IdentityCondition.__hash__ = unstable_hash  # type: ignore[assignment]
+
+        assert hash(first) == first_hash
+        assert first == same_reference
+        assert first != different_reference
+    finally:
+        _IdentityCondition.__eq__ = object.__eq__  # type: ignore[method-assign]
+        _IdentityCondition.__hash__ = object.__hash__  # type: ignore[assignment]
 
 
 def test_opaque_c_backed_mutable_callable_is_rejected_before_backend_io() -> None:
@@ -1363,7 +1437,7 @@ def test_parse_plan_preserves_identity_sensitive_drop_condition_values() -> None
     filtered = frame[frame["status"] != comparison_value].reset_index(drop=True)
 
     assert filtered["status"].tolist() == [other]
-    assert plan.drop_conditions[0][1] is sentinel
+    assert plan.drop_conditions[0][1] is not sentinel
 
 
 @pytest.mark.parametrize("format_type", ["xlsx", "xlsm", "xltx", "xltm"])

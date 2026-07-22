@@ -8,7 +8,7 @@ projections consumed by the existing parsing and normalization layers.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, field, is_dataclass
 from enum import Enum
 from inspect import isbuiltin, isfunction
 from itertools import pairwise
@@ -123,6 +123,13 @@ class _FrozenComplex:
 
 
 @dataclass(frozen=True, slots=True)
+class _FrozenIdentityReference:
+    value_type: type[Any]
+    identity: int
+    reference: Any = field(compare=False, hash=False, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class _FrozenObject:
     object_type: type[Any]
     attribute_values: tuple[tuple[str, Any], ...]
@@ -173,8 +180,8 @@ class ParsePlan:
 
     Configuration values are projected to immutable tagged snapshots. Legacy
     consumers receive fresh deep projections through the ``thaw_*`` methods.
-    Drop operands with exact object identity equality/hash remain semantic
-    references because reconstruction would change the legacy comparison.
+    Drop operands with exact object identity equality/hash use immutable
+    identity tokens that thaw to the exact semantic reference.
     """
 
     # Projection for format handlers.
@@ -394,7 +401,7 @@ def _freeze(  # noqa: C901
     is_dataclass_instance = is_dataclass(value) and not isinstance(value, type)
     uses_identity_semantics = _uses_legacy_identity_semantics(value)
     if preserve_identity_reference and uses_identity_semantics:
-        return value
+        return _FrozenIdentityReference(type(value), id(value), value)
 
     identity = id(value)
     if identity in active:
@@ -472,6 +479,8 @@ def _thaw(value: Any) -> Any:  # noqa: C901
         return float.fromhex(value.hexadecimal)
     if isinstance(value, _FrozenComplex):
         return complex(_thaw(value.real), _thaw(value.imaginary))
+    if isinstance(value, _FrozenIdentityReference):
+        return value.reference
     if isinstance(value, FrozenDataclassValue):
         instance = object.__new__(value.dataclass_type)
         for name, item in value.attribute_values:
@@ -618,7 +627,27 @@ def _uses_legacy_identity_semantics(value: Any) -> bool:
 
 def _is_safely_reconstructable_python_object(value: Any) -> bool:
     """Reject C-backed values whose complete hidden state cannot be captured."""
-    return _raw_mro_attribute(type(value), "__new__") is object.__new__
+    return _has_object_allocation_layout(type(value), set())
+
+
+def _has_object_allocation_layout(
+    value_type: type[Any],
+    seen: set[type[Any]],
+) -> bool:
+    """Accept Python allocation overrides only over object-layout base types."""
+    if value_type is object or value_type in seen:
+        return True
+    seen.add(value_type)
+
+    namespace = vars(value_type)
+    if "__new__" in namespace:
+        allocator = namespace["__new__"]
+        if isinstance(allocator, staticmethod):
+            allocator = allocator.__func__
+        if allocator is not object.__new__ and not isfunction(allocator):
+            return False
+
+    return all(_has_object_allocation_layout(base, seen) for base in value_type.__bases__)
 
 
 def _raw_mro_attribute(value_type: type[Any], name: str) -> Any:
