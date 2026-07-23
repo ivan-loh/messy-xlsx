@@ -755,6 +755,28 @@ def test_dense_million_row_encoded_columns_use_metadata_validity_fast_path(
     assert max(validity_buffer_bytes, default=0) <= 64
 
 
+def test_dense_plain_column_avoids_later_million_row_dictionary_reference_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dense = pa.repeat(pa.scalar(1, type=pa.int64()), 1_000_000)
+    dictionary = pa.DictionaryArray.from_arrays(
+        pa.repeat(pa.scalar(1, type=pa.int8()), 1_000_000),
+        pa.array([None, 7], type=pa.int64()),
+    )
+    batch = pa.record_batch([dense, dictionary], names=["dense", "encoded"])
+    unique_input_lengths: list[int] = []
+    real_unique = encoded.pc.unique
+
+    def counted_unique(values: pa.Array) -> pa.Array:
+        unique_input_lengths.append(len(values))
+        return real_unique(values)
+
+    monkeypatch.setattr(encoded.pc, "unique", counted_unique)
+
+    assert arrow_pipeline._drop_all_null_rows(batch) is batch
+    assert unique_input_lengths == []
+
+
 @pytest.mark.parametrize(
     "operation",
     [

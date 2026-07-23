@@ -54,6 +54,11 @@ def encoded_has_no_logical_nulls(array: pa.Array) -> bool:
     return _has_no_logical_nulls(array, 0, [MAX_ENCODED_NODES])
 
 
+def validate_encoded_physical_buffers(array: pa.Array) -> None:
+    """Validate encoded physical limits without resolving logical references."""
+    _validate_physical_buffer_budget(array)
+
+
 def filter_encoded(array: pa.Array, keep: pa.BooleanArray) -> pa.Array:
     """Filter an array while retaining any recursive dictionary/REE type."""
     if len(array) != len(keep):
