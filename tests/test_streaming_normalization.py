@@ -748,6 +748,138 @@ def test_dense_million_row_encoded_columns_use_metadata_validity_fast_path(
 
 
 @pytest.mark.parametrize(
+    "operation",
+    [
+        "logical-view",
+        "logical-validity",
+        "logical-density",
+        "end-to-end",
+        "ree-filter",
+        "ree-direct-filter",
+        "ree-mask",
+        "dictionary-filter",
+        "dictionary-mask",
+    ],
+)
+def test_encoded_operations_reject_oversized_retained_root_buffers(
+    operation: str,
+) -> None:
+    root = pa.array(range(2_000_000), type=pa.int64())
+    tiny_slice = root.slice(0, 1)
+    run_values = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1], type=pa.int16()),
+        tiny_slice,
+    )
+    dictionary_values = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        tiny_slice,
+    )
+    keep = pa.array([True])
+    mask = pa.array([False])
+    batch = pa.record_batch([run_values], names=["value"])
+    calls: dict[str, Any] = {
+        "logical-view": lambda: encoded.encoded_logical_view(run_values),
+        "logical-validity": lambda: encoded.encoded_logical_validity(run_values),
+        "logical-density": lambda: encoded.encoded_has_no_logical_nulls(run_values),
+        "end-to-end": lambda: arrow_pipeline._drop_all_null_rows(batch),
+        "ree-filter": lambda: encoded.filter_encoded(run_values, keep),
+        "ree-direct-filter": lambda: encoded.filter_run_end_encoded(run_values, keep),
+        "ree-mask": lambda: encoded.mask_encoded(run_values, mask),
+        "dictionary-filter": lambda: encoded.filter_encoded(dictionary_values, keep),
+        "dictionary-mask": lambda: encoded.mask_encoded(dictionary_values, mask),
+    }
+
+    assert tiny_slice.nbytes == 8
+    assert run_values.nbytes < 100
+    assert dictionary_values.nbytes < 100
+    with pytest.raises(ValueError, match="logical-view byte limit"):
+        calls[operation]()
+
+
+def test_encoded_buffer_budget_deduplicates_shared_roots_and_preserves_identity() -> None:
+    shared = pa.repeat(
+        pa.scalar(0, type=pa.int8()),
+        encoded.MAX_ENCODED_VIEW_BYTES // 2 + 1,
+    )
+    values = pa.DictionaryArray.from_arrays(
+        shared.slice(0, 1),
+        shared.slice(1, 1),
+    )
+    keep = pa.array([True])
+    mask = pa.array([False])
+
+    assert encoded.encoded_has_no_logical_nulls(values)
+    assert encoded.filter_encoded(values, keep) is values
+    assert encoded.mask_encoded(values, mask) is values
+
+
+def test_encoded_buffer_budget_counts_alternating_children_root_buffers() -> None:
+    root = pa.array(range(2_000_000), type=pa.int64())
+    leaf_dictionary = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        root.slice(0, 1),
+    )
+    nested_runs = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1], type=pa.int16()),
+        leaf_dictionary,
+    )
+    values = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        nested_runs,
+    )
+
+    with pytest.raises(ValueError, match="logical-view byte limit"):
+        encoded.encoded_has_no_logical_nulls(values)
+
+
+def test_encoded_buffer_budget_applies_to_root_size_at_the_exact_boundary() -> None:
+    accepted_root = pa.array(
+        range((encoded.MAX_ENCODED_VIEW_BYTES - 8) // 8),
+        type=pa.int64(),
+    )
+    accepted = pa.DictionaryArray.from_arrays(
+        pa.repeat(pa.scalar(0, type=pa.int8()), 8),
+        accepted_root,
+    )
+    rejected_root = pa.array(
+        range(encoded.MAX_ENCODED_VIEW_BYTES // 8),
+        type=pa.int64(),
+    )
+    rejected_slice = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        rejected_root.slice(0, 1),
+    )
+
+    assert accepted.nbytes == encoded.MAX_ENCODED_VIEW_BYTES
+    assert rejected_slice.nbytes < 100
+    assert encoded.encoded_logical_view(accepted).to_pylist() == [0] * 8
+    with pytest.raises(ValueError, match="logical-view byte limit"):
+        encoded.encoded_logical_view(rejected_slice)
+
+
+def test_encoded_buffer_accounting_has_depth_and_node_traversal_guards() -> None:
+    deep: pa.Array = pa.array([1], type=pa.int8())
+    for _ in range(encoded.MAX_ENCODED_DEPTH + 1):
+        deep = pa.DictionaryArray.from_arrays(
+            pa.array([0], type=pa.int8()),
+            deep,
+        )
+    wide = pa.StructArray.from_arrays(
+        [pa.array([index], type=pa.int16()) for index in range(encoded.MAX_ENCODED_NODES + 1)],
+        names=[f"field_{index}" for index in range(encoded.MAX_ENCODED_NODES + 1)],
+    )
+    wide_encoded = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        wide,
+    )
+
+    with pytest.raises(ValueError, match="logical-view structural limits"):
+        encoded.encoded_has_no_logical_nulls(deep)
+    with pytest.raises(ValueError, match="logical-view structural limits"):
+        encoded.encoded_has_no_logical_nulls(wide_encoded)
+
+
+@pytest.mark.parametrize(
     ("indices", "dictionary", "expected"),
     [
         ([0, 1], [None, 7], [7]),

@@ -51,6 +51,8 @@ def filter_encoded(array: pa.Array, keep: pa.BooleanArray) -> pa.Array:
     """Filter an array while retaining any recursive dictionary/REE type."""
     if len(array) != len(keep):
         raise ValueError("encoded filter mask length must match the logical slice")
+    if isinstance(array, (pa.DictionaryArray, pa.RunEndEncodedArray)):
+        _validate_physical_buffer_budget(array)
     safe_keep = cast("pa.BooleanArray", pc.fill_null(keep, False))
     if pc.all(safe_keep).as_py() is True:
         return array
@@ -63,6 +65,8 @@ def mask_encoded(array: pa.Array, mask: pa.BooleanArray) -> pa.Array:
     """Replace selected logical values with null while retaining encoded type."""
     if len(array) != len(mask):
         raise ValueError("encoded mask length must match the logical slice")
+    if isinstance(array, (pa.DictionaryArray, pa.RunEndEncodedArray)):
+        _validate_physical_buffer_budget(array)
     safe_mask = cast("pa.BooleanArray", pc.fill_null(mask, False))
     if pc.any(safe_mask).as_py() is not True:
         return array
@@ -100,6 +104,7 @@ def filter_run_end_encoded(
     """Filter a bounded REE slice while retaining its recursive encoded type."""
     if len(array) != len(keep):
         raise ValueError("REE filter mask length must match the logical slice")
+    _validate_physical_buffer_budget(array)
     encoded_logical_type(array.type)
     safe_keep = cast("pa.BooleanArray", pc.fill_null(keep, False))
     return _filter_run_end_encoded(array, safe_keep, 0, [MAX_ENCODED_NODES])
@@ -107,6 +112,7 @@ def filter_run_end_encoded(
 
 def trim_run_end_encoded(array: pa.RunEndEncodedArray) -> pa.RunEndEncodedArray:
     """Return only intersecting runs, rebased to the current logical slice."""
+    _validate_physical_buffer_budget(array)
     physical_offset = array.find_physical_offset()
     physical_length = array.find_physical_length()
     run_values = array.values.slice(physical_offset, physical_length)
@@ -462,6 +468,76 @@ def _consume_projection_budget(
 ) -> None:
     if depth > MAX_ENCODED_DEPTH or budget[0] < 1:
         raise ValueError("encoded array exceeds logical-view structural limits")
-    if array.nbytes > MAX_ENCODED_VIEW_BYTES:
-        raise ValueError("encoded array exceeds logical-view byte limit")
+    _validate_physical_buffer_budget(array)
     budget[0] -= 1
+
+
+def _validate_physical_buffer_budget(array: pa.Array) -> None:
+    seen_buffers: set[tuple[int, int]] = set()
+    buffer_bytes = _unique_physical_buffer_bytes(
+        array,
+        seen_buffers,
+        0,
+        [MAX_ENCODED_NODES],
+    )
+    if buffer_bytes > MAX_ENCODED_VIEW_BYTES:
+        raise ValueError("encoded array exceeds logical-view byte limit")
+
+
+def _unique_physical_buffer_bytes(
+    array: pa.Array,
+    seen_buffers: set[tuple[int, int]],
+    depth: int,
+    budget: list[int],
+) -> int:
+    if depth > MAX_ENCODED_DEPTH or budget[0] < 1:
+        raise ValueError("encoded array exceeds logical-view structural limits")
+    budget[0] -= 1
+    total = _unique_root_buffer_bytes(array, seen_buffers)
+    for child in _physical_child_arrays(array):
+        total += _unique_physical_buffer_bytes(
+            child,
+            seen_buffers,
+            depth + 1,
+            budget,
+        )
+    return total
+
+
+def _unique_root_buffer_bytes(
+    array: pa.Array,
+    seen_buffers: set[tuple[int, int]],
+) -> int:
+    total = 0
+    for original_buffer in array.buffers():
+        if original_buffer is None:
+            continue
+        buffer = original_buffer
+        while buffer.parent is not None:
+            buffer = buffer.parent
+        identity = (buffer.address, buffer.size)
+        if identity not in seen_buffers:
+            seen_buffers.add(identity)
+            total += buffer.size
+    return total
+
+
+def _physical_child_arrays(array: pa.Array) -> tuple[pa.Array, ...]:
+    if isinstance(array, pa.DictionaryArray):
+        return (array.dictionary,)
+    if isinstance(array, pa.ExtensionArray):
+        return (array.storage,)
+    if (
+        pa.types.is_list(array.type)
+        or pa.types.is_large_list(array.type)
+        or pa.types.is_fixed_size_list(array.type)
+        or pa.types.is_list_view(array.type)
+        or pa.types.is_large_list_view(array.type)
+        or pa.types.is_map(array.type)
+    ):
+        return (array.values,)
+    if pa.types.is_struct(array.type) or pa.types.is_union(array.type):
+        return tuple(array.field(index) for index in range(array.type.num_fields))
+    if isinstance(array, pa.RunEndEncodedArray):
+        return (array.run_ends, array.values)
+    return ()
