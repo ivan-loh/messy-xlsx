@@ -128,7 +128,7 @@ class ArrowNormalizationOperation:
         rule: ColumnNormalization,
         row_base: int,
     ) -> pa.Array:
-        array = _decode_dictionary_strings(array)
+        array = _decode_encoded_strings(array)
         if pa.types.is_null(rule.output_type):
             return self._normalize_null_column(array, rule, row_base)
         if (
@@ -400,13 +400,19 @@ def _normalize_arrow_column(
     return None
 
 
-def _decode_dictionary_strings(array: pa.Array) -> pa.Array:
-    if not isinstance(array, pa.DictionaryArray):
-        return array
-    value_type = cast("pa.DictionaryType", array.type).value_type
-    if not (pa.types.is_string(value_type) or pa.types.is_large_string(value_type)):
-        return array
-    return cast("pa.Array", pc.dictionary_decode(array))
+def _decode_encoded_strings(array: pa.Array) -> pa.Array:
+    if isinstance(array, pa.RunEndEncodedArray):
+        value_type = cast("pa.RunEndEncodedType", array.type).value_type
+        if pa.types.is_dictionary(value_type):
+            value_type = cast("pa.DictionaryType", value_type).value_type
+        if not (pa.types.is_string(value_type) or pa.types.is_large_string(value_type)):
+            return array
+        array = _decode_run_end_encoded(array)
+    if isinstance(array, pa.DictionaryArray):
+        value_type = cast("pa.DictionaryType", array.type).value_type
+        if pa.types.is_string(value_type) or pa.types.is_large_string(value_type):
+            return cast("pa.Array", pc.dictionary_decode(array))
+    return array
 
 
 def _close_owned_reader(reader: object) -> None:
@@ -748,23 +754,73 @@ def _drop_all_null_rows(batch: pa.RecordBatch) -> pa.RecordBatch:
         if not isinstance(column, pa.RunEndEncodedArray):
             arrays.append(cast("pa.Array", pc.filter(column, keep)))
             continue
-        decoded = cast("pa.Array", pc.run_end_decode(column))
-        filtered = cast("pa.Array", pc.filter(decoded, keep))
-        run_end_type = cast("pa.RunEndEncodedType", column.type).run_end_type
-        arrays.append(pc.run_end_encode(filtered, run_end_type=run_end_type))
+        arrays.append(_filter_run_end_encoded(column, keep))
     return _record_batch(arrays, batch.schema, len(arrays[0]))
 
 
 def _has_no_logical_nulls(array: pa.Array) -> bool:
     if isinstance(array, pa.RunEndEncodedArray):
-        return bool(array.values.null_count == 0)
+        return _has_no_logical_nulls(array.values)
+    if isinstance(array, pa.DictionaryArray):
+        if array.null_count:
+            return False
+        if array.dictionary.null_count == 0:
+            return True
+        return pc.all(_dictionary_logical_validity(array)).as_py() is True
     return bool(array.null_count == 0)
 
 
 def _logical_validity(array: pa.Array) -> pa.BooleanArray:
     if isinstance(array, pa.RunEndEncodedArray):
-        array = cast("pa.Array", pc.run_end_decode(array))
+        run_validity = _logical_validity(array.values)
+        encoded = pa.RunEndEncodedArray.from_arrays(array.run_ends, run_validity)
+        decoded = cast("pa.BooleanArray", pc.run_end_decode(encoded))
+        return decoded.slice(array.offset, len(array))
+    if isinstance(array, pa.DictionaryArray):
+        return _dictionary_logical_validity(array)
     return cast("pa.BooleanArray", pc.is_valid(array))
+
+
+def _dictionary_logical_validity(array: pa.DictionaryArray) -> pa.BooleanArray:
+    dictionary_validity = pc.is_valid(array.dictionary)
+    referenced_validity = pc.take(dictionary_validity, array.indices)
+    return cast("pa.BooleanArray", pc.fill_null(referenced_validity, False))
+
+
+def _filter_run_end_encoded(
+    array: pa.RunEndEncodedArray,
+    keep: pa.BooleanArray,
+) -> pa.RunEndEncodedArray:
+    decoded = _decode_run_end_encoded(array)
+    filtered = cast("pa.Array", pc.filter(decoded, keep))
+    run_end_type = cast("pa.RunEndEncodedType", array.type).run_end_type
+    if not isinstance(filtered, pa.DictionaryArray):
+        return pc.run_end_encode(filtered, run_end_type=run_end_type)
+    encoded_indices = pc.run_end_encode(filtered.indices, run_end_type=run_end_type)
+    run_values = pa.DictionaryArray.from_arrays(
+        encoded_indices.values,
+        filtered.dictionary,
+        ordered=cast("pa.DictionaryType", filtered.type).ordered,
+    )
+    return pa.RunEndEncodedArray.from_arrays(encoded_indices.run_ends, run_values)
+
+
+def _decode_run_end_encoded(array: pa.RunEndEncodedArray) -> pa.Array:
+    if not isinstance(array.values, pa.DictionaryArray):
+        return cast("pa.Array", pc.run_end_decode(array))
+    index_runs = pa.RunEndEncodedArray.from_arrays(
+        array.run_ends,
+        array.values.indices,
+    )
+    decoded_indices = cast("pa.Array", pc.run_end_decode(index_runs)).slice(
+        array.offset,
+        len(array),
+    )
+    return pa.DictionaryArray.from_arrays(
+        decoded_indices,
+        array.values.dictionary,
+        ordered=cast("pa.DictionaryType", array.values.type).ordered,
+    )
 
 
 def _apply_regex_filter(
@@ -937,11 +993,11 @@ def _safe_display_label(value: object) -> str:
 
 
 def _safe_value_description(value: object) -> str:
-    if isinstance(value, str):
-        return f"str(length={len(value)})"
-    if isinstance(value, bytes):
-        return f"bytes(length={len(value)})"
     value_type = type(value)
+    if value_type is str:
+        return f"str(length={len(cast('str', value))})"
+    if value_type is bytes:
+        return f"bytes(length={len(cast('bytes', value))})"
     if (
         value_type is int
         or value_type is float

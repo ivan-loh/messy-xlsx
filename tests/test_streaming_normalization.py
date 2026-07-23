@@ -289,6 +289,121 @@ def test_compiler_uses_bounded_values_not_only_names(
     assert compiled.schema.types == [expected_type]
 
 
+@pytest.mark.parametrize("sanitize", [False, True])
+@pytest.mark.parametrize(
+    ("values", "label", "expected_type"),
+    [
+        (["Jan 1 2024", "Jan 2 2024"], "event_date", pa.timestamp("us")),
+        (["Jan 1 2024", "Jan 2 2024"], b"event_date", pa.timestamp("us")),
+        (
+            ["Jan 1 2024", "Jan 2 2024"],
+            (b"event_date", ("kind", 1, True, 1.0)),
+            pa.timestamp("us"),
+        ),
+        (["001", "002"], b"phone", pa.string()),
+        (["001", "002"], (b"phone",), pa.string()),
+    ],
+)
+def test_safe_non_string_labels_participate_in_legacy_name_inference(
+    sanitize: bool,
+    values: list[str],
+    label: object,
+    expected_type: pa.DataType,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(values),), (label,)),
+        _parse_plan(sanitize_column_names=sanitize),
+    )
+
+    assert normalization_plan._safe_name_text(label) == str(label)
+    assert compiled.schema.types == [expected_type]
+    assert compiled.source_label_tokens == (normalization_plan._display_label_token(label),)
+
+
+def test_type_distinct_safe_name_projections_keep_distinct_label_tokens() -> None:
+    values = pa.array(["Jan 1 2024", "Jan 2 2024"])
+    labels = (b"event_date", "event_date", (b"event_date",))
+    compiled = compile_normalization_plan(
+        _sample((values, values, values), labels),
+        _parse_plan(),
+    )
+
+    assert compiled.schema.types == [pa.timestamp("us")] * 3
+    assert len(set(compiled.source_label_tokens)) == 3
+    assert compiled.source_display_names == labels
+
+
+@pytest.mark.parametrize("sanitize", [False, True])
+def test_unsafe_tuple_member_is_excluded_from_name_inference_without_callbacks(
+    sanitize: bool,
+) -> None:
+    callbacks: list[str] = []
+
+    class UnsafeMember:
+        def __repr__(self) -> str:
+            callbacks.append("repr")
+            raise AssertionError("unsafe tuple member must not be rendered")
+
+        def __str__(self) -> str:
+            callbacks.append("str")
+            raise AssertionError("unsafe tuple member must not be rendered")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("format")
+            raise AssertionError("unsafe tuple member must not be rendered")
+
+    member = UnsafeMember()
+    member_ref = weakref.ref(member)
+    sample = _sample(
+        (pa.array(["Jan 1 2024", "Jan 2 2024"]),),
+        ((b"event_date", member),),
+    )
+
+    compiled = compile_normalization_plan(
+        sample,
+        _parse_plan(sanitize_column_names=sanitize),
+    )
+
+    assert compiled.schema.types == [pa.string()]
+    assert callbacks == []
+    del sample, member
+    gc.collect()
+    assert member_ref() is None
+
+
+def test_unsafe_timezone_tuple_member_is_excluded_from_name_inference() -> None:
+    callbacks: list[str] = []
+
+    class UnsafeTimezone(tzinfo):
+        def utcoffset(self, _value: datetime | None) -> timedelta:
+            callbacks.append("utcoffset")
+            raise AssertionError("unsafe timezone must not execute")
+
+        def dst(self, _value: datetime | None) -> timedelta:
+            callbacks.append("dst")
+            raise AssertionError("unsafe timezone must not execute")
+
+        def tzname(self, _value: datetime | None) -> str:
+            callbacks.append("tzname")
+            raise AssertionError("unsafe timezone must not execute")
+
+    unsafe_timezone = UnsafeTimezone()
+    unsafe_timezone_ref = weakref.ref(unsafe_timezone)
+    label = (
+        b"event_date",
+        datetime(2024, 1, 1, tzinfo=unsafe_timezone),
+    )
+    sample = _sample((pa.array(["Jan 1 2024", "Jan 2 2024"]),), (label,))
+
+    compiled = compile_normalization_plan(sample, _parse_plan())
+
+    assert compiled.schema.types == [pa.string()]
+    assert callbacks == []
+    del sample, label, unsafe_timezone
+    gc.collect()
+    assert unsafe_timezone_ref() is None
+
+
 def test_compiler_preserves_native_numeric_for_text_hint_and_native_bool() -> None:
     sample = _sample(
         (pa.array([1, 2], type=pa.int64()), pa.array([True, False])),
@@ -576,6 +691,62 @@ def test_run_end_encoded_logical_nulls_do_not_take_the_dense_shortcut() -> None:
     assert all_null_result.num_rows == 0
     assert all_null_result.schema.equals(all_null_batch.schema, check_metadata=True)
     assert arrow_pipeline._drop_all_null_rows(dense_batch) is dense_batch
+
+
+@pytest.mark.parametrize(
+    ("indices", "dictionary", "expected"),
+    [
+        ([0, 1], [None, 7], [7]),
+        ([0, 0], [None], []),
+        ([None, 0], [7], [7]),
+    ],
+)
+def test_dictionary_logical_nulls_participate_in_all_null_row_filtering(
+    indices: list[int | None],
+    dictionary: list[int | None],
+    expected: list[int],
+) -> None:
+    values = pa.DictionaryArray.from_arrays(
+        pa.array(indices, type=pa.int8()),
+        pa.array(dictionary, type=pa.int64()),
+    )
+    batch = pa.record_batch([values], names=["value"])
+
+    result = arrow_pipeline._drop_all_null_rows(batch)
+
+    assert result.column(0).to_pylist() == expected
+    assert result.schema.equals(batch.schema, check_metadata=True)
+
+
+def test_unreferenced_null_dictionary_value_preserves_batch_identity() -> None:
+    values = pa.DictionaryArray.from_arrays(
+        pa.array([1, 1], type=pa.int8()),
+        pa.array([None, 7], type=pa.int64()),
+    )
+    batch = pa.record_batch([values], names=["value"])
+
+    result = arrow_pipeline._drop_all_null_rows(batch)
+
+    assert result is batch
+    assert result.column(0).indices.buffers()[1].address == values.indices.buffers()[1].address
+
+
+def test_run_end_encoded_dictionary_logical_nulls_keep_stable_schema() -> None:
+    run_values = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1], type=pa.int8()),
+        pa.array([None, 7], type=pa.int64()),
+    )
+    values = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 3], type=pa.int16()),
+        run_values,
+    )
+    batch = pa.record_batch([values], names=["value"])
+
+    result = arrow_pipeline._drop_all_null_rows(batch)
+
+    assert result.column(0).to_pylist() == [7, 7]
+    assert result.schema.equals(batch.schema, check_metadata=True)
+    assert result.column(0).type == values.type
 
 
 def test_late_value_uses_global_input_offset_across_filtered_rows() -> None:
@@ -1302,6 +1473,125 @@ def test_boolean_numeric_conditions_match_characterized_pandas_equality(
     assert result.column(0).to_pylist() == expected
 
 
+@pytest.mark.parametrize(
+    ("values", "operand", "expected"),
+    [
+        (pa.array([1, 2], type=pa.int64()), Decimal("1"), [2]),
+        (pa.array([1.5, 2.5], type=pa.float64()), Decimal("1.5"), [2.5]),
+        (
+            pa.array([Decimal("1.5"), Decimal("2.5")], type=pa.decimal128(3, 1)),
+            1.5,
+            [Decimal("2.5")],
+        ),
+        (pa.array([True, False]), Decimal("1"), [False]),
+        (
+            pa.array([Decimal("1.0"), Decimal("2.0")], type=pa.decimal128(3, 1)),
+            True,
+            [Decimal("2.0")],
+        ),
+    ],
+)
+def test_decimal_numeric_conditions_match_characterized_pandas_equality(
+    values: pa.Array,
+    operand: object,
+    expected: list[object],
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(drop_conditions=[{"column": "value", "value": operand}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == expected
+
+
+@pytest.mark.parametrize(
+    ("values", "operand"),
+    [
+        (pa.array([1, 2], type=pa.int8()), Decimal("1.5")),
+        (pa.array([1, 2], type=pa.int8()), Decimal("128")),
+        (pa.array([0.1, 0.2], type=pa.float64()), Decimal("0.1")),
+        (pa.array([1.0, 2.0], type=pa.float64()), Decimal("NaN")),
+        (
+            pa.array([Decimal("0.1"), Decimal("0.2")], type=pa.decimal128(3, 1)),
+            0.1,
+        ),
+        (
+            pa.array([Decimal("1.0"), Decimal("2.0")], type=pa.decimal128(3, 1)),
+            float("inf"),
+        ),
+    ],
+)
+def test_unsafe_numeric_condition_conversions_are_harmless_non_matches(
+    values: pa.Array,
+    operand: object,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(drop_conditions=[{"column": "value", "value": operand}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == values.to_pylist()
+    assert compiled.drop_conditions[0].operands == (None,)
+
+
+def test_decimal_condition_preserves_duplicate_label_positional_masking() -> None:
+    arrays = (
+        pa.array([1, 2], type=pa.int64()),
+        pa.array([1, 3], type=pa.int64()),
+    )
+    compiled = compile_normalization_plan(
+        _sample(arrays, ("value", "value")),
+        _parse_plan(drop_conditions=[{"column": "value", "value": Decimal("1")}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch(list(arrays), schema=compiled.input_schema)
+    )
+
+    assert result.to_pydict() == {"0": [None, 2], "1": [None, 3]}
+
+
+def test_hostile_numeric_subclass_condition_is_never_executed_or_retained() -> None:
+    callbacks: list[str] = []
+
+    class HostileDecimal(Decimal):
+        def __float__(self) -> float:
+            callbacks.append("float")
+            raise AssertionError("hostile numeric conversion")
+
+        def __int__(self) -> int:
+            callbacks.append("int")
+            raise AssertionError("hostile numeric conversion")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("eq")
+            raise AssertionError("hostile numeric comparison")
+
+        def __hash__(self) -> int:
+            callbacks.append("hash")
+            raise AssertionError("hostile numeric hashing")
+
+    operand = HostileDecimal("1")
+    operand_ref = weakref.ref(operand)
+
+    snapshot = normalization_plan._snapshot_condition_value(operand)
+
+    assert isinstance(snapshot, tuple)
+    assert snapshot[:1] == ("unsupported",)
+    assert callbacks == []
+    del operand
+    gc.collect()
+    assert operand_ref() is None
+
+
 def test_duplicate_subset_condition_raises_after_prior_condition_drops_every_row() -> None:
     sample = _sample(
         (pa.array(["drop"]), pa.array(["drop"]), pa.array(["x"])),
@@ -1942,6 +2232,100 @@ def test_hostile_metaclass_hash_is_not_used_for_label_classification(
     del sample, label
     gc.collect()
     assert label_ref() is None
+
+
+@pytest.mark.parametrize(
+    ("hostile_type", "expected"),
+    [
+        (type("HostileText", (str,), {}), "unsupported value"),
+        (type("HostileBytes", (bytes,), {}), "unsupported value"),
+    ],
+)
+def test_safe_value_description_accepts_only_exact_builtin_primitives(
+    hostile_type: type[object],
+    expected: str,
+) -> None:
+    callbacks: list[str] = []
+
+    def hostile_len(_self: object) -> int:
+        callbacks.append("len")
+        raise RuntimeError("hostile length")
+
+    hostile_type.__len__ = hostile_len  # type: ignore[attr-defined]
+    raw_value = b"secret" if issubclass(hostile_type, bytes) else "secret"
+    value = hostile_type(raw_value)
+    value_ref = None if isinstance(value, bytes) else weakref.ref(value)
+
+    assert arrow_pipeline._safe_value_description(value) == expected
+    assert arrow_pipeline._safe_value_description("safe") == "str(length=4)"
+    assert arrow_pipeline._safe_value_description(b"safe") == "bytes(length=4)"
+    assert callbacks == []
+
+    del value
+    gc.collect()
+    assert value_ref is None or value_ref() is None
+
+
+def test_late_extension_scalar_error_description_is_sanitized_without_callbacks() -> None:
+    callbacks: list[str] = []
+    value_refs: list[weakref.ReferenceType[object]] = []
+
+    class HostileText(str):
+        def __len__(self) -> int:
+            callbacks.append("len")
+            raise RuntimeError("hostile length")
+
+    class HostileScalar(pa.ExtensionScalar):
+        def as_py(self, **_kwargs: object) -> object:
+            value = HostileText(self.value.as_py())
+            value_refs.append(weakref.ref(value))
+            return value
+
+    class HostileTextType(pa.ExtensionType):
+        def __init__(self) -> None:
+            super().__init__(pa.string(), "test.hostile-text-value")
+
+        def __arrow_ext_serialize__(self) -> bytes:
+            return b""
+
+        @classmethod
+        def __arrow_ext_deserialize__(
+            cls,
+            _storage_type: pa.DataType,
+            _serialized: bytes,
+        ) -> HostileTextType:
+            return cls()
+
+        def __arrow_ext_scalar_class__(self) -> type[pa.ExtensionScalar]:
+            return HostileScalar
+
+    extension_type = HostileTextType()
+    sample_values = pa.ExtensionArray.from_storage(extension_type, pa.array(["1"]))
+    late_values = pa.ExtensionArray.from_storage(extension_type, pa.array(["bad"]))
+    compiled = compile_normalization_plan(
+        _sample((sample_values,), ("amount",)),
+        _parse_plan(type_hints={"amount": "INTEGER"}),
+    )
+    operation = ArrowNormalizationOperation(compiled)
+
+    with pytest.raises(StreamingTypeError) as captured:
+        operation.normalize(
+            pa.record_batch([late_values], schema=compiled.input_schema),
+        )
+
+    assert captured.value.context == {
+        "ordinal": 0,
+        "display_label": "str label(length=6)",
+        "row_offset": 0,
+        "value_description": "unsupported value",
+        "expected_type": "int64",
+    }
+    assert callbacks == []
+
+    del captured, operation
+    gc.collect()
+    assert value_refs
+    assert all(value_ref() is None for value_ref in value_refs)
 
 
 def test_hostile_metaclass_hash_is_not_used_for_condition_snapshotting() -> None:
@@ -3083,6 +3467,98 @@ def test_shared_string_dictionary_columns_normalize_independently() -> None:
         "0": ["alpha", None, None],
         "1": ["alpha", "alpha", "alpha"],
     }
+
+
+def test_run_end_encoded_strings_match_plain_normalization_across_late_batches() -> None:
+    encoded = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2, 4], type=pa.int16()),
+        pa.array(["  alpha  ", "NA", None]),
+    )
+    plain = pa.array(encoded.to_pylist(), type=pa.string())
+    encoded_plan = compile_normalization_plan(
+        _sample((encoded,), ("value",)),
+        _parse_plan(batch_size=4),
+    )
+    plain_plan = compile_normalization_plan(
+        _sample((plain,), ("value",)),
+        _parse_plan(batch_size=4),
+    )
+    encoded_operation = ArrowNormalizationOperation(encoded_plan)
+    plain_operation = ArrowNormalizationOperation(plain_plan)
+
+    encoded_result = encoded_operation.normalize(
+        pa.record_batch([encoded], schema=encoded_plan.input_schema)
+    )
+    plain_result = plain_operation.normalize(
+        pa.record_batch([plain], schema=plain_plan.input_schema)
+    )
+    late_encoded = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2, 4], type=pa.int16()),
+        pa.array(["  beta  ", "NA", None]),
+    )
+    late_plain = pa.array(late_encoded.to_pylist(), type=pa.string())
+    encoded_late_result = encoded_operation.normalize(
+        pa.record_batch([late_encoded], schema=encoded_plan.input_schema)
+    )
+    plain_late_result = plain_operation.normalize(
+        pa.record_batch([late_plain], schema=plain_plan.input_schema)
+    )
+
+    assert encoded_plan.schema == plain_plan.schema == pa.schema([("0", pa.string())])
+    assert encoded_result.to_pydict() == plain_result.to_pydict() == {"0": ["alpha"]}
+    assert encoded_late_result.to_pydict() == plain_late_result.to_pydict() == {"0": ["beta"]}
+
+
+def test_run_end_encoded_string_locale_inference_matches_plain_evidence() -> None:
+    encoded = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2], type=pa.int16()),
+        pa.array(["1,00", "2,00"]),
+    )
+    plain = pa.array(encoded.to_pylist(), type=pa.string())
+    encoded_plan = compile_normalization_plan(
+        _sample((encoded,), ("amount",)),
+        _parse_plan(),
+    )
+    plain_plan = compile_normalization_plan(
+        _sample((plain,), ("amount",)),
+        _parse_plan(),
+    )
+
+    encoded_result = ArrowNormalizationOperation(encoded_plan).normalize(
+        pa.record_batch([encoded], schema=encoded_plan.input_schema)
+    )
+
+    assert encoded_plan.schema == plain_plan.schema
+    assert encoded_plan.columns[0].decimal_separator == ","
+    assert encoded_result.column(0).to_pylist() == [1.0, 2.0]
+
+
+def test_normalize_false_preserves_run_end_encoded_string_identity() -> None:
+    values = pa.RunEndEncodedArray.from_arrays(
+        pa.array([2], type=pa.int16()),
+        pa.array(["  unchanged  "]),
+    )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(normalize=False),
+    )
+    batch = pa.record_batch([values], schema=compiled.input_schema)
+
+    result = ArrowNormalizationOperation(compiled).normalize(batch)
+
+    assert compiled.schema == compiled.input_schema
+    assert result is batch
+    assert result.column(0).type == values.type
+
+
+def test_sample_budget_counts_run_end_encoded_string_value_buffers() -> None:
+    values = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1], type=pa.int16()),
+        pa.array(["x" * (MAX_SAMPLE_BYTES + 1)]),
+    )
+
+    with pytest.raises(ValueError, match="bytes"):
+        _sample((values,), ("value",))
 
 
 @pytest.mark.parametrize(

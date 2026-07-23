@@ -301,6 +301,9 @@ def compile_normalization_plan(
     source_names = tuple(
         _snapshot_display_name(identity.display_name) for identity in sample.column_identities
     )
+    source_name_texts = tuple(
+        _safe_name_text(identity.display_name) for identity in sample.column_identities
+    )
     source_names_sanitizable = tuple(
         _is_sanitizable_display_name(identity.display_name) for identity in sample.column_identities
     )
@@ -336,11 +339,12 @@ def compile_normalization_plan(
     )
     rules: list[ColumnNormalization] = []
     fields: list[pa.Field] = []
-    for ordinal, (schema_field, values, source_name, final_name) in enumerate(
+    for ordinal, (schema_field, values, source_name, source_name_text, final_name) in enumerate(
         zip(
             sample.schema,
             sample.columns,
             source_names,
+            source_name_texts,
             final_names,
             strict=True,
         )
@@ -350,7 +354,7 @@ def compile_normalization_plan(
         decision = _compile_column_decision(
             schema_field.type,
             values,
-            source_name,
+            source_name_text,
             explicit_hint,
             normalize=plan.normalize,
             enabled_stages=enabled_stages,
@@ -488,32 +492,49 @@ def _compile_condition_operand(
         return None
 
 
-def _condition_value_matches_type(value: object, output_type: pa.DataType) -> bool:
+def _condition_value_matches_type(  # noqa: C901
+    value: object,
+    output_type: pa.DataType,
+) -> bool:
     value_type = type(value)
     if pa.types.is_string(output_type) or pa.types.is_large_string(output_type):
         return value_type is str
     if pa.types.is_binary(output_type) or pa.types.is_large_binary(output_type):
         return value_type is bytes
     if pa.types.is_boolean(output_type):
-        return value_type is bool or (
-            (value_type is int or value_type is float or value_type is Decimal) and value in {0, 1}
-        )
-    if pa.types.is_integer(output_type):
-        return (
-            value_type is bool
-            or value_type is int
-            or (
-                value_type is float
-                and math.isfinite(cast("float", value))
-                and cast("float", value).is_integer()
+        if value_type is bool:
+            return True
+        if value_type is int:
+            return value == 0 or value == 1
+        if value_type is float:
+            float_value = cast("float", value)
+            return math.isfinite(float_value) and (float_value == 0.0 or float_value == 1.0)
+        if value_type is Decimal:
+            decimal_value = cast("Decimal", value)
+            return decimal_value.is_finite() and (
+                decimal_value == Decimal(0) or decimal_value == Decimal(1)
             )
-        )
+        return False
+    if pa.types.is_integer(output_type):
+        if value_type is bool or value_type is int:
+            return True
+        if value_type is float:
+            float_value = cast("float", value)
+            return math.isfinite(float_value) and float_value.is_integer()
+        if value_type is Decimal:
+            decimal_value = cast("Decimal", value)
+            return decimal_value.is_finite() and decimal_value == decimal_value.to_integral_value()
+        return False
     if pa.types.is_floating(output_type):
-        return (
-            value_type is bool or value_type is int or value_type is float or value_type is Decimal
-        )
+        return _has_exact_finite_float_projection(value)
     if pa.types.is_decimal(output_type):
-        return value_type is bool or value_type is int or value_type is Decimal
+        if value_type is bool or value_type is int:
+            return True
+        if value_type is float:
+            return math.isfinite(cast("float", value))
+        if value_type is Decimal:
+            return cast("Decimal", value).is_finite()
+        return False
     if pa.types.is_date(output_type):
         return value_type is date
     if pa.types.is_timestamp(output_type):
@@ -530,17 +551,48 @@ def _coerce_condition_value(value: object, output_type: pa.DataType) -> object:
         value_type is int or value_type is float or value_type is Decimal
     ):
         return value == 1
-    if (
-        pa.types.is_integer(output_type) or pa.types.is_decimal(output_type)
-    ) and value_type is bool:
-        return int(cast("bool", value))
+    if pa.types.is_integer(output_type) and (
+        value_type is bool or value_type is float or value_type is Decimal
+    ):
+        return int(cast("bool | float | Decimal", value))
+    if pa.types.is_floating(output_type):
+        return float(cast("bool | int | float | Decimal", value))
+    if pa.types.is_decimal(output_type):
+        if value_type is bool or value_type is int:
+            return Decimal(int(cast("bool | int", value)))
+        if value_type is float:
+            return Decimal.from_float(cast("float", value))
     return value
+
+
+def _has_exact_finite_float_projection(value: object) -> bool:
+    value_type = type(value)
+    if value_type is bool:
+        return True
+    if value_type is float:
+        return math.isfinite(cast("float", value))
+    if value_type is int:
+        try:
+            projected = float(cast("int", value))
+        except OverflowError:
+            return False
+        return math.isfinite(projected) and int(projected) == value
+    if value_type is Decimal:
+        decimal_value = cast("Decimal", value)
+        if not decimal_value.is_finite():
+            return False
+        try:
+            projected = float(decimal_value)
+        except (OverflowError, ValueError):
+            return False
+        return math.isfinite(projected) and Decimal.from_float(projected) == decimal_value
+    return False
 
 
 def _compile_column_decision(
     observed_type: pa.DataType,
     values: pa.Array,
-    source_name: object,
+    source_name_text: str,
     explicit_hint: str | None,
     *,
     normalize: bool,
@@ -552,7 +604,7 @@ def _compile_column_decision(
 ) -> _ColumnDecision:
     if not normalize:
         return _decision(SemanticOperation.PASSTHROUGH, observed_type)
-    logical_observed_type = _dictionary_string_value_type(observed_type)
+    logical_observed_type = _encoded_string_value_type(observed_type)
     if explicit_hint is not None:
         return _hint_decision(
             explicit_hint,
@@ -578,7 +630,7 @@ def _compile_column_decision(
         logical_observed_type,
         non_null,
         present,
-        source_name,
+        source_name_text,
         enabled_stages,
         decimal_separator,
         thousands_separator,
@@ -590,13 +642,13 @@ def _decision_for_observed_values(
     observed_type: pa.DataType,
     non_null: tuple[object, ...],
     present: tuple[object, ...],
-    source_name: object,
+    source_name_text: str,
     enabled_stages: tuple[str, ...],
     decimal_separator: str | None,
     thousands_separator: str | None,
     detect_mixed_locale: bool,
 ) -> _ColumnDecision:
-    inferred = SemanticTypeInference()._infer_from_name(_safe_name_text(source_name))
+    inferred = SemanticTypeInference()._infer_from_name(source_name_text)
     if inferred == "VARCHAR":
         return _decision(SemanticOperation.IDENTIFIER, observed_type)
     if pa.types.is_timestamp(observed_type) or pa.types.is_date(observed_type):
@@ -911,7 +963,7 @@ def _detect_sample_numeric_locale(
 ) -> tuple[str, str]:
     samples: list[str] = []
     for column in sample.columns:
-        logical_type = _dictionary_string_value_type(column.type)
+        logical_type = _encoded_string_value_type(column.type)
         if not (pa.types.is_string(logical_type) or pa.types.is_large_string(logical_type)):
             continue
         strings = tuple(
@@ -923,10 +975,10 @@ def _detect_sample_numeric_locale(
     return _detected_numeric_separators(tuple(samples))
 
 
-def _dictionary_string_value_type(observed_type: pa.DataType) -> pa.DataType:
-    if not pa.types.is_dictionary(observed_type):
-        return observed_type
-    value_type = cast("pa.DictionaryType", observed_type).value_type
+def _encoded_string_value_type(observed_type: pa.DataType) -> pa.DataType:
+    value_type = observed_type
+    while pa.types.is_dictionary(value_type) or pa.types.is_run_end_encoded(value_type):
+        value_type = value_type.value_type
     if pa.types.is_string(value_type) or pa.types.is_large_string(value_type):
         return value_type
     return observed_type
@@ -1267,13 +1319,82 @@ def _consume_label_budget(depth: int, budget: list[int] | None) -> list[int]:
     return budget
 
 
-def _safe_name_text(value: object) -> str:
+def _safe_name_text(value: object) -> str:  # noqa: C901
     value_type = type(value)
     if value_type is str:
         return cast("str", value)
-    if value_type is int or value_type is float or value_type is bool:
-        return str(value)
+    if value_type is bytes:
+        return bytes.__str__(cast("bytes", value))
+    if value_type is bool:
+        return "True" if value else "False"
+    if value_type is int:
+        return int.__str__(cast("int", value))
+    if value_type is float:
+        return float.__str__(cast("float", value))
+    if value_type is date:
+        return date.__str__(cast("date", value))
+    if value_type is datetime:
+        datetime_value = cast("datetime", value)
+        if not _timezone_label_projection(datetime_value.tzinfo)[1]:
+            return ""
+        return datetime.__str__(datetime_value)
+    if value_type is time:
+        time_value = cast("time", value)
+        if not _timezone_label_projection(time_value.tzinfo)[1]:
+            return ""
+        return time.__str__(time_value)
+    if value_type is tuple:
+        projected = _safe_name_repr(value, _depth=0, _budget=None)
+        return projected or ""
     return ""
+
+
+def _safe_name_repr(  # noqa: C901
+    value: object,
+    *,
+    _depth: int,
+    _budget: list[int] | None,
+) -> str | None:
+    budget = _consume_label_budget(_depth, _budget)
+    value_type = type(value)
+    if value is None:
+        return "None"
+    if value_type is str:
+        return str.__repr__(cast("str", value))
+    if value_type is bytes:
+        return bytes.__repr__(cast("bytes", value))
+    if value_type is bool:
+        return "True" if value else "False"
+    if value_type is int:
+        return int.__repr__(cast("int", value))
+    if value_type is float:
+        return float.__repr__(cast("float", value))
+    if value_type is date:
+        return date.__repr__(cast("date", value))
+    if value_type is datetime:
+        datetime_value = cast("datetime", value)
+        if not _timezone_label_projection(datetime_value.tzinfo)[1]:
+            return None
+        return datetime.__repr__(datetime_value)
+    if value_type is time:
+        time_value = cast("time", value)
+        if not _timezone_label_projection(time_value.tzinfo)[1]:
+            return None
+        return time.__repr__(time_value)
+    if value_type is not tuple:
+        return None
+    members: list[str] = []
+    for member in cast("tuple[object, ...]", value):
+        projected = _safe_name_repr(
+            member,
+            _depth=_depth + 1,
+            _budget=budget,
+        )
+        if projected is None:
+            return None
+        members.append(projected)
+    trailing_comma = "," if len(members) == 1 else ""
+    return f"({', '.join(members)}{trailing_comma})"
 
 
 __all__ = [
