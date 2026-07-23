@@ -97,7 +97,7 @@
 | 8 | Coordinate-aware Arrow transforms | 5, 7 | [x] |
 | 9 | Closable stream lifecycle | 3, 6 | [x] |
 | 10 | Openpyxl bounded-row OOXML reader | 8, 9 | [x] |
-| 11 | Streaming normalization and schema enforcement | 9, 10 | [ ] |
+| 11 | Streaming normalization and schema enforcement | 9, 10 | [x] |
 | 12 | Public Arrow, batch, and pandas-chunk APIs | 7, 9, 11 | [ ] |
 | 13 | Unified multi-sheet planning and `SheetStream` | 5, 7, 12 | [ ] |
 | 14 | CSV/TXT direct-stream and batch optimization | 3, 9, 11 | [ ] |
@@ -2369,7 +2369,7 @@ git commit -m "feat: stream OOXML rows into Arrow batches"
 - Produces: frozen `NormalizationPlan` and `compile_normalization_plan(sample, config) -> NormalizationPlan`.
 - Produces: `ArrowNormalizationPipeline.normalize(batch, plan) -> pa.RecordBatch` with stable schema and ordinal fields.
 
-- [ ] **Step 1: Write failing schema and late-value tests**
+- [x] **Step 1: Write failing schema and late-value tests**
 
 ```python
 # tests/test_streaming_normalization.py
@@ -2415,7 +2415,7 @@ Run: `.venv/bin/pytest tests/test_streaming_normalization.py -q`
 
 Expected: collection fails because normalization-plan modules and `StreamingTypeError` do not exist.
 
-- [ ] **Step 2: Add the public typed error**
+- [x] **Step 2: Add the public typed error**
 
 ```python
 class StreamingTypeError(NormalizationError):
@@ -2433,7 +2433,7 @@ class StreamingTypeError(NormalizationError):
 
 Export it from `messy_xlsx.__all__` in Task 12.
 
-- [ ] **Step 3: Define and compile the immutable normalization plan**
+- [x] **Step 3: Define and compile the immutable normalization plan**
 
 ```python
 # src/messy_xlsx/normalization/plan.py
@@ -2483,7 +2483,7 @@ def _arrow_type(observed: pa.DataType, hinted: str | None) -> pa.DataType:
 
 Without a hint, refine the observed type with the bounded sample plus current name-based inference rules before calling `_arrow_type()`.
 
-- [ ] **Step 4: Normalize each ordinal and report the first incompatible value**
+- [x] **Step 4: Normalize each ordinal and report the first incompatible value**
 
 Use `pyarrow.compute` for whitespace, missing markers, numeric casts, temporal casts, masks, and row filters. If an exact Arrow operation is unavailable, convert only that column to pandas and rebuild that one Arrow array. Catch cast failures, locate the first invalid offset, and raise `StreamingTypeError` with display label, offset, safe `repr(value)`, and expected Arrow type. Never silently substitute null for a non-null invalid input.
 
@@ -2517,18 +2517,23 @@ class ArrowNormalizationPipeline:
             raise
 ```
 
-- [ ] **Step 5: Run streaming and legacy normalization tests**
+- [x] **Step 5: Run streaming and legacy normalization tests**
 
 Run: `.venv/bin/pytest tests/test_streaming_normalization.py tests/test_normalization tests/test_bigquery_compatibility.py -q`
 
 Expected: streaming rules pass and all legacy pandas normalization behavior remains unchanged.
 
-- [ ] **Step 6: Commit stable streaming normalization**
+- [x] **Step 6: Commit stable streaming normalization**
 
 ```bash
 git add src/messy_xlsx/exceptions.py src/messy_xlsx/normalization src/messy_xlsx/parsing/xlsx_streaming.py tests/test_streaming_normalization.py
 git commit -m "feat: normalize streaming Arrow schemas"
 ```
+
+Completed through `b3c4278`. Final acceptance evidence: 2,076 tests passed,
+Ruff and formatting checks passed, scoped mypy passed for all eight changed
+source files, the cumulative diff and worktree were clean, and independent
+architecture, lifecycle, and performance reviews returned CLEAN.
 
 ---
 
