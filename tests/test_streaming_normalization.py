@@ -931,6 +931,192 @@ def test_encoded_structural_preflight_precedes_flattened_and_bulk_child_walks(
     assert (flattened_buffer_counts, expanded_child_counts) == ([], [])
 
 
+@pytest.mark.parametrize("consumer", ["sample", "runtime"])
+def test_base_extension_storage_preflight_precedes_flattened_buffer_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+    consumer: str,
+) -> None:
+    storage = pa.StructArray.from_arrays(
+        [pa.array([index], type=pa.int16()) for index in range(1_025)],
+        names=[f"field_{index}" for index in range(1_025)],
+    )
+    opaque_type = pa.opaque(storage.type, "messy-xlsx", "wide-struct")
+    values = pa.ExtensionArray.from_storage(opaque_type, storage)
+    flattened_types: list[pa.DataType] = []
+    real_flattened = physical_buffers._unique_flattened_buffer_bytes
+
+    def counted_flattened(
+        array: pa.Array,
+        seen_buffers: set[tuple[int, int]],
+        max_parent_nodes: int,
+    ) -> int:
+        flattened_types.append(array.type)
+        return real_flattened(array, seen_buffers, max_parent_nodes)
+
+    monkeypatch.setattr(
+        physical_buffers,
+        "_unique_flattened_buffer_bytes",
+        counted_flattened,
+    )
+
+    assert isinstance(opaque_type, pa.BaseExtensionType)
+    assert not isinstance(opaque_type, pa.ExtensionType)
+    if consumer == "sample":
+        with pytest.raises(ValueError, match="physical-buffer structural limits"):
+            _sample((values,), ("value",))
+    else:
+        with pytest.raises(ValueError, match="logical-view structural limits"):
+            encoded.encoded_logical_view(values)
+    assert flattened_types == []
+
+
+@pytest.mark.parametrize("consumer", ["sample", "runtime"])
+def test_declared_buffer_entry_budget_precedes_flattened_buffer_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+    consumer: str,
+) -> None:
+    values = pa.StructArray.from_arrays(
+        [pa.array([index], type=pa.int16()) for index in range(512)],
+        names=[f"field_{index}" for index in range(512)],
+    )
+    flattened_types: list[pa.DataType] = []
+    real_flattened = physical_buffers._unique_flattened_buffer_bytes
+
+    def counted_flattened(
+        array: pa.Array,
+        seen_buffers: set[tuple[int, int]],
+        max_parent_nodes: int,
+    ) -> int:
+        flattened_types.append(array.type)
+        return real_flattened(array, seen_buffers, max_parent_nodes)
+
+    monkeypatch.setattr(
+        physical_buffers,
+        "_unique_flattened_buffer_bytes",
+        counted_flattened,
+    )
+
+    assert values.type.num_buffers + sum(field.type.num_buffers for field in values.type) == 1_025
+    if consumer == "sample":
+        with pytest.raises(ValueError, match="physical-buffer structural limits"):
+            _sample((values,), ("value",))
+    else:
+        with pytest.raises(ValueError, match="logical-view structural limits"):
+            encoded.encoded_logical_view(values)
+    assert flattened_types == []
+
+
+@pytest.mark.parametrize(
+    ("value_type", "value"),
+    [(pa.string_view(), "value"), (pa.binary_view(), b"value")],
+)
+def test_variadic_buffer_sample_preflight_maps_structural_error_before_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+    value_type: pa.DataType,
+    value: str | bytes,
+) -> None:
+    values = pa.array([value], type=value_type)
+    flattened_types: list[pa.DataType] = []
+    real_flattened = physical_buffers._unique_flattened_buffer_bytes
+
+    def counted_flattened(
+        array: pa.Array,
+        seen_buffers: set[tuple[int, int]],
+        max_parent_nodes: int,
+    ) -> int:
+        flattened_types.append(array.type)
+        return real_flattened(array, seen_buffers, max_parent_nodes)
+
+    monkeypatch.setattr(
+        physical_buffers,
+        "_unique_flattened_buffer_bytes",
+        counted_flattened,
+    )
+
+    assert value_type.has_variadic_buffers
+    with pytest.raises(ValueError, match="physical-buffer structural limits"):
+        _sample((values,), ("value",))
+    assert flattened_types == []
+
+
+@pytest.mark.parametrize(
+    ("value_type", "value"),
+    [(pa.string_view(), "value"), (pa.binary_view(), b"value")],
+)
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "logical-type",
+        "logical-view",
+        "logical-validity",
+        "logical-density",
+        "generic-filter",
+        "generic-mask",
+        "ree-filter",
+        "ree-trim",
+        "normalization-runtime",
+    ],
+)
+def test_variadic_buffer_runtime_operations_map_structural_error_before_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+    value_type: pa.DataType,
+    value: str | bytes,
+    operation: str,
+) -> None:
+    values = pa.array([value], type=value_type)
+    runs = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1], type=pa.int16()),
+        values,
+    )
+    keep = pa.array([True])
+    mask = pa.array([False])
+    batch = pa.record_batch([runs], names=["value"])
+    flattened_types: list[pa.DataType] = []
+    real_flattened = physical_buffers._unique_flattened_buffer_bytes
+    calls: dict[str, Any] = {
+        "logical-type": lambda: encoded.encoded_logical_type(value_type),
+        "logical-view": lambda: encoded.encoded_logical_view(values),
+        "logical-validity": lambda: encoded.encoded_logical_validity(values),
+        "logical-density": lambda: encoded.encoded_has_no_logical_nulls(values),
+        "generic-filter": lambda: encoded.filter_encoded(values, keep),
+        "generic-mask": lambda: encoded.mask_encoded(values, mask),
+        "ree-filter": lambda: encoded.filter_run_end_encoded(runs, keep),
+        "ree-trim": lambda: encoded.trim_run_end_encoded(runs),
+        "normalization-runtime": lambda: arrow_pipeline._drop_all_null_rows(batch),
+    }
+
+    def counted_flattened(
+        array: pa.Array,
+        seen_buffers: set[tuple[int, int]],
+        max_parent_nodes: int,
+    ) -> int:
+        flattened_types.append(array.type)
+        return real_flattened(array, seen_buffers, max_parent_nodes)
+
+    monkeypatch.setattr(
+        physical_buffers,
+        "_unique_flattened_buffer_bytes",
+        counted_flattened,
+    )
+
+    with pytest.raises(ValueError, match="logical-view structural limits"):
+        calls[operation]()
+    assert flattened_types == []
+
+
+def test_nonvariadic_physical_buffer_operations_preserve_ordinary_behavior() -> None:
+    values = pa.array([1, 2], type=pa.int64())
+    keep = pa.array([True, False])
+    mask = pa.array([False, True])
+
+    assert encoded.encoded_logical_type(values.type) == pa.int64()
+    assert encoded.encoded_logical_view(values) is values
+    assert encoded.encoded_logical_validity(values).to_pylist() == [True, True]
+    assert encoded.encoded_has_no_logical_nulls(values)
+    assert encoded.filter_encoded(values, keep).to_pylist() == [1]
+    assert encoded.mask_encoded(values, mask).to_pylist() == [1, None]
+
+
 @pytest.mark.parametrize("consumer", ["sample", "encoded"])
 def test_physical_buffer_preflight_supports_map_children(consumer: str) -> None:
     values = pa.array(

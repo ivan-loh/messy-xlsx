@@ -10,6 +10,7 @@ import pyarrow.compute as pc
 
 from messy_xlsx.normalization.physical_buffers import (
     PhysicalBufferTraversalError,
+    preflight_physical_type,
     unique_physical_buffer_bytes,
 )
 
@@ -20,6 +21,7 @@ MAX_ENCODED_VIEW_BYTES: Final = 8 * 1024 * 1024
 
 def encoded_logical_type(value_type: pa.DataType) -> pa.DataType:
     """Return the leaf type beneath a bounded dictionary/REE wrapper chain."""
+    _validate_physical_type_budget(value_type)
     depth = 0
     nodes = MAX_ENCODED_NODES
     while pa.types.is_dictionary(value_type) or pa.types.is_run_end_encoded(value_type):
@@ -56,6 +58,7 @@ def filter_encoded(array: pa.Array, keep: pa.BooleanArray) -> pa.Array:
     """Filter an array while retaining any recursive dictionary/REE type."""
     if len(array) != len(keep):
         raise ValueError("encoded filter mask length must match the logical slice")
+    _validate_physical_type_budget(array.type)
     if isinstance(array, (pa.DictionaryArray, pa.RunEndEncodedArray)):
         _validate_physical_buffer_budget(array)
     safe_keep = cast("pa.BooleanArray", pc.fill_null(keep, False))
@@ -70,6 +73,7 @@ def mask_encoded(array: pa.Array, mask: pa.BooleanArray) -> pa.Array:
     """Replace selected logical values with null while retaining encoded type."""
     if len(array) != len(mask):
         raise ValueError("encoded mask length must match the logical slice")
+    _validate_physical_type_budget(array.type)
     if isinstance(array, (pa.DictionaryArray, pa.RunEndEncodedArray)):
         _validate_physical_buffer_budget(array)
     safe_mask = cast("pa.BooleanArray", pc.fill_null(mask, False))
@@ -489,3 +493,15 @@ def _validate_physical_buffer_budget(array: pa.Array) -> None:
         raise ValueError("encoded array exceeds logical-view structural limits") from None
     if buffer_bytes > MAX_ENCODED_VIEW_BYTES:
         raise ValueError("encoded array exceeds logical-view byte limit")
+
+
+def _validate_physical_type_budget(value_type: pa.DataType) -> None:
+    try:
+        preflight_physical_type(
+            value_type,
+            max_depth=MAX_ENCODED_DEPTH,
+            max_nodes=MAX_ENCODED_NODES,
+            max_buffer_entries=MAX_ENCODED_NODES,
+        )
+    except PhysicalBufferTraversalError:
+        raise ValueError("encoded array exceeds logical-view structural limits") from None

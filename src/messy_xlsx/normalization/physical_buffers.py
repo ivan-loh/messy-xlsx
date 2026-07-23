@@ -9,6 +9,7 @@ import pyarrow as pa
 
 MAX_PHYSICAL_BUFFER_DEPTH: Final = 32
 MAX_PHYSICAL_BUFFER_NODES: Final = 1_024
+MAX_PHYSICAL_BUFFER_ENTRIES: Final = 1_024
 MAX_BUFFER_PARENT_NODES: Final = 1_024
 
 
@@ -21,12 +22,20 @@ def unique_physical_buffer_bytes(
     *,
     max_depth: int = MAX_PHYSICAL_BUFFER_DEPTH,
     max_nodes: int = MAX_PHYSICAL_BUFFER_NODES,
+    max_buffer_entries: int = MAX_PHYSICAL_BUFFER_ENTRIES,
     max_parent_nodes: int = MAX_BUFFER_PARENT_NODES,
 ) -> int:
     """Return deduplicated root-buffer bytes after bounded structural preflight."""
     type_budget = [max_nodes]
+    buffer_entry_budget = [max_buffer_entries]
     for array in arrays:
-        _preflight_physical_type(array.type, 0, type_budget, max_depth)
+        _preflight_physical_type(
+            array.type,
+            0,
+            type_budget,
+            buffer_entry_budget,
+            max_depth,
+        )
 
     seen_buffers: set[tuple[int, int]] = set()
     array_budget = [max_nodes]
@@ -43,15 +52,44 @@ def unique_physical_buffer_bytes(
     )
 
 
+def preflight_physical_type(
+    value_type: pa.DataType,
+    *,
+    max_depth: int = MAX_PHYSICAL_BUFFER_DEPTH,
+    max_nodes: int = MAX_PHYSICAL_BUFFER_NODES,
+    max_buffer_entries: int = MAX_PHYSICAL_BUFFER_ENTRIES,
+) -> None:
+    """Reject types whose flattened buffer enumeration cannot be bounded."""
+    _preflight_physical_type(
+        value_type,
+        0,
+        [max_nodes],
+        [max_buffer_entries],
+        max_depth,
+    )
+
+
 def _preflight_physical_type(
     value_type: pa.DataType,
     depth: int,
-    budget: list[int],
+    node_budget: list[int],
+    buffer_entry_budget: list[int],
     max_depth: int,
 ) -> None:
-    _consume_structural_budget(depth, budget, max_depth)
+    _consume_structural_budget(depth, node_budget, max_depth)
+    if value_type.has_variadic_buffers:
+        raise PhysicalBufferTraversalError
+    if buffer_entry_budget[0] < value_type.num_buffers:
+        raise PhysicalBufferTraversalError
+    buffer_entry_budget[0] -= value_type.num_buffers
     for child_type in _physical_child_types(value_type):
-        _preflight_physical_type(child_type, depth + 1, budget, max_depth)
+        _preflight_physical_type(
+            child_type,
+            depth + 1,
+            node_budget,
+            buffer_entry_budget,
+            max_depth,
+        )
 
 
 def _unique_array_buffer_bytes(
@@ -127,7 +165,7 @@ def _bounded_root_buffer(buffer: pa.Buffer, max_parent_nodes: int) -> pa.Buffer:
 def _physical_child_types(value_type: pa.DataType) -> Iterator[pa.DataType]:
     if pa.types.is_dictionary(value_type):
         yield value_type.value_type
-    elif isinstance(value_type, pa.ExtensionType):
+    elif isinstance(value_type, pa.BaseExtensionType):
         yield value_type.storage_type
     elif (
         pa.types.is_list(value_type)
