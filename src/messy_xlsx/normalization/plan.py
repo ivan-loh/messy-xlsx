@@ -19,6 +19,10 @@ from messy_xlsx.normalization.missing_values import (
     DEFAULT_MISSING_VALUES,
     EXTENDED_MISSING_VALUES,
 )
+from messy_xlsx.normalization.physical_buffers import (
+    PhysicalBufferTraversalError,
+    unique_physical_buffer_bytes,
+)
 from messy_xlsx.normalization.type_inference import SemanticTypeInference
 from messy_xlsx.parsing.contracts import OutputMode
 from messy_xlsx.parsing.coordinates import ColumnIdentity
@@ -168,50 +172,12 @@ def _validate_sample_budget(sample: NormalizationSample) -> None:
     cells = len(sample.columns) * sample.row_count
     if cells > MAX_SAMPLE_CELLS:
         raise ValueError(f"sample may retain at most {MAX_SAMPLE_CELLS} cells")
-    seen_buffers: set[tuple[int, int]] = set()
-    buffer_bytes = sum(
-        _unique_physical_buffer_bytes(column, seen_buffers) for column in sample.columns
-    )
+    try:
+        buffer_bytes = unique_physical_buffer_bytes(sample.columns)
+    except PhysicalBufferTraversalError:
+        raise ValueError("sample exceeds physical-buffer structural limits") from None
     if buffer_bytes > MAX_SAMPLE_BYTES:
         raise ValueError(f"sample may retain at most {MAX_SAMPLE_BYTES} Arrow bytes")
-
-
-def _unique_physical_buffer_bytes(
-    array: pa.Array,
-    seen: set[tuple[int, int]],
-) -> int:
-    total = 0
-    for buffer in array.buffers():
-        if buffer is None:
-            continue
-        while buffer.parent is not None:
-            buffer = buffer.parent
-        identity = (buffer.address, buffer.size)
-        if identity not in seen:
-            seen.add(identity)
-            total += buffer.size
-    if isinstance(array, pa.DictionaryArray):
-        total += _unique_physical_buffer_bytes(array.dictionary, seen)
-    elif isinstance(array, pa.ExtensionArray):
-        total += _unique_physical_buffer_bytes(array.storage, seen)
-    elif (
-        pa.types.is_list(array.type)
-        or pa.types.is_large_list(array.type)
-        or pa.types.is_fixed_size_list(array.type)
-        or pa.types.is_list_view(array.type)
-        or pa.types.is_large_list_view(array.type)
-        or pa.types.is_map(array.type)
-    ):
-        total += _unique_physical_buffer_bytes(array.values, seen)
-    elif pa.types.is_struct(array.type) or pa.types.is_union(array.type):
-        total += sum(
-            _unique_physical_buffer_bytes(array.field(index), seen)
-            for index in range(array.type.num_fields)
-        )
-    elif pa.types.is_run_end_encoded(array.type):
-        total += _unique_physical_buffer_bytes(array.run_ends, seen)
-        total += _unique_physical_buffer_bytes(array.values, seen)
-    return total
 
 
 def _validate_date_system(date_system: str) -> None:

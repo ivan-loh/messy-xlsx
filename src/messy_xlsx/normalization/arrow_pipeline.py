@@ -738,11 +738,15 @@ def _parse_date_value(value: object, rule: ColumnNormalization) -> date | dateti
 
 
 def _drop_all_null_rows(batch: pa.RecordBatch) -> pa.RecordBatch:
+    has_dense_column = False
+    for column in batch.columns:
+        column_is_dense = _has_no_logical_nulls(column)
+        has_dense_column = has_dense_column or column_is_dense
     if batch.num_rows == 0:
         return batch
     if batch.num_columns == 0:
         return _record_batch([], batch.schema, 0)
-    if any(_has_no_logical_nulls(column) for column in batch.columns):
+    if has_dense_column:
         return batch
     keep = _logical_validity(batch.column(0))
     for ordinal in range(1, batch.num_columns):

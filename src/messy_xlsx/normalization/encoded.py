@@ -8,6 +8,11 @@ from typing import Final, cast
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from messy_xlsx.normalization.physical_buffers import (
+    PhysicalBufferTraversalError,
+    unique_physical_buffer_bytes,
+)
+
 MAX_ENCODED_DEPTH: Final = 32
 MAX_ENCODED_NODES: Final = 1_024
 MAX_ENCODED_VIEW_BYTES: Final = 8 * 1024 * 1024
@@ -473,71 +478,14 @@ def _consume_projection_budget(
 
 
 def _validate_physical_buffer_budget(array: pa.Array) -> None:
-    seen_buffers: set[tuple[int, int]] = set()
-    buffer_bytes = _unique_physical_buffer_bytes(
-        array,
-        seen_buffers,
-        0,
-        [MAX_ENCODED_NODES],
-    )
+    try:
+        buffer_bytes = unique_physical_buffer_bytes(
+            (array,),
+            max_depth=MAX_ENCODED_DEPTH,
+            max_nodes=MAX_ENCODED_NODES,
+            max_parent_nodes=MAX_ENCODED_NODES,
+        )
+    except PhysicalBufferTraversalError:
+        raise ValueError("encoded array exceeds logical-view structural limits") from None
     if buffer_bytes > MAX_ENCODED_VIEW_BYTES:
         raise ValueError("encoded array exceeds logical-view byte limit")
-
-
-def _unique_physical_buffer_bytes(
-    array: pa.Array,
-    seen_buffers: set[tuple[int, int]],
-    depth: int,
-    budget: list[int],
-) -> int:
-    if depth > MAX_ENCODED_DEPTH or budget[0] < 1:
-        raise ValueError("encoded array exceeds logical-view structural limits")
-    budget[0] -= 1
-    total = _unique_root_buffer_bytes(array, seen_buffers)
-    for child in _physical_child_arrays(array):
-        total += _unique_physical_buffer_bytes(
-            child,
-            seen_buffers,
-            depth + 1,
-            budget,
-        )
-    return total
-
-
-def _unique_root_buffer_bytes(
-    array: pa.Array,
-    seen_buffers: set[tuple[int, int]],
-) -> int:
-    total = 0
-    for original_buffer in array.buffers():
-        if original_buffer is None:
-            continue
-        buffer = original_buffer
-        while buffer.parent is not None:
-            buffer = buffer.parent
-        identity = (buffer.address, buffer.size)
-        if identity not in seen_buffers:
-            seen_buffers.add(identity)
-            total += buffer.size
-    return total
-
-
-def _physical_child_arrays(array: pa.Array) -> tuple[pa.Array, ...]:
-    if isinstance(array, pa.DictionaryArray):
-        return (array.dictionary,)
-    if isinstance(array, pa.ExtensionArray):
-        return (array.storage,)
-    if (
-        pa.types.is_list(array.type)
-        or pa.types.is_large_list(array.type)
-        or pa.types.is_fixed_size_list(array.type)
-        or pa.types.is_list_view(array.type)
-        or pa.types.is_large_list_view(array.type)
-        or pa.types.is_map(array.type)
-    ):
-        return (array.values,)
-    if pa.types.is_struct(array.type) or pa.types.is_union(array.type):
-        return tuple(array.field(index) for index in range(array.type.num_fields))
-    if isinstance(array, pa.RunEndEncodedArray):
-        return (array.run_ends, array.values)
-    return ()

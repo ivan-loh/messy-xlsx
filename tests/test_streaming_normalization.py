@@ -17,6 +17,7 @@ import pytest
 
 import messy_xlsx.normalization.arrow_pipeline as arrow_pipeline
 import messy_xlsx.normalization.encoded as encoded
+import messy_xlsx.normalization.physical_buffers as physical_buffers
 import messy_xlsx.normalization.plan as normalization_plan
 from messy_xlsx import SheetConfig
 from messy_xlsx._fallback_signals import _fallback_block_reason, _FallbackBlockReason
@@ -79,6 +80,13 @@ def _sample(
 
 def _zero_column_batch(row_count: int) -> pa.RecordBatch:
     return pa.record_batch([pa.nulls(row_count)], names=["_row_count"]).select([])
+
+
+def _deep_parent_buffer_array(parent_links: int = 20_000) -> pa.Array:
+    buffer = pa.allocate_buffer(8)
+    for _ in range(parent_links):
+        buffer = buffer.slice(0, 8)
+    return pa.Array.from_buffers(pa.int64(), 1, [None, buffer])
 
 
 class _Reader:
@@ -877,6 +885,143 @@ def test_encoded_buffer_accounting_has_depth_and_node_traversal_guards() -> None
         encoded.encoded_has_no_logical_nulls(deep)
     with pytest.raises(ValueError, match="logical-view structural limits"):
         encoded.encoded_has_no_logical_nulls(wide_encoded)
+
+
+def test_encoded_structural_preflight_precedes_flattened_and_bulk_child_walks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wide = pa.StructArray.from_arrays(
+        [pa.array([index], type=pa.int16()) for index in range(4_096)],
+        names=[f"field_{index}" for index in range(4_096)],
+    )
+    values = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        wide,
+    )
+    flattened_buffer_counts: list[int] = []
+    expanded_child_counts: list[int] = []
+    real_root_buffers = physical_buffers._unique_flattened_buffer_bytes
+    real_children = physical_buffers._physical_child_arrays
+
+    def counted_root_buffers(
+        array: pa.Array,
+        seen_buffers: set[tuple[int, int]],
+        max_parent_nodes: int,
+    ) -> int:
+        if isinstance(array, pa.StructArray) and array.type.num_fields == 4_096:
+            flattened_buffer_counts.append(len(array.buffers()))
+        return real_root_buffers(array, seen_buffers, max_parent_nodes)
+
+    def counted_children(array: pa.Array) -> tuple[pa.Array, ...]:
+        children = tuple(real_children(array))
+        if isinstance(array, pa.StructArray) and array.type.num_fields == 4_096:
+            expanded_child_counts.append(len(children))
+        return children
+
+    monkeypatch.setattr(
+        physical_buffers,
+        "_unique_flattened_buffer_bytes",
+        counted_root_buffers,
+    )
+    monkeypatch.setattr(physical_buffers, "_physical_child_arrays", counted_children)
+
+    assert wide.type.num_buffers == 1
+    with pytest.raises(ValueError, match="logical-view structural limits"):
+        encoded.encoded_has_no_logical_nulls(values)
+    assert (flattened_buffer_counts, expanded_child_counts) == ([], [])
+
+
+@pytest.mark.parametrize("consumer", ["sample", "encoded"])
+def test_physical_buffer_preflight_supports_map_children(consumer: str) -> None:
+    values = pa.array(
+        [[("key", 1)]],
+        type=pa.map_(pa.string(), pa.int64()),
+    )
+
+    if consumer == "sample":
+        assert _sample((values,), ("value",)).row_count == 1
+    else:
+        wrapped = pa.DictionaryArray.from_arrays(
+            pa.array([0], type=pa.int8()),
+            values,
+        )
+        assert encoded.encoded_has_no_logical_nulls(wrapped)
+
+
+@pytest.mark.parametrize(
+    ("encoded_first", "empty"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_normalization_validates_all_encoded_columns_before_batch_fast_paths(
+    encoded_first: bool,
+    empty: bool,
+) -> None:
+    safe_encoded = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1], type=pa.int16()),
+        pa.array([7], type=pa.int64()),
+    )
+    safe_plain = pa.array([1], type=pa.int64())
+    sample_arrays = (safe_encoded, safe_plain) if encoded_first else (safe_plain, safe_encoded)
+    compiled = compile_normalization_plan(
+        _sample(sample_arrays, ("first", "second")),
+        _parse_plan(batch_size=1),
+    )
+    root = pa.array(range(2_000_000), type=pa.int64())
+    oversized_encoded = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1], type=pa.int16()),
+        root.slice(0, 1),
+    )
+    runtime_plain = pa.array([], type=pa.int64()) if empty else safe_plain
+    runtime_encoded = oversized_encoded.slice(0, 0) if empty else oversized_encoded
+    runtime_arrays = (
+        (runtime_encoded, runtime_plain) if encoded_first else (runtime_plain, runtime_encoded)
+    )
+    batch = pa.record_batch(list(runtime_arrays), schema=compiled.input_schema)
+
+    with pytest.raises(ValueError, match="logical-view byte limit"):
+        ArrowNormalizationOperation(compiled).normalize(batch)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "logical-view",
+        "logical-validity",
+        "logical-density",
+        "ree-filter",
+        "ree-direct-filter",
+        "ree-mask",
+        "ree-trim",
+        "dictionary-filter",
+        "dictionary-mask",
+    ],
+)
+def test_encoded_buffer_parent_chain_is_bounded(operation: str) -> None:
+    leaf = _deep_parent_buffer_array()
+    run_values = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1], type=pa.int16()),
+        leaf,
+    )
+    dictionary_values = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        leaf,
+    )
+    keep = pa.array([True])
+    mask = pa.array([False])
+    calls: dict[str, Any] = {
+        "logical-view": lambda: encoded.encoded_logical_view(run_values),
+        "logical-validity": lambda: encoded.encoded_logical_validity(run_values),
+        "logical-density": lambda: encoded.encoded_has_no_logical_nulls(run_values),
+        "ree-filter": lambda: encoded.filter_encoded(run_values, keep),
+        "ree-direct-filter": lambda: encoded.filter_run_end_encoded(run_values, keep),
+        "ree-mask": lambda: encoded.mask_encoded(run_values, mask),
+        "ree-trim": lambda: encoded.trim_run_end_encoded(run_values),
+        "dictionary-filter": lambda: encoded.filter_encoded(dictionary_values, keep),
+        "dictionary-mask": lambda: encoded.mask_encoded(dictionary_values, mask),
+    }
+
+    with pytest.raises(ValueError, match="logical-view structural limits"):
+        calls[operation]()
 
 
 @pytest.mark.parametrize(
@@ -4044,6 +4189,35 @@ def test_sample_budget_counts_nested_dictionary_backing_buffers() -> None:
     )
     accepted = _sample((left, right), ("left", "right"))
     assert accepted.row_count == 1
+
+
+def test_sample_buffer_parent_chain_is_bounded_with_configuration_error() -> None:
+    values = _deep_parent_buffer_array()
+
+    with pytest.raises(ValueError, match="physical-buffer structural limits"):
+        _sample((values,), ("value",))
+
+
+def test_sample_buffer_accounting_rejects_wide_type_before_eager_walk() -> None:
+    wide = pa.StructArray.from_arrays(
+        [pa.array([index], type=pa.int16()) for index in range(4_096)],
+        names=[f"field_{index}" for index in range(4_096)],
+    )
+
+    with pytest.raises(ValueError, match="physical-buffer structural limits"):
+        _sample((wide,), ("value",))
+
+
+def test_sample_buffer_accounting_converts_deep_type_to_configuration_error() -> None:
+    deep: pa.Array = pa.array([1], type=pa.int8())
+    for _ in range(1_100):
+        deep = pa.DictionaryArray.from_arrays(
+            pa.array([0], type=pa.int8()),
+            deep,
+        )
+
+    with pytest.raises(ValueError, match="physical-buffer structural limits"):
+        _sample((deep,), ("value",))
 
 
 def test_dictionary_encoded_strings_match_plain_normalization_across_late_batches() -> None:
