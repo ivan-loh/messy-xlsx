@@ -2220,6 +2220,67 @@ def test_supported_duplicate_tuple_tokens_remain_resolvable() -> None:
     assert tuple(rule.explicit_hint for rule in compiled.columns) == ("INTEGER", "INTEGER")
 
 
+@pytest.mark.parametrize("resolution", ["hints", "renames", "conditions"])
+def test_unrelated_safe_configuration_is_allowed_with_an_opaque_tuple_label(
+    resolution: str,
+) -> None:
+    class OpaqueMember:
+        pass
+
+    opaque = OpaqueMember()
+    opaque_ref = weakref.ref(opaque)
+    arrays = (
+        pa.array(["opaque", "opaque"]),
+        pa.array(["1", "2"] if resolution == "hints" else ["keep", "drop"]),
+    )
+    configuration: dict[str, object]
+    if resolution == "hints":
+        configuration = {"type_hints": {"safe": "INTEGER"}}
+    elif resolution == "renames":
+        configuration = {"column_renames": {"safe": "renamed"}}
+    else:
+        configuration = {"drop_conditions": [{"column": "safe", "value": "drop"}]}
+    sample = _sample(arrays, ((opaque,), "safe"))
+
+    compiled = compile_normalization_plan(sample, _parse_plan(**configuration))
+
+    if resolution == "hints":
+        assert tuple(rule.explicit_hint for rule in compiled.columns) == (None, "INTEGER")
+    elif resolution == "renames":
+        assert compiled.final_display_names[1] == "renamed"
+    else:
+        result = ArrowNormalizationOperation(compiled).normalize(
+            pa.record_batch(list(arrays), schema=compiled.input_schema)
+        )
+        assert result.to_pydict() == {"0": ["opaque"], "1": ["keep"]}
+    del sample, opaque
+    gc.collect()
+    assert opaque_ref() is None
+
+
+def test_sanitized_opaque_tuple_name_can_be_renamed_and_conditioned() -> None:
+    class OpaqueMember:
+        pass
+
+    opaque = OpaqueMember()
+    arrays = (pa.array(["drop", "keep"]), pa.array(["x", "y"]))
+    compiled = compile_normalization_plan(
+        _sample(arrays, ((opaque,), "safe column")),
+        _parse_plan(
+            sanitize_column_names=True,
+            column_renames={"unsafe_label": "opaque_safe"},
+            drop_conditions=[{"column": "opaque_safe", "value": "drop"}],
+        ),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch(list(arrays), schema=compiled.input_schema)
+    )
+
+    assert compiled.final_display_names == ("opaque_safe", "safe_column")
+    assert result.to_pydict() == {"0": ["keep"], "1": ["y"]}
+
+
 def test_ambiguous_hostile_tuple_members_are_never_executed_or_retained() -> None:
     callbacks: list[str] = []
 
@@ -2259,6 +2320,189 @@ def test_ambiguous_hostile_tuple_members_are_never_executed_or_retained() -> Non
     gc.collect()
     assert left_ref() is None
     assert right_ref() is None
+
+
+@pytest.mark.parametrize("unsafe_payload", ["offset", "name"])
+def test_nested_unsafe_temporal_tuple_collisions_are_rejected_without_callbacks(
+    unsafe_payload: str,
+) -> None:
+    callbacks: list[str] = []
+
+    class HostileName(str):
+        __slots__ = ("__weakref__",)
+
+        def __hash__(self) -> int:
+            callbacks.append("name-hash")
+            raise AssertionError("timezone name must not be hashed")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("name-eq")
+            raise AssertionError("timezone name must not be compared")
+
+        def __str__(self) -> str:
+            callbacks.append("name-str")
+            raise AssertionError("timezone name must not be rendered")
+
+        def __repr__(self) -> str:
+            callbacks.append("name-repr")
+            raise AssertionError("timezone name must not be rendered")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("name-format")
+            raise AssertionError("timezone name must not be formatted")
+
+    class HostileOffset(timedelta):
+        __slots__ = ("__weakref__",)
+
+        def __hash__(self) -> int:
+            callbacks.append("offset-hash")
+            raise AssertionError("timezone offset must not be hashed")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("offset-eq")
+            raise AssertionError("timezone offset must not be compared")
+
+        def __str__(self) -> str:
+            callbacks.append("offset-str")
+            raise AssertionError("timezone offset must not be rendered")
+
+        def __repr__(self) -> str:
+            callbacks.append("offset-repr")
+            raise AssertionError("timezone offset must not be rendered")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("offset-format")
+            raise AssertionError("timezone offset must not be formatted")
+
+    def hostile_label(side: str) -> tuple[tuple[datetime], weakref.ReferenceType[object]]:
+        if unsafe_payload == "offset":
+            payload: object = HostileOffset(hours=1 if side == "left" else 2)
+            exact_timezone = timezone(payload, "hostile")
+        else:
+            payload = HostileName(side)
+            exact_timezone = timezone(timedelta(hours=3), payload)
+        return (
+            (datetime(2024, 1, 2, 3, 4, 5, tzinfo=exact_timezone),),
+            weakref.ref(payload),
+        )
+
+    left, left_ref = hostile_label("left")
+    right, right_ref = hostile_label("right")
+    labels = (left, right)
+    sample = _sample((pa.array(["left"]), pa.array(["right"])), labels)
+
+    with pytest.raises(ValueError, match="opaque tuple"):
+        compile_normalization_plan(sample, _parse_plan())
+
+    assert callbacks == []
+    del sample, labels, left, right
+    gc.collect()
+    assert left_ref() is None
+    assert right_ref() is None
+
+
+def test_safe_timezone_tuple_and_unrelated_configuration_remain_resolvable() -> None:
+    temporal = datetime(
+        2024,
+        1,
+        2,
+        3,
+        4,
+        5,
+        tzinfo=timezone(timedelta(hours=3), "safe"),
+    )
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["x"]), pa.array(["1"])), ((temporal,), "amount")),
+        _parse_plan(
+            type_hints={
+                (temporal,): "VARCHAR",
+                "amount": "INTEGER",
+            }
+        ),
+    )
+
+    assert tuple(rule.explicit_hint for rule in compiled.columns) == ("VARCHAR", "INTEGER")
+
+
+@pytest.mark.parametrize("resolution", ["hints", "renames", "conditions"])
+@pytest.mark.parametrize("unsafe_payload", ["offset", "name"])
+def test_nested_unsafe_temporal_tuple_configuration_is_rejected_without_callbacks(
+    resolution: str,
+    unsafe_payload: str,
+) -> None:
+    callbacks: list[str] = []
+
+    class HostileName(str):
+        __slots__ = ("__weakref__",)
+
+        def __hash__(self) -> int:
+            callbacks.append("name-hash")
+            raise AssertionError("timezone name must not be hashed")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("name-eq")
+            raise AssertionError("timezone name must not be compared")
+
+        def __str__(self) -> str:
+            callbacks.append("name-str")
+            raise AssertionError("timezone name must not be rendered")
+
+        def __repr__(self) -> str:
+            callbacks.append("name-repr")
+            raise AssertionError("timezone name must not be rendered")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("name-format")
+            raise AssertionError("timezone name must not be formatted")
+
+    class HostileOffset(timedelta):
+        __slots__ = ("__weakref__",)
+
+        def __hash__(self) -> int:
+            callbacks.append("offset-hash")
+            raise AssertionError("timezone offset must not be hashed")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("offset-eq")
+            raise AssertionError("timezone offset must not be compared")
+
+        def __str__(self) -> str:
+            callbacks.append("offset-str")
+            raise AssertionError("timezone offset must not be rendered")
+
+        def __repr__(self) -> str:
+            callbacks.append("offset-repr")
+            raise AssertionError("timezone offset must not be rendered")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("offset-format")
+            raise AssertionError("timezone offset must not be formatted")
+
+    payload: object
+    if unsafe_payload == "offset":
+        payload = HostileOffset(hours=3)
+        exact_timezone = timezone(payload, "hostile")
+    else:
+        payload = HostileName("hostile")
+        exact_timezone = timezone(timedelta(hours=3), payload)
+    payload_ref = weakref.ref(payload)
+    label = (datetime(2024, 1, 2, 3, 4, 5, tzinfo=exact_timezone),)
+    configuration: dict[str, object]
+    if resolution == "hints":
+        configuration = {"type_hints": {label: "INTEGER"}}
+    elif resolution == "renames":
+        configuration = {"column_renames": {label: "renamed"}}
+    else:
+        configuration = {"drop_conditions": [{"column": label, "value": "drop"}]}
+    callbacks.clear()
+
+    with pytest.raises(TypeError, match="unsupported mutable configuration value: datetime"):
+        _parse_plan(**configuration)
+
+    assert callbacks == []
+    del configuration, label, exact_timezone, payload
+    gc.collect()
+    assert payload_ref() is None
 
 
 def test_tuple_label_structuralization_has_a_bounded_depth() -> None:

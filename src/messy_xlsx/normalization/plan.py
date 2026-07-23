@@ -297,12 +297,7 @@ def compile_normalization_plan(
     source_label_tokens = tuple(
         _display_label_token(identity.display_name) for identity in sample.column_identities
     )
-    _reject_ambiguous_unsupported_tuple_tokens(
-        source_label_tokens,
-        label_resolution_requested=bool(
-            plan.type_hints or plan.column_renames or (plan.normalize and plan.drop_conditions)
-        ),
-    )
+    _reject_ambiguous_opaque_tuple_tokens(source_label_tokens)
     source_names = tuple(
         _snapshot_display_name(identity.display_name) for identity in sample.column_identities
     )
@@ -315,16 +310,15 @@ def compile_normalization_plan(
         source_label_tokens,
         plan,
     )
-    _reject_ambiguous_unsupported_tuple_tokens(
-        final_label_tokens,
-        label_resolution_requested=bool(plan.normalize and plan.drop_conditions),
-    )
-    hints = _tokenize_mapping(plan.thaw_type_hints())
+    _reject_ambiguous_opaque_tuple_tokens(final_label_tokens)
+    hints = _tokenize_mapping(plan.thaw_type_hint_items())
     enabled_stages = tuple(
         stage
         for stage in ("whitespace", "numbers", "dates", "missing", "type_coercion")
         if stage not in plan.skip_normalization_steps
     )
+    decimal_separator: str | None
+    thousands_separator: str | None
     detect_mixed_locale = plan.decimal_separator is None and plan.thousands_separator is None
     if detect_mixed_locale:
         decimal_separator, thousands_separator = _detect_sample_numeric_locale(
@@ -431,7 +425,7 @@ def _compile_final_names(
         names = tuple(sanitized)
     else:
         names = source_names
-    renames = _tokenize_mapping(plan.thaw_column_renames())
+    renames = _tokenize_mapping(plan.thaw_column_rename_items())
     name_tokens = (
         tuple(_display_label_token(name) for name in names)
         if plan.sanitize_column_names
@@ -458,6 +452,7 @@ def _compile_conditions(
     for raw_label, raw_value in plan.thaw_drop_conditions():
         value = _snapshot_condition_value(raw_value)
         label_token = _display_label_token(raw_label)
+        _reject_opaque_tuple_configuration_token(label_token)
         ordinals = () if raw_label is None else tuple(ordinals_by_token.get(label_token, ()))
         if not ordinals:
             mode = ConditionMode.IGNORE
@@ -990,36 +985,61 @@ def _date_format(strings: tuple[str, ...], name_suggests_date: bool) -> str | No
     return "mixed" if int(parsed.notna().sum()) == len(strings) else None
 
 
-def _tokenize_mapping(mapping: dict[object, object]) -> dict[_LabelToken, object]:
+def _tokenize_mapping(items: list[tuple[object, object]]) -> dict[_LabelToken, object]:
     """Index label-keyed configuration once while preserving its first match."""
     tokenized: dict[_LabelToken, object] = {}
-    for candidate, value in mapping.items():
-        tokenized.setdefault(_display_label_token(candidate), value)
+    for candidate, value in items:
+        candidate_token = _display_label_token(candidate)
+        _reject_opaque_tuple_configuration_token(candidate_token)
+        tokenized.setdefault(candidate_token, value)
     return tokenized
 
 
-def _reject_ambiguous_unsupported_tuple_tokens(
+def _reject_ambiguous_opaque_tuple_tokens(
     tokens: tuple[_LabelToken, ...],
-    *,
-    label_resolution_requested: bool,
 ) -> None:
     """Reject opaque tuple identity before label-keyed configuration can alias it."""
-    unsupported_tuple_tokens = tuple(
-        token for token in tokens if _tuple_token_contains_unsupported_member(token)
+    opaque_tuple_tokens = tuple(
+        token for token in tokens if _tuple_token_contains_opaque_member(token)
     )
-    if label_resolution_requested and unsupported_tuple_tokens:
-        raise ValueError("label resolution cannot target unsupported tuple members")
-    if len(set(unsupported_tuple_tokens)) != len(unsupported_tuple_tokens):
-        raise ValueError("ambiguous labels contain unsupported tuple members")
+    if len(set(opaque_tuple_tokens)) != len(opaque_tuple_tokens):
+        raise ValueError(
+            "ambiguous labels contain opaque tuple members (unsupported tuple members)"
+        )
 
 
-def _tuple_token_contains_unsupported_member(token: _LabelToken) -> bool:
+def _reject_opaque_tuple_configuration_token(token: _LabelToken) -> None:
+    if _tuple_token_contains_opaque_member(token):
+        raise ValueError(
+            "label resolution cannot target opaque tuple members (unsupported tuple members)"
+        )
+
+
+def _tuple_token_contains_opaque_member(token: _LabelToken) -> bool:
     if token.kind != "tuple":
         return False
     members = cast("tuple[_LabelToken, ...]", token.value)
     return any(
-        member.kind == "unsupported" or _tuple_token_contains_unsupported_member(member)
+        member.kind == "unsupported"
+        or _tuple_token_contains_opaque_member(member)
+        or _temporal_token_has_unsafe_timezone(member)
         for member in members
+    )
+
+
+def _temporal_token_has_unsafe_timezone(token: _LabelToken) -> bool:
+    if token.kind not in {"datetime", "time"}:
+        return False
+    temporal_parts = cast("tuple[object, ...]", token.value)
+    timezone_token = cast("tuple[object, ...]", temporal_parts[-1])
+    if timezone_token[:1] == ("untrusted_timezone",):
+        return True
+    if timezone_token[:1] != ("timezone",):
+        return False
+    offset_token = timezone_token[1]
+    name_token = timezone_token[2]
+    return (type(offset_token) is tuple and offset_token[:1] == ("unsafe_offset",)) or (
+        type(name_token) is tuple and name_token[:1] == ("unsafe_name",)
     )
 
 

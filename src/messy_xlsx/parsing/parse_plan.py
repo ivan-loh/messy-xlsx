@@ -357,9 +357,17 @@ class ParsePlan:
         """Return fresh type-hint values in their legacy container kinds."""
         return {_thaw(key): _thaw(value) for key, value in self.type_hints}
 
+    def thaw_type_hint_items(self) -> list[tuple[Any, Any]]:
+        """Return fresh type-hint entries without hashing reconstructed keys."""
+        return [(_thaw(key), _thaw(value)) for key, value in self.type_hints]
+
     def thaw_column_renames(self) -> dict[Any, Any]:
         """Return fresh column rename values for the legacy pandas path."""
         return {_thaw(key): _thaw(value) for key, value in self.column_renames}
+
+    def thaw_column_rename_items(self) -> list[tuple[Any, Any]]:
+        """Return fresh rename entries without hashing reconstructed keys."""
+        return [(_thaw(key), _thaw(value)) for key, value in self.column_renames]
 
     def thaw_drop_conditions(self) -> list[tuple[Any, Any]]:
         """Return fresh condition values for the legacy pandas path."""
@@ -912,9 +920,9 @@ def _freeze_stdlib_timezone(
         return None
     if type(value) is not timezone:
         raise TypeError(f"unsupported mutable configuration value: {scalar_name}")
-    offset = value.utcoffset(None)
-    name = value.tzname(None)
-    if offset is None or name is None:
+    offset = timezone.utcoffset(value, None)
+    name = timezone.tzname(value, None)
+    if type(offset) is not timedelta or type(name) is not str:
         raise TypeError(f"unsupported mutable configuration value: {scalar_name}")
     return _FrozenTimezone(
         _FrozenTimedelta(offset.days, offset.seconds, offset.microseconds),
@@ -1322,7 +1330,7 @@ def _resolve_skip_footer(
     structure: StructureInfo,
 ) -> int:
     """Resolve footer trimming with caller and detected-table precedence."""
-    skip_footer = structure.suggested_skip_footer
+    skip_footer = cast("int", structure.suggested_skip_footer)
     if config.skip_footer > 0:
         return config.skip_footer
 
