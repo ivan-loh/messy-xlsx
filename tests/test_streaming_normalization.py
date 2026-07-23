@@ -8,7 +8,7 @@ import math
 import re
 import weakref
 from dataclasses import FrozenInstanceError
-from datetime import date, datetime, time, timedelta, tzinfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from decimal import Decimal
 from typing import Any
 
@@ -2179,6 +2179,88 @@ def test_hostile_tuple_label_member_is_never_executed_or_retained() -> None:
     assert member_ref() is None
 
 
+@pytest.mark.parametrize("resolution", ["hints", "renames", "conditions"])
+def test_unsupported_tuple_member_collisions_are_rejected_before_resolution(
+    resolution: str,
+) -> None:
+    class OpaqueMember:
+        def __init__(self, side: str) -> None:
+            self.side = side
+
+        def __hash__(self) -> int:
+            return hash(self.side)
+
+        def __eq__(self, other: object) -> bool:
+            return type(other) is OpaqueMember and self.side == other.side
+
+    labels = ((OpaqueMember("right"),),)
+    configuration: dict[str, object]
+    if resolution == "hints":
+        configuration = {"type_hints": {(OpaqueMember("left"),): "INTEGER"}}
+    elif resolution == "renames":
+        configuration = {"column_renames": {(OpaqueMember("left"),): "renamed"}}
+    else:
+        configuration = {"drop_conditions": [{"column": (OpaqueMember("left"),), "value": "drop"}]}
+    plan = _parse_plan(**configuration)
+
+    with pytest.raises(ValueError, match="unsupported tuple members"):
+        compile_normalization_plan(
+            _sample((pa.array(["drop"]),), labels),
+            plan,
+        )
+
+
+def test_supported_duplicate_tuple_tokens_remain_resolvable() -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]), pa.array(["2"])), (("same",), ("same",))),
+        _parse_plan(type_hints={("same",): "INTEGER"}),
+    )
+
+    assert compiled.source_label_tokens[0] == compiled.source_label_tokens[1]
+    assert tuple(rule.explicit_hint for rule in compiled.columns) == ("INTEGER", "INTEGER")
+
+
+def test_ambiguous_hostile_tuple_members_are_never_executed_or_retained() -> None:
+    callbacks: list[str] = []
+
+    class HostileMember:
+        def __str__(self) -> str:
+            callbacks.append("str")
+            raise AssertionError("str must not run")
+
+        def __repr__(self) -> str:
+            callbacks.append("repr")
+            raise AssertionError("repr must not run")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("format")
+            raise AssertionError("format must not run")
+
+        def __hash__(self) -> int:
+            callbacks.append("hash")
+            raise AssertionError("hash must not run")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("eq")
+            raise AssertionError("equality must not run")
+
+    left = HostileMember()
+    right = HostileMember()
+    left_ref = weakref.ref(left)
+    right_ref = weakref.ref(right)
+    labels = ((left,), (right,))
+    sample = _sample((pa.array(["left"]), pa.array(["right"])), labels)
+
+    with pytest.raises(ValueError, match="unsupported tuple members"):
+        compile_normalization_plan(sample, _parse_plan())
+
+    assert callbacks == []
+    del sample, labels, left, right
+    gc.collect()
+    assert left_ref() is None
+    assert right_ref() is None
+
+
 def test_tuple_label_structuralization_has_a_bounded_depth() -> None:
     label: object = "leaf"
     for _ in range(40):
@@ -2269,6 +2351,99 @@ def test_hostile_temporal_label_timezone_is_never_executed_or_retained(
     assert calls == 0
     assert timezone_ref() is None
     assert hash(compiled)
+
+
+@pytest.mark.parametrize("sanitize", [False, True])
+@pytest.mark.parametrize("temporal_kind", ["datetime", "time"])
+@pytest.mark.parametrize("unsafe_payload", ["name", "offset"])
+def test_exact_timezone_hostile_payload_is_never_executed_or_retained(
+    sanitize: bool,
+    temporal_kind: str,
+    unsafe_payload: str,
+) -> None:
+    callbacks: list[str] = []
+
+    class HostileName(str):
+        __slots__ = ("__weakref__",)
+
+        def __hash__(self) -> int:
+            callbacks.append("name-hash")
+            raise AssertionError("timezone name must not be hashed")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("name-eq")
+            raise AssertionError("timezone name must not be compared")
+
+        def __str__(self) -> str:
+            callbacks.append("name-str")
+            raise AssertionError("timezone name must not be rendered")
+
+        def __repr__(self) -> str:
+            callbacks.append("name-repr")
+            raise AssertionError("timezone name must not be rendered")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("name-format")
+            raise AssertionError("timezone name must not be formatted")
+
+    class HostileOffset(timedelta):
+        __slots__ = ("__weakref__",)
+
+        def __hash__(self) -> int:
+            callbacks.append("offset-hash")
+            raise AssertionError("timezone offset must not be hashed")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("offset-eq")
+            raise AssertionError("timezone offset must not be compared")
+
+        def __str__(self) -> str:
+            callbacks.append("offset-str")
+            raise AssertionError("timezone offset must not be rendered")
+
+        def __repr__(self) -> str:
+            callbacks.append("offset-repr")
+            raise AssertionError("timezone offset must not be rendered")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("offset-format")
+            raise AssertionError("timezone offset must not be formatted")
+
+    def hostile_sample() -> tuple[NormalizationSample, weakref.ReferenceType[object]]:
+        name = HostileName("hostile") if unsafe_payload == "name" else "safe"
+        offset = HostileOffset(hours=3) if unsafe_payload == "offset" else timedelta(hours=3)
+        payload_ref = weakref.ref(name if unsafe_payload == "name" else offset)
+        exact_timezone = timezone(offset, name)
+        label = (
+            datetime(2024, 1, 2, 3, 4, 5, tzinfo=exact_timezone)
+            if temporal_kind == "datetime"
+            else time(3, 4, 5, tzinfo=exact_timezone)
+        )
+        return _sample((pa.array(["x"]),), (label,)), payload_ref
+
+    first_sample, first_payload_ref = hostile_sample()
+    second_sample, second_payload_ref = hostile_sample()
+
+    first = compile_normalization_plan(
+        first_sample,
+        _parse_plan(sanitize_column_names=sanitize),
+    )
+    second = compile_normalization_plan(
+        second_sample,
+        _parse_plan(sanitize_column_names=sanitize),
+    )
+
+    assert callbacks == []
+    assert type(first.source_display_names[0]) is str
+    assert first.final_display_names == (
+        ("unsafe_label" if sanitize else first.source_display_names[0]),
+    )
+    assert first == second
+    assert hash(first) == hash(second)
+    del first_sample, second_sample
+    gc.collect()
+    assert first_payload_ref() is None
+    assert second_payload_ref() is None
 
 
 def test_none_condition_label_is_ignored_while_nan_label_resolves_positionally() -> None:

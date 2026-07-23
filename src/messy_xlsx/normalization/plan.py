@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
 from itertools import pairwise
@@ -297,13 +297,27 @@ def compile_normalization_plan(
     source_label_tokens = tuple(
         _display_label_token(identity.display_name) for identity in sample.column_identities
     )
+    _reject_ambiguous_unsupported_tuple_tokens(
+        source_label_tokens,
+        label_resolution_requested=bool(
+            plan.type_hints or plan.column_renames or (plan.normalize and plan.drop_conditions)
+        ),
+    )
     source_names = tuple(
         _snapshot_display_name(identity.display_name) for identity in sample.column_identities
     )
+    source_names_sanitizable = tuple(
+        _is_sanitizable_display_name(identity.display_name) for identity in sample.column_identities
+    )
     final_names, final_label_tokens = _compile_final_names(
         source_names,
+        source_names_sanitizable,
         source_label_tokens,
         plan,
+    )
+    _reject_ambiguous_unsupported_tuple_tokens(
+        final_label_tokens,
+        label_resolution_requested=bool(plan.normalize and plan.drop_conditions),
     )
     hints = _tokenize_mapping(plan.thaw_type_hints())
     enabled_stages = tuple(
@@ -397,16 +411,19 @@ def compile_normalization_plan(
 
 def _compile_final_names(
     source_names: tuple[object, ...],
+    source_names_sanitizable: tuple[bool, ...],
     source_label_tokens: tuple[_LabelToken, ...],
     plan: ParsePlan,
 ) -> tuple[tuple[object, ...], tuple[_LabelToken, ...]]:
     if plan.sanitize_column_names:
         seen: dict[str, int] = {}
         sanitized: list[object] = []
-        for source_name in source_names:
-            safe_source = (
-                source_name if _is_sanitizable_display_name(source_name) else "unsafe_label"
-            )
+        for source_name, is_sanitizable in zip(
+            source_names,
+            source_names_sanitizable,
+            strict=True,
+        ):
+            safe_source = source_name if is_sanitizable else "unsafe_label"
             name = sanitize_column_name(safe_source)
             occurrence = seen.get(name, 0)
             seen[name] = occurrence + 1
@@ -981,6 +998,31 @@ def _tokenize_mapping(mapping: dict[object, object]) -> dict[_LabelToken, object
     return tokenized
 
 
+def _reject_ambiguous_unsupported_tuple_tokens(
+    tokens: tuple[_LabelToken, ...],
+    *,
+    label_resolution_requested: bool,
+) -> None:
+    """Reject opaque tuple identity before label-keyed configuration can alias it."""
+    unsupported_tuple_tokens = tuple(
+        token for token in tokens if _tuple_token_contains_unsupported_member(token)
+    )
+    if label_resolution_requested and unsupported_tuple_tokens:
+        raise ValueError("label resolution cannot target unsupported tuple members")
+    if len(set(unsupported_tuple_tokens)) != len(unsupported_tuple_tokens):
+        raise ValueError("ambiguous labels contain unsupported tuple members")
+
+
+def _tuple_token_contains_unsupported_member(token: _LabelToken) -> bool:
+    if token.kind != "tuple":
+        return False
+    members = cast("tuple[_LabelToken, ...]", token.value)
+    return any(
+        member.kind == "unsupported" or _tuple_token_contains_unsupported_member(member)
+        for member in members
+    )
+
+
 def _snapshot_display_name(
     value: object,
     *,
@@ -997,7 +1039,7 @@ def _snapshot_display_name(
     if type(value) in {datetime, time}:
         temporal = cast("datetime | time", value)
         tz = temporal.tzinfo
-        if tz is None or type(tz) is timezone:
+        if _timezone_label_projection(tz)[1]:
             return value
         module, qualname = _safe_type_description(type(value))
         return f"<{module}.{qualname} label>"
@@ -1027,7 +1069,7 @@ def _is_sanitizable_display_name(value: object) -> bool:
         return True
     if type(value) in {datetime, time}:
         temporal = cast("datetime | time", value)
-        return temporal.tzinfo is None or type(temporal.tzinfo) is timezone
+        return _timezone_label_projection(temporal.tzinfo)[1]
     return False
 
 
@@ -1101,22 +1143,42 @@ def _display_label_token(  # noqa: C901
 
 
 def _timezone_label_token(value: object) -> object:
+    return _timezone_label_projection(value)[0]
+
+
+def _timezone_label_projection(value: object) -> tuple[object, bool]:
     if value is None:
-        return ("naive",)
+        return ("naive",), True
     value_type = type(value)
     if value_type is timezone:
         timezone_value = cast("timezone", value)
-        offset = timezone_value.utcoffset(None)
-        name = timezone_value.tzname(None)
+        offset = timezone.utcoffset(timezone_value, None)
+        name = timezone.tzname(timezone_value, None)
+        if type(offset) is timedelta:
+            offset_token: object = (
+                "offset",
+                offset.days,
+                offset.seconds,
+                offset.microseconds,
+            )
+            offset_is_safe = True
+        else:
+            offset_module, offset_qualname = _safe_type_description(type(offset))
+            offset_token = ("unsafe_offset", offset_module, offset_qualname)
+            offset_is_safe = False
+        if type(name) is str:
+            name_token: object = name
+            name_is_safe = True
+        else:
+            name_module, name_qualname = _safe_type_description(type(name))
+            name_token = ("unsafe_name", name_module, name_qualname)
+            name_is_safe = False
         return (
-            "timezone",
-            offset.days if offset is not None else None,
-            offset.seconds if offset is not None else None,
-            offset.microseconds if offset is not None else None,
-            name,
+            ("timezone", offset_token, name_token),
+            offset_is_safe and name_is_safe,
         )
     module, qualname = _safe_type_description(value_type)
-    return ("untrusted_timezone", module, qualname)
+    return ("untrusted_timezone", module, qualname), False
 
 
 def _safe_type_description(value_type: type[object]) -> tuple[str, str]:
