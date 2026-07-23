@@ -694,6 +694,59 @@ def test_run_end_encoded_logical_nulls_do_not_take_the_dense_shortcut() -> None:
     assert arrow_pipeline._drop_all_null_rows(dense_batch) is dense_batch
 
 
+def test_dense_million_row_encoded_columns_use_metadata_validity_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dense_dictionary = pa.DictionaryArray.from_arrays(
+        pa.repeat(pa.scalar(0, type=pa.int8()), 1_000_000),
+        pa.array([7], type=pa.int64()),
+    )
+    run_dictionary = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        pa.array([7], type=pa.int64()),
+    )
+    dictionary_runs = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1_000_000], type=pa.int32()),
+        pa.array([7], type=pa.int64()),
+    )
+    arrays = (
+        pa.RunEndEncodedArray.from_arrays(
+            pa.array([1_000_000], type=pa.int32()),
+            pa.array([7], type=pa.int64()),
+        ),
+        dense_dictionary,
+        pa.RunEndEncodedArray.from_arrays(
+            pa.array([1_000_000], type=pa.int32()),
+            run_dictionary,
+        ),
+        pa.DictionaryArray.from_arrays(
+            pa.repeat(pa.scalar(0, type=pa.int8()), 1_000_000),
+            dictionary_runs,
+        ),
+    )
+    validity_lengths: list[int] = []
+    validity_buffer_bytes: list[int] = []
+    real_validity = arrow_pipeline.encoded_logical_validity
+
+    def counted_validity(array: pa.Array) -> pa.BooleanArray:
+        validity = real_validity(array)
+        validity_lengths.append(len(validity))
+        validity_buffer_bytes.append(
+            sum(buffer.size for buffer in validity.buffers() if buffer is not None)
+        )
+        return validity
+
+    monkeypatch.setattr(arrow_pipeline, "encoded_logical_validity", counted_validity)
+
+    for values in arrays:
+        batch = pa.record_batch([values], names=["value"])
+
+        assert arrow_pipeline._drop_all_null_rows(batch) is batch
+
+    assert max(validity_lengths, default=0) <= 1
+    assert max(validity_buffer_bytes, default=0) <= 64
+
+
 @pytest.mark.parametrize(
     ("indices", "dictionary", "expected"),
     [

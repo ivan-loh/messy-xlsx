@@ -42,6 +42,11 @@ def encoded_logical_validity(array: pa.Array) -> pa.BooleanArray:
     return cast("pa.BooleanArray", pc.fill_null(projected, False))
 
 
+def encoded_has_no_logical_nulls(array: pa.Array) -> bool:
+    """Prove logical density from encoded metadata and bounded references."""
+    return _has_no_logical_nulls(array, 0, [MAX_ENCODED_NODES])
+
+
 def filter_encoded(array: pa.Array, keep: pa.BooleanArray) -> pa.Array:
     """Filter an array while retaining any recursive dictionary/REE type."""
     if len(array) != len(keep):
@@ -151,6 +156,116 @@ def _project_encoded(
             budget,
         )
     return leaf_projection(array)
+
+
+def _has_no_logical_nulls(
+    array: pa.Array,
+    depth: int,
+    budget: list[int],
+    indices: pa.Array | None = None,
+) -> bool:
+    _consume_projection_budget(array, depth, budget)
+    if indices is not None:
+        if indices.null_count:
+            return False
+        unique_indices = cast("pa.Array", pc.unique(indices))
+        if not len(unique_indices):
+            return True
+        return _selected_values_have_no_logical_nulls(
+            array,
+            unique_indices,
+            depth,
+            budget,
+        )
+    if isinstance(array, pa.DictionaryArray):
+        if array.null_count:
+            return False
+        if _metadata_proves_all_values_valid(
+            array.dictionary,
+            depth + 1,
+            budget,
+        ):
+            return True
+        referenced = cast("pa.Array", pc.unique(array.indices))
+        return _has_no_logical_nulls(
+            array.dictionary,
+            depth + 1,
+            budget,
+            referenced,
+        )
+    if isinstance(array, pa.RunEndEncodedArray):
+        trimmed = trim_run_end_encoded(array)
+        return _has_no_logical_nulls(
+            trimmed.values,
+            depth + 1,
+            budget,
+        )
+    return bool(array.null_count == 0)
+
+
+def _selected_values_have_no_logical_nulls(
+    array: pa.Array,
+    indices: pa.Array,
+    depth: int,
+    budget: list[int],
+) -> bool:
+    if isinstance(array, pa.DictionaryArray):
+        dictionary_indices = cast("pa.Array", pc.take(array.indices, indices))
+        if dictionary_indices.null_count:
+            return False
+        if _metadata_proves_all_values_valid(
+            array.dictionary,
+            depth + 1,
+            budget,
+        ):
+            return True
+        referenced = cast("pa.Array", pc.unique(dictionary_indices))
+        return _has_no_logical_nulls(
+            array.dictionary,
+            depth + 1,
+            budget,
+            referenced,
+        )
+    if isinstance(array, pa.RunEndEncodedArray):
+        physical_indices = cast(
+            "pa.Array",
+            pc.unique(_run_end_physical_indices(array, indices)),
+        )
+        return _has_no_logical_nulls(
+            array.values,
+            depth + 1,
+            budget,
+            physical_indices,
+        )
+    if array.null_count == 0:
+        return True
+    selected = cast("pa.Array", pc.take(array, indices))
+    return bool(selected.null_count == 0)
+
+
+def _metadata_proves_all_values_valid(
+    array: pa.Array,
+    depth: int,
+    budget: list[int],
+) -> bool:
+    _consume_projection_budget(array, depth, budget)
+    if isinstance(array, pa.DictionaryArray):
+        return bool(
+            array.null_count == 0
+            and _metadata_proves_all_values_valid(
+                array.dictionary,
+                depth + 1,
+                budget,
+            )
+        )
+    if isinstance(array, pa.RunEndEncodedArray):
+        trimmed = trim_run_end_encoded(array)
+        return _metadata_proves_all_values_valid(
+            trimmed.values,
+            depth + 1,
+            budget,
+        )
+    return bool(array.null_count == 0)
 
 
 def _project_unique_encoded(

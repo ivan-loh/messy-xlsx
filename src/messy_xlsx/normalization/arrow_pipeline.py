@@ -22,6 +22,7 @@ from messy_xlsx._fallback_signals import (
 )
 from messy_xlsx.exceptions import StreamingTypeError
 from messy_xlsx.normalization.encoded import (
+    encoded_has_no_logical_nulls,
     encoded_logical_type,
     encoded_logical_validity,
     encoded_logical_view,
@@ -753,7 +754,7 @@ def _drop_all_null_rows(batch: pa.RecordBatch) -> pa.RecordBatch:
 
 def _has_no_logical_nulls(array: pa.Array) -> bool:
     if isinstance(array, (pa.RunEndEncodedArray, pa.DictionaryArray)):
-        return pc.all(encoded_logical_validity(array)).as_py() is True
+        return encoded_has_no_logical_nulls(array)
     return bool(array.null_count == 0)
 
 
