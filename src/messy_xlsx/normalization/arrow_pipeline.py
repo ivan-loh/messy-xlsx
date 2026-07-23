@@ -21,6 +21,12 @@ from messy_xlsx._fallback_signals import (
     _mark_fallback_blocked,
 )
 from messy_xlsx.exceptions import StreamingTypeError
+from messy_xlsx.normalization.encoded import (
+    encoded_logical_type,
+    encoded_logical_validity,
+    encoded_logical_view,
+    filter_run_end_encoded,
+)
 from messy_xlsx.normalization.plan import (
     ColumnNormalization,
     ConditionMode,
@@ -401,17 +407,11 @@ def _normalize_arrow_column(
 
 
 def _decode_encoded_strings(array: pa.Array) -> pa.Array:
-    if isinstance(array, pa.RunEndEncodedArray):
-        value_type = cast("pa.RunEndEncodedType", array.type).value_type
-        if pa.types.is_dictionary(value_type):
-            value_type = cast("pa.DictionaryType", value_type).value_type
-        if not (pa.types.is_string(value_type) or pa.types.is_large_string(value_type)):
-            return array
-        array = _decode_run_end_encoded(array)
-    if isinstance(array, pa.DictionaryArray):
-        value_type = cast("pa.DictionaryType", array.type).value_type
-        if pa.types.is_string(value_type) or pa.types.is_large_string(value_type):
-            return cast("pa.Array", pc.dictionary_decode(array))
+    value_type = encoded_logical_type(array.type)
+    if (pa.types.is_dictionary(array.type) or pa.types.is_run_end_encoded(array.type)) and (
+        pa.types.is_string(value_type) or pa.types.is_large_string(value_type)
+    ):
+        return encoded_logical_view(array)
     return array
 
 
@@ -759,68 +759,26 @@ def _drop_all_null_rows(batch: pa.RecordBatch) -> pa.RecordBatch:
 
 
 def _has_no_logical_nulls(array: pa.Array) -> bool:
-    if isinstance(array, pa.RunEndEncodedArray):
-        return _has_no_logical_nulls(array.values)
-    if isinstance(array, pa.DictionaryArray):
-        if array.null_count:
-            return False
-        if array.dictionary.null_count == 0:
-            return True
-        return pc.all(_dictionary_logical_validity(array)).as_py() is True
+    if isinstance(array, (pa.RunEndEncodedArray, pa.DictionaryArray)):
+        return pc.all(encoded_logical_validity(array)).as_py() is True
     return bool(array.null_count == 0)
 
 
 def _logical_validity(array: pa.Array) -> pa.BooleanArray:
-    if isinstance(array, pa.RunEndEncodedArray):
-        run_validity = _logical_validity(array.values)
-        encoded = pa.RunEndEncodedArray.from_arrays(array.run_ends, run_validity)
-        decoded = cast("pa.BooleanArray", pc.run_end_decode(encoded))
-        return decoded.slice(array.offset, len(array))
-    if isinstance(array, pa.DictionaryArray):
-        return _dictionary_logical_validity(array)
+    if isinstance(array, (pa.RunEndEncodedArray, pa.DictionaryArray)):
+        return encoded_logical_validity(array)
     return cast("pa.BooleanArray", pc.is_valid(array))
 
 
 def _dictionary_logical_validity(array: pa.DictionaryArray) -> pa.BooleanArray:
-    dictionary_validity = pc.is_valid(array.dictionary)
-    referenced_validity = pc.take(dictionary_validity, array.indices)
-    return cast("pa.BooleanArray", pc.fill_null(referenced_validity, False))
+    return encoded_logical_validity(array)
 
 
 def _filter_run_end_encoded(
     array: pa.RunEndEncodedArray,
     keep: pa.BooleanArray,
 ) -> pa.RunEndEncodedArray:
-    decoded = _decode_run_end_encoded(array)
-    filtered = cast("pa.Array", pc.filter(decoded, keep))
-    run_end_type = cast("pa.RunEndEncodedType", array.type).run_end_type
-    if not isinstance(filtered, pa.DictionaryArray):
-        return pc.run_end_encode(filtered, run_end_type=run_end_type)
-    encoded_indices = pc.run_end_encode(filtered.indices, run_end_type=run_end_type)
-    run_values = pa.DictionaryArray.from_arrays(
-        encoded_indices.values,
-        filtered.dictionary,
-        ordered=cast("pa.DictionaryType", filtered.type).ordered,
-    )
-    return pa.RunEndEncodedArray.from_arrays(encoded_indices.run_ends, run_values)
-
-
-def _decode_run_end_encoded(array: pa.RunEndEncodedArray) -> pa.Array:
-    if not isinstance(array.values, pa.DictionaryArray):
-        return cast("pa.Array", pc.run_end_decode(array))
-    index_runs = pa.RunEndEncodedArray.from_arrays(
-        array.run_ends,
-        array.values.indices,
-    )
-    decoded_indices = cast("pa.Array", pc.run_end_decode(index_runs)).slice(
-        array.offset,
-        len(array),
-    )
-    return pa.DictionaryArray.from_arrays(
-        decoded_indices,
-        array.values.dictionary,
-        ordered=cast("pa.DictionaryType", array.values.type).ordered,
-    )
+    return filter_run_end_encoded(array, keep)
 
 
 def _apply_regex_filter(
@@ -953,7 +911,7 @@ def _apply_condition(
         operand = condition.operands[0]
         if operand is None:
             return batch
-        equal = pc.fill_null(pc.equal(batch.column(ordinal), operand), False)
+        equal = _condition_equal(batch.column(ordinal), operand)
         return batch if pc.any(equal).as_py() is not True else batch.filter(pc.invert(equal))
 
     arrays = list(batch.columns)
@@ -961,7 +919,7 @@ def _apply_condition(
     for ordinal, operand in zip(condition.ordinals, condition.operands, strict=True):
         if operand is None:
             continue
-        equal = pc.fill_null(pc.equal(arrays[ordinal], operand), False)
+        equal = _condition_equal(arrays[ordinal], operand)
         if pc.any(equal).as_py() is not True:
             continue
         arrays[ordinal] = pc.if_else(
@@ -971,6 +929,13 @@ def _apply_condition(
         )
         changed = True
     return _record_batch(arrays, batch.schema, batch.num_rows) if changed else batch
+
+
+def _condition_equal(array: pa.Array, operand: pa.Scalar) -> pa.BooleanArray:
+    if pa.types.is_float16(array.type):
+        array = cast("pa.Array", pc.cast(array, pa.float32(), safe=True))
+        operand = pa.scalar(operand.as_py(), type=pa.float32())
+    return cast("pa.BooleanArray", pc.fill_null(pc.equal(array, operand), False))
 
 
 def _record_batch(

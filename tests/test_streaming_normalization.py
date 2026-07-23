@@ -731,6 +731,78 @@ def test_unreferenced_null_dictionary_value_preserves_batch_identity() -> None:
     assert result.column(0).indices.buffers()[1].address == values.indices.buffers()[1].address
 
 
+def test_nested_dictionary_logical_nulls_are_filtered_recursively() -> None:
+    inner = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1], type=pa.int8()),
+        pa.array([None, 7], type=pa.int64()),
+    )
+    values = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1], type=pa.int8()),
+        inner,
+    )
+    batch = pa.record_batch([values], names=["value"])
+
+    result = arrow_pipeline._drop_all_null_rows(batch)
+
+    assert result.column(0).to_pylist() == [7]
+    assert result.column(0).type == values.type
+    assert result.schema.equals(batch.schema, check_metadata=True)
+
+
+@pytest.mark.parametrize(
+    ("indices", "expected", "unchanged"),
+    [
+        ([0, 1], [7], False),
+        ([0, 0], [], False),
+        ([1, 1], [7, 7], True),
+        ([None, 1], [7], False),
+    ],
+)
+def test_alternating_dictionary_ree_validity_is_recursive(
+    indices: list[int | None],
+    expected: list[int],
+    unchanged: bool,
+) -> None:
+    leaf_dictionary = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1], type=pa.int8()),
+        pa.array([None, 7], type=pa.int64()),
+    )
+    nested_runs = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2], type=pa.int16()),
+        leaf_dictionary,
+    )
+    values = pa.DictionaryArray.from_arrays(
+        pa.array(indices, type=pa.int8()),
+        nested_runs,
+    )
+    batch = pa.record_batch([values], names=["value"])
+
+    result = arrow_pipeline._drop_all_null_rows(batch)
+
+    assert result.column(0).to_pylist() == expected
+    assert result.column(0).type == values.type
+    assert result.schema.equals(batch.schema, check_metadata=True)
+    assert (result is batch) is unchanged
+
+
+def test_nested_run_end_encoded_logical_nulls_preserve_recursive_schema() -> None:
+    inner = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2], type=pa.int16()),
+        pa.array([None, 7], type=pa.int64()),
+    )
+    values = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2], type=pa.int16()),
+        inner,
+    )
+    batch = pa.record_batch([values], names=["value"])
+
+    result = arrow_pipeline._drop_all_null_rows(batch)
+
+    assert result.column(0).to_pylist() == [7]
+    assert result.column(0).type == values.type
+    assert result.schema.equals(batch.schema, check_metadata=True)
+
+
 def test_run_end_encoded_dictionary_logical_nulls_keep_stable_schema() -> None:
     run_values = pa.DictionaryArray.from_arrays(
         pa.array([0, 1], type=pa.int8()),
@@ -747,6 +819,61 @@ def test_run_end_encoded_dictionary_logical_nulls_keep_stable_schema() -> None:
     assert result.column(0).to_pylist() == [7, 7]
     assert result.schema.equals(batch.schema, check_metadata=True)
     assert result.column(0).type == values.type
+
+
+@pytest.mark.parametrize("offset", [0, 499_999])
+def test_sliced_ree_dictionary_filter_decodes_only_intersecting_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    offset: int,
+) -> None:
+    run_values = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1], type=pa.int8()),
+        pa.array([None, 7], type=pa.int64()),
+    )
+    parent = pa.RunEndEncodedArray.from_arrays(
+        pa.array([500_000, 1_000_000], type=pa.int32()),
+        run_values,
+    )
+    values = parent.slice(offset, 1)
+    batch = pa.record_batch([values], names=["value"])
+    decoded_lengths: list[int] = []
+    decoded_buffer_bytes: list[int] = []
+    real_decode = arrow_pipeline.pc.run_end_decode
+
+    def counted_decode(encoded: pa.RunEndEncodedArray) -> pa.Array:
+        decoded = real_decode(encoded)
+        decoded_lengths.append(len(encoded))
+        decoded_buffer_bytes.append(
+            sum(buffer.size for buffer in decoded.buffers() if buffer is not None)
+        )
+        return decoded
+
+    monkeypatch.setattr(arrow_pipeline.pc, "run_end_decode", counted_decode)
+
+    result = arrow_pipeline._drop_all_null_rows(batch)
+
+    assert result.num_rows == 0
+    assert decoded_lengths
+    assert max(decoded_lengths) <= 1
+    assert max(decoded_buffer_bytes) <= 64
+    assert result.schema.equals(batch.schema, check_metadata=True)
+
+
+def test_trailing_dense_ree_slice_preserves_batch_identity() -> None:
+    run_values = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1], type=pa.int8()),
+        pa.array([None, 7], type=pa.int64()),
+    )
+    parent = pa.RunEndEncodedArray.from_arrays(
+        pa.array([500_000, 1_000_000], type=pa.int32()),
+        run_values,
+    )
+    values = parent.slice(999_999, 1)
+    batch = pa.record_batch([values], names=["value"])
+
+    result = arrow_pipeline._drop_all_null_rows(batch)
+
+    assert result is batch
 
 
 def test_late_value_uses_global_input_offset_across_filtered_rows() -> None:
@@ -1528,6 +1655,60 @@ def test_decimal_numeric_conditions_match_characterized_pandas_equality(
 def test_unsafe_numeric_condition_conversions_are_harmless_non_matches(
     values: pa.Array,
     operand: object,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(drop_conditions=[{"column": "value", "value": operand}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == values.to_pylist()
+    assert compiled.drop_conditions[0].operands == (None,)
+
+
+def test_decimal_condition_must_be_exact_in_the_arrow_float_width() -> None:
+    values = pa.array([16_777_216.0, 2.0], type=pa.float32())
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(drop_conditions=[{"column": "value", "value": Decimal("16777217")}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == values.to_pylist()
+    assert compiled.drop_conditions[0].operands == (None,)
+
+
+def test_exact_decimal_condition_matches_float16_values() -> None:
+    values = pa.array([1.5, 2.0], type=pa.float16())
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(drop_conditions=[{"column": "value", "value": Decimal("1.5")}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == [2.0]
+
+
+@pytest.mark.parametrize(
+    ("values", "operand"),
+    [
+        (pa.array([2_048.0, 2.0], type=pa.float16()), Decimal("2049")),
+        (pa.array([0.0, 2.0], type=pa.float32()), Decimal("1e-50")),
+        (pa.array([0.0, 2.0], type=pa.float32()), Decimal("1e100")),
+    ],
+)
+def test_decimal_float_width_loss_is_a_harmless_non_match(
+    values: pa.Array,
+    operand: Decimal,
 ) -> None:
     compiled = compile_normalization_plan(
         _sample((values,), ("value",)),
@@ -3531,6 +3712,121 @@ def test_run_end_encoded_string_locale_inference_matches_plain_evidence() -> Non
     assert encoded_plan.schema == plain_plan.schema
     assert encoded_plan.columns[0].decimal_separator == ","
     assert encoded_result.column(0).to_pylist() == [1.0, 2.0]
+
+
+def test_dictionary_of_run_end_encoded_strings_enforces_late_timezone() -> None:
+    sample_dictionary = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2], type=pa.int16()),
+        pa.array(["2024-01-01T00:00:00+08:00", "2024-01-02T00:00:00+08:00"]),
+    )
+    sample_values = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1], type=pa.int8()),
+        sample_dictionary,
+    )
+    compiled = compile_normalization_plan(
+        _sample((sample_values,), ("created_at",)),
+        _parse_plan(batch_size=2),
+    )
+    late_dictionary = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2], type=pa.int16()),
+        pa.array(["2024-01-03T00:00:00+09:00", "2024-01-04T00:00:00+08:00"]),
+    )
+    late_values = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1], type=pa.int8()),
+        late_dictionary,
+    )
+
+    with pytest.raises(StreamingTypeError) as captured:
+        ArrowNormalizationOperation(compiled).normalize(
+            pa.record_batch([late_values], schema=compiled.input_schema)
+        )
+
+    assert captured.value.context["ordinal"] == 0
+    assert captured.value.context["row_offset"] == 0
+    assert compiled.columns[0].timezone == "+08:00"
+
+
+def test_alternating_encoded_strings_normalize_missing_whitespace_and_nulls() -> None:
+    def encoded(dictionary_values: list[str | None]) -> pa.DictionaryArray:
+        leaf = pa.DictionaryArray.from_arrays(
+            pa.array([0, 1, 2], type=pa.int8()),
+            pa.array(dictionary_values, type=pa.string()),
+        )
+        runs = pa.RunEndEncodedArray.from_arrays(
+            pa.array([1, 2, 3], type=pa.int16()),
+            leaf,
+        )
+        return pa.DictionaryArray.from_arrays(
+            pa.array([0, 1, 2, None], type=pa.int8()),
+            runs,
+        )
+
+    sample_values = encoded(["  alpha  ", "NA", None])
+    compiled = compile_normalization_plan(
+        _sample((sample_values,), ("value",)),
+        _parse_plan(batch_size=4),
+    )
+    late_values = encoded(["  beta  ", "NA", None])
+    operation = ArrowNormalizationOperation(compiled)
+
+    sample_result = operation.normalize(
+        pa.record_batch([sample_values], schema=compiled.input_schema)
+    )
+    late_result = operation.normalize(pa.record_batch([late_values], schema=compiled.input_schema))
+
+    assert compiled.schema == pa.schema([("0", pa.string())])
+    assert sample_result.column(0).to_pylist() == ["alpha"]
+    assert late_result.column(0).to_pylist() == ["beta"]
+
+
+def test_alternating_encoded_string_locale_matches_plain_values() -> None:
+    leaf = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1], type=pa.int8()),
+        pa.array(["1,00", "2,00"]),
+    )
+    runs = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2], type=pa.int16()),
+        leaf,
+    )
+    values = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1], type=pa.int8()),
+        runs,
+    )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("amount",)),
+        _parse_plan(),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.columns[0].decimal_separator == ","
+    assert result.column(0).to_pylist() == [1.0, 2.0]
+
+
+def test_normalize_false_preserves_alternating_encoded_string_identity() -> None:
+    leaf = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        pa.array(["  unchanged  "]),
+    )
+    runs = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1], type=pa.int16()),
+        leaf,
+    )
+    values = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        runs,
+    )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(normalize=False),
+    )
+    batch = pa.record_batch([values], schema=compiled.input_schema)
+
+    result = ArrowNormalizationOperation(compiled).normalize(batch)
+
+    assert result is batch
 
 
 def test_normalize_false_preserves_run_end_encoded_string_identity() -> None:

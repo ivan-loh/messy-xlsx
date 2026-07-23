@@ -14,6 +14,7 @@ from typing import Final, cast
 import pandas as pd
 import pyarrow as pa
 
+from messy_xlsx.normalization.encoded import encoded_logical_type
 from messy_xlsx.normalization.missing_values import (
     DEFAULT_MISSING_VALUES,
     EXTENDED_MISSING_VALUES,
@@ -526,7 +527,7 @@ def _condition_value_matches_type(  # noqa: C901
             return decimal_value.is_finite() and decimal_value == decimal_value.to_integral_value()
         return False
     if pa.types.is_floating(output_type):
-        return _has_exact_finite_float_projection(value)
+        return _has_exact_finite_float_projection(value, output_type)
     if pa.types.is_decimal(output_type):
         if value_type is bool or value_type is int:
             return True
@@ -565,7 +566,10 @@ def _coerce_condition_value(value: object, output_type: pa.DataType) -> object:
     return value
 
 
-def _has_exact_finite_float_projection(value: object) -> bool:
+def _has_exact_finite_float_projection(
+    value: object,
+    output_type: pa.DataType,
+) -> bool:
     value_type = type(value)
     if value_type is bool:
         return True
@@ -585,7 +589,17 @@ def _has_exact_finite_float_projection(value: object) -> bool:
             projected = float(decimal_value)
         except (OverflowError, ValueError):
             return False
-        return math.isfinite(projected) and Decimal.from_float(projected) == decimal_value
+        if not math.isfinite(projected):
+            return False
+        try:
+            narrowed = pa.scalar(projected, type=output_type).as_py()
+        except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError, TypeError, ValueError):
+            return False
+        return (
+            type(narrowed) is float
+            and math.isfinite(narrowed)
+            and Decimal.from_float(narrowed) == decimal_value
+        )
     return False
 
 
@@ -976,9 +990,7 @@ def _detect_sample_numeric_locale(
 
 
 def _encoded_string_value_type(observed_type: pa.DataType) -> pa.DataType:
-    value_type = observed_type
-    while pa.types.is_dictionary(value_type) or pa.types.is_run_end_encoded(value_type):
-        value_type = value_type.value_type
+    value_type = encoded_logical_type(observed_type)
     if pa.types.is_string(value_type) or pa.types.is_large_string(value_type):
         return value_type
     return observed_type
