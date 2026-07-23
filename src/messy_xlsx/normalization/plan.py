@@ -27,10 +27,16 @@ from messy_xlsx.utils import sanitize_column_name
 MAX_SAMPLE_VALUES: Final = 1_000
 MAX_SAMPLE_CELLS: Final = 1_000_000
 MAX_SAMPLE_BYTES: Final = 8 * 1024 * 1024
+_MAX_LABEL_DEPTH: Final = 32
+_MAX_LABEL_NODES: Final = 1_024
+_INT64_MIN: Final = -(1 << 63)
+_INT64_MAX: Final = (1 << 63) - 1
+_UINT64_MAX: Final = (1 << 64) - 1
 _DATE_SYSTEMS: Final = frozenset({"1900", "1904"})
 _NUMBER_PATTERN: Final = re.compile(
     r"^[+-]?[\d,.\s\xa0]+$|^\([0-9,.\s\xa0]+\)$|^[$€£¥₹][0-9,.\s\xa0]+$"
 )
+_NUMERIC_CHARS_PATTERN: Final = re.compile(r"[\d,.\s\xa0]+")
 _COMMA_DECIMAL_PATTERN: Final = re.compile(r"\d,\d{2}$")
 _DOT_DECIMAL_PATTERN: Final = re.compile(r"\d\.\d{2}$")
 _DOT_THOUSANDS_PATTERN: Final = re.compile(r"\d\.\d{3}")
@@ -299,12 +305,21 @@ def compile_normalization_plan(
         source_label_tokens,
         plan,
     )
-    hints = plan.thaw_type_hints()
+    hints = _tokenize_mapping(plan.thaw_type_hints())
     enabled_stages = tuple(
         stage
         for stage in ("whitespace", "numbers", "dates", "missing", "type_coercion")
         if stage not in plan.skip_normalization_steps
     )
+    detect_mixed_locale = plan.decimal_separator is None and plan.thousands_separator is None
+    if detect_mixed_locale:
+        decimal_separator, thousands_separator = _detect_sample_numeric_locale(
+            sample,
+            enabled_stages,
+        )
+    else:
+        decimal_separator = plan.decimal_separator
+        thousands_separator = plan.thousands_separator
     missing_values = frozenset(
         (
             *DEFAULT_MISSING_VALUES,
@@ -322,7 +337,7 @@ def compile_normalization_plan(
             strict=True,
         )
     ):
-        hint_value = _mapping_get(hints, source_label_tokens[ordinal])
+        hint_value = hints.get(source_label_tokens[ordinal])
         explicit_hint = _validated_hint(hint_value)
         decision = _compile_column_decision(
             schema_field.type,
@@ -332,8 +347,9 @@ def compile_normalization_plan(
             normalize=plan.normalize,
             enabled_stages=enabled_stages,
             missing_values=missing_values,
-            decimal_separator=plan.decimal_separator,
-            thousands_separator=plan.thousands_separator,
+            decimal_separator=decimal_separator,
+            thousands_separator=thousands_separator,
+            detect_mixed_locale=detect_mixed_locale,
         )
         fields.append(pa.field(str(ordinal), decision.output_type))
         rules.append(
@@ -398,14 +414,14 @@ def _compile_final_names(
         names = tuple(sanitized)
     else:
         names = source_names
-    renames = plan.thaw_column_renames()
+    renames = _tokenize_mapping(plan.thaw_column_renames())
     name_tokens = (
         tuple(_display_label_token(name) for name in names)
         if plan.sanitize_column_names
         else source_label_tokens
     )
     renamed = tuple(
-        _mapping_get(renames, token, name) for name, token in zip(names, name_tokens, strict=True)
+        renames.get(token, name) for name, token in zip(names, name_tokens, strict=True)
     )
     return (
         tuple(_snapshot_display_name(name) for name in renamed),
@@ -419,18 +435,13 @@ def _compile_conditions(
     plan: ParsePlan,
 ) -> tuple[RowCondition, ...]:
     conditions: list[RowCondition] = []
+    ordinals_by_token: dict[_LabelToken, list[int]] = {}
+    for ordinal, token in enumerate(final_label_tokens):
+        ordinals_by_token.setdefault(token, []).append(ordinal)
     for raw_label, raw_value in plan.thaw_drop_conditions():
         value = _snapshot_condition_value(raw_value)
         label_token = _display_label_token(raw_label)
-        ordinals = (
-            ()
-            if raw_label is None
-            else tuple(
-                ordinal
-                for ordinal, final_token in enumerate(final_label_tokens)
-                if final_token == label_token
-            )
-        )
+        ordinals = () if raw_label is None else tuple(ordinals_by_token.get(label_token, ()))
         if not ordinals:
             mode = ConditionMode.IGNORE
         elif len(ordinals) == 1:
@@ -458,8 +469,9 @@ def _compile_condition_operand(
         return None
     if not _condition_value_matches_type(value, output_type):
         return None
+    scalar_value = _coerce_condition_value(value, output_type)
     try:
-        return pa.scalar(value, type=output_type)
+        return pa.scalar(scalar_value, type=output_type)
     except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError, TypeError, ValueError):
         return None
 
@@ -470,15 +482,15 @@ def _condition_value_matches_type(value: object, output_type: pa.DataType) -> bo
     if pa.types.is_binary(output_type) or pa.types.is_large_binary(output_type):
         return type(value) is bytes
     if pa.types.is_boolean(output_type):
-        return type(value) is bool
+        return type(value) is bool or (type(value) in {int, float, Decimal} and value in {0, 1})
     if pa.types.is_integer(output_type):
-        return type(value) is int or (
+        return type(value) in {bool, int} or (
             type(value) is float and math.isfinite(value) and value.is_integer()
         )
     if pa.types.is_floating(output_type):
-        return type(value) in {int, float, Decimal}
+        return type(value) in {bool, int, float, Decimal}
     if pa.types.is_decimal(output_type):
-        return type(value) in {int, Decimal}
+        return type(value) in {bool, int, Decimal}
     if pa.types.is_date(output_type):
         return type(value) is date
     if pa.types.is_timestamp(output_type):
@@ -486,6 +498,17 @@ def _condition_value_matches_type(value: object, output_type: pa.DataType) -> bo
     if pa.types.is_time(output_type):
         return type(value) is time
     return False
+
+
+def _coerce_condition_value(value: object, output_type: pa.DataType) -> object:
+    """Project characterized pandas boolean/numeric equality into Arrow scalars."""
+    if pa.types.is_boolean(output_type) and type(value) in {int, float, Decimal}:
+        return value == 1
+    if (pa.types.is_integer(output_type) or pa.types.is_decimal(output_type)) and type(
+        value
+    ) is bool:
+        return int(value)
+    return value
 
 
 def _compile_column_decision(
@@ -499,6 +522,7 @@ def _compile_column_decision(
     missing_values: frozenset[str],
     decimal_separator: str | None,
     thousands_separator: str | None,
+    detect_mixed_locale: bool,
 ) -> _ColumnDecision:
     if not normalize:
         return _decision(SemanticOperation.PASSTHROUGH, observed_type)
@@ -531,6 +555,7 @@ def _compile_column_decision(
         enabled_stages,
         decimal_separator,
         thousands_separator,
+        detect_mixed_locale,
     )
 
 
@@ -542,6 +567,7 @@ def _decision_for_observed_values(
     enabled_stages: tuple[str, ...],
     decimal_separator: str | None,
     thousands_separator: str | None,
+    detect_mixed_locale: bool,
 ) -> _ColumnDecision:
     inferred = SemanticTypeInference()._infer_from_name(_safe_name_text(source_name))
     if inferred == "VARCHAR":
@@ -570,6 +596,7 @@ def _decision_for_observed_values(
             enabled_stages,
             decimal_separator,
             thousands_separator,
+            detect_mixed_locale,
         )
     return _decision(SemanticOperation.PASSTHROUGH, observed_type)
 
@@ -599,6 +626,7 @@ def _string_observed_decision(
     enabled_stages: tuple[str, ...],
     decimal_separator: str | None,
     thousands_separator: str | None,
+    detect_mixed_locale: bool,
 ) -> _ColumnDecision:
     strings = tuple(value for value in non_null if isinstance(value, str))
     if "numbers" in enabled_stages:
@@ -606,6 +634,7 @@ def _string_observed_decision(
             strings,
             decimal_separator,
             thousands_separator,
+            detect_mixed_locale=detect_mixed_locale,
         )
         if number_decision is not None:
             return number_decision
@@ -762,13 +791,15 @@ def _numeric_decision(
     strings: tuple[str, ...],
     configured_decimal: str | None,
     configured_thousands: str | None,
+    *,
+    detect_mixed_locale: bool,
 ) -> _ColumnDecision | None:
     if not strings:
         return None
     matches = sum(bool(_NUMBER_PATTERN.fullmatch(value.strip())) for value in strings)
     if matches <= len(strings) * 0.5:
         return None
-    if configured_decimal is None and configured_thousands is None:
+    if detect_mixed_locale:
         mixed = _mixed_numeric_decision(strings)
         if mixed is not None:
             return mixed
@@ -777,7 +808,7 @@ def _numeric_decision(
         configured_decimal,
         configured_thousands,
     )
-    parsed: list[float] = []
+    parsed: list[int | float] = []
     is_float = False
     for value in strings:
         try:
@@ -788,7 +819,9 @@ def _numeric_decision(
         is_float = is_float or fractional
     if not parsed:
         return None
-    output_type = pa.float64() if is_float else pa.int64()
+    output_type = _sampled_number_type(tuple(parsed), fractional=is_float)
+    if output_type is None:
+        return None
     return _decision(
         SemanticOperation.NUMBER,
         output_type,
@@ -805,8 +838,9 @@ def _mixed_numeric_decision(strings: tuple[str, ...]) -> _ColumnDecision | None:
         return None
     try:
         for value in strings:
-            _parse_mixed_sample_number(value)
-    except ValueError:
+            if not math.isfinite(_parse_mixed_sample_number(value)):
+                return None
+    except (OverflowError, ValueError):
         return None
     return _decision(
         SemanticOperation.NUMBER,
@@ -841,7 +875,27 @@ def _numeric_separators(
 ) -> tuple[str, str]:
     if configured_decimal is not None or configured_thousands is not None:
         return configured_decimal or ".", configured_thousands or ""
-    samples = strings[:50]
+    return _detected_numeric_separators(strings[:50])
+
+
+def _detect_sample_numeric_locale(
+    sample: NormalizationSample,
+    enabled_stages: tuple[str, ...],
+) -> tuple[str, str]:
+    samples: list[str] = []
+    for column in sample.columns:
+        if not (pa.types.is_string(column.type) or pa.types.is_large_string(column.type)):
+            continue
+        strings = tuple(
+            value
+            for value in _normalized_sample_values(column, enabled_stages)
+            if type(value) is str
+        )[:50]
+        samples.extend(value for value in strings if _NUMERIC_CHARS_PATTERN.match(value))
+    return _detected_numeric_separators(tuple(samples))
+
+
+def _detected_numeric_separators(samples: tuple[str, ...]) -> tuple[str, str]:
     comma_decimal = sum(bool(_COMMA_DECIMAL_PATTERN.search(value)) for value in samples)
     dot_decimal = sum(bool(_DOT_DECIMAL_PATTERN.search(value)) for value in samples)
     dot_thousands = sum(bool(_DOT_THOUSANDS_PATTERN.search(value)) for value in samples)
@@ -859,7 +913,7 @@ def _parse_sample_number(
     value: str,
     decimal_separator: str,
     thousands_separator: str,
-) -> tuple[float, bool]:
+) -> tuple[int | float, bool]:
     text = re.sub(r"(?:[$€£¥₹]|CHF|kr|zł)", "", value).strip()
     accounting = re.fullmatch(r"\((.*)\)", text)
     if accounting is not None:
@@ -872,7 +926,32 @@ def _parse_sample_number(
         text = text.replace(decimal_separator, ".")
     if not text:
         raise ValueError("empty number")
-    return float(text), fractional or "e" in text.lower()
+    fractional = fractional or "e" in text.lower()
+    return (float(text) if fractional else int(text)), fractional
+
+
+def _sampled_number_type(
+    values: tuple[int | float, ...],
+    *,
+    fractional: bool,
+) -> pa.DataType | None:
+    if fractional:
+        return pa.float64() if _all_finite_floats(values) else None
+    integers = cast("tuple[int, ...]", values)
+    minimum = min(integers)
+    maximum = max(integers)
+    if minimum >= _INT64_MIN and maximum <= _INT64_MAX:
+        return pa.int64()
+    if minimum >= 0 and maximum <= _UINT64_MAX:
+        return pa.uint64()
+    return pa.float64() if _all_finite_floats(values) else None
+
+
+def _all_finite_floats(values: tuple[int | float, ...]) -> bool:
+    try:
+        return all(math.isfinite(float(value)) for value in values)
+    except OverflowError:
+        return False
 
 
 def _date_format(strings: tuple[str, ...], name_suggests_date: bool) -> str | None:
@@ -894,30 +973,35 @@ def _date_format(strings: tuple[str, ...], name_suggests_date: bool) -> str | No
     return "mixed" if int(parsed.notna().sum()) == len(strings) else None
 
 
-def _mapping_get(
-    mapping: dict[object, object],
-    key_token: _LabelToken,
-    default: object | None = None,
-) -> object | None:
+def _tokenize_mapping(mapping: dict[object, object]) -> dict[_LabelToken, object]:
+    """Index label-keyed configuration once while preserving its first match."""
+    tokenized: dict[_LabelToken, object] = {}
     for candidate, value in mapping.items():
-        if _display_label_token(candidate) == key_token:
-            return value
-    return default
+        tokenized.setdefault(_display_label_token(candidate), value)
+    return tokenized
 
 
-def _snapshot_display_name(value: object) -> object:
+def _snapshot_display_name(
+    value: object,
+    *,
+    _depth: int = 0,
+    _budget: list[int] | None = None,
+) -> object:
+    budget = _consume_label_budget(_depth, _budget)
     if value is None or type(value) in {str, int, float, bool, bytes, date}:
         return value
+    if type(value) is tuple:
+        return tuple(
+            _snapshot_display_name(item, _depth=_depth + 1, _budget=budget) for item in value
+        )
     if type(value) in {datetime, time}:
         temporal = cast("datetime | time", value)
         tz = temporal.tzinfo
         if tz is None or type(tz) is timezone:
             return value
-        value_type = type(value)
-        return f"<{value_type.__module__}.{value_type.__qualname__} label>"
-    value_type = type(value)
-    module = type.__getattribute__(value_type, "__module__")
-    qualname = type.__getattribute__(value_type, "__qualname__")
+        module, qualname = _safe_type_description(type(value))
+        return f"<{module}.{qualname} label>"
+    module, qualname = _safe_type_description(type(value))
     return f"<{module}.{qualname}>"
 
 
@@ -934,9 +1018,7 @@ def _snapshot_condition_value(value: object) -> object:
         time,
     }:
         return value
-    value_type = type(value)
-    module = type.__getattribute__(value_type, "__module__")
-    qualname = type.__getattribute__(value_type, "__qualname__")
+    module, qualname = _safe_type_description(type(value))
     return ("unsupported", module, qualname)
 
 
@@ -949,8 +1031,14 @@ def _is_sanitizable_display_name(value: object) -> bool:
     return False
 
 
-def _display_label_token(value: object) -> _LabelToken:  # noqa: C901
+def _display_label_token(  # noqa: C901
+    value: object,
+    *,
+    _depth: int = 0,
+    _budget: list[int] | None = None,
+) -> _LabelToken:
     """Snapshot exact built-ins without invoking user equality, hash, or text hooks."""
+    budget = _consume_label_budget(_depth, _budget)
     value_type = type(value)
     if value is None:
         return _LabelToken("none", None)
@@ -967,6 +1055,15 @@ def _display_label_token(value: object) -> _LabelToken:  # noqa: C901
         if math.isnan(float_value):
             return _LabelToken("float", "nan")
         return _LabelToken("float", float_value.hex())
+    if value_type is tuple:
+        tuple_value = cast("tuple[object, ...]", value)
+        return _LabelToken(
+            "tuple",
+            tuple(
+                _display_label_token(item, _depth=_depth + 1, _budget=budget)
+                for item in tuple_value
+            ),
+        )
     if value_type is datetime:
         datetime_value = cast("datetime", value)
         return _LabelToken(
@@ -999,8 +1096,7 @@ def _display_label_token(value: object) -> _LabelToken:  # noqa: C901
                 _timezone_label_token(time_value.tzinfo),
             ),
         )
-    module = type.__getattribute__(value_type, "__module__")
-    qualname = type.__getattribute__(value_type, "__qualname__")
+    module, qualname = _safe_type_description(value_type)
     return _LabelToken("unsupported", (module, qualname))
 
 
@@ -1019,9 +1115,28 @@ def _timezone_label_token(value: object) -> object:
             offset.microseconds if offset is not None else None,
             name,
         )
+    module, qualname = _safe_type_description(value_type)
+    return ("untrusted_timezone", module, qualname)
+
+
+def _safe_type_description(value_type: type[object]) -> tuple[str, str]:
+    """Copy only exact string metadata from an untrusted label type."""
     module = type.__getattribute__(value_type, "__module__")
     qualname = type.__getattribute__(value_type, "__qualname__")
-    return ("untrusted_timezone", module, qualname)
+    return (
+        module if type(module) is str else "<unknown-module>",
+        qualname if type(qualname) is str else "<unknown-type>",
+    )
+
+
+def _consume_label_budget(depth: int, budget: list[int] | None) -> list[int]:
+    """Bound recursive tuple projection before walking caller-owned labels."""
+    if budget is None:
+        budget = [_MAX_LABEL_NODES]
+    if depth > _MAX_LABEL_DEPTH or budget[0] < 1:
+        raise ValueError("tuple label exceeds structural limits")
+    budget[0] -= 1
+    return budget
 
 
 def _safe_name_text(value: object) -> str:

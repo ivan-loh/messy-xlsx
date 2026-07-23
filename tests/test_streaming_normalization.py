@@ -16,6 +16,7 @@ import pyarrow as pa
 import pytest
 
 import messy_xlsx.normalization.arrow_pipeline as arrow_pipeline
+import messy_xlsx.normalization.plan as normalization_plan
 from messy_xlsx import SheetConfig
 from messy_xlsx._fallback_signals import _fallback_block_reason, _FallbackBlockReason
 from messy_xlsx.exceptions import StreamingTypeError
@@ -331,6 +332,61 @@ def test_compiler_fixes_numeric_locale_mode_and_date_format() -> None:
     assert compiled.columns[1].date_format == "%Y-%m-%d"
 
 
+def test_auto_numeric_locale_is_inferred_once_across_the_bounded_sheet_sample() -> None:
+    comma_decimal = pa.array(["1.234,56", "2.345,67"])
+    dot_decimal = pa.array(["1,234.56", "2,345.67"])
+    compiled = compile_normalization_plan(
+        _sample((comma_decimal, dot_decimal), ("comma", "dot")),
+        _parse_plan(),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch(
+            [comma_decimal, dot_decimal],
+            schema=compiled.input_schema,
+        )
+    )
+
+    assert tuple(rule.decimal_separator for rule in compiled.columns) == (".", ".")
+    assert tuple(rule.thousands_separator for rule in compiled.columns) == (",", ",")
+    assert result.column(0).to_pylist() == pytest.approx([1.23456, 2.34567])
+    assert result.column(1).to_pylist() == pytest.approx([1234.56, 2345.67])
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_type", "expected_value"),
+    [
+        ("9223372036854775807", pa.int64(), 9_223_372_036_854_775_807),
+        ("-9223372036854775808", pa.int64(), -9_223_372_036_854_775_808),
+        ("9223372036854775808", pa.uint64(), 9_223_372_036_854_775_808),
+        ("18446744073709551615", pa.uint64(), 18_446_744_073_709_551_615),
+        ("18446744073709551616", pa.float64(), float("18446744073709551616")),
+        ("-9223372036854775809", pa.float64(), float("-9223372036854775809")),
+        ("9" * 400, pa.string(), "9" * 400),
+    ],
+)
+def test_sampled_integer_text_compiles_to_a_schema_that_can_hold_its_evidence(
+    value: str,
+    expected_type: pa.DataType,
+    expected_value: object,
+) -> None:
+    values = pa.array([value])
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.schema.types == [expected_type]
+    if pa.types.is_floating(expected_type):
+        assert result.column(0).to_pylist() == pytest.approx([expected_value])
+    else:
+        assert result.column(0).to_pylist() == [expected_value]
+
+
 def test_invalid_regex_is_rejected_during_pure_compilation() -> None:
     with pytest.raises(re.error):
         compile_normalization_plan(
@@ -441,6 +497,29 @@ def test_number_whitespace_missing_and_empty_row_rules_are_fixed_by_sample() -> 
     }
 
 
+@pytest.mark.parametrize(
+    ("normalize_whitespace", "expected_text"),
+    [(True, "a b"), (False, "a\u2003\u2003b")],
+)
+def test_unicode_whitespace_and_blank_detection_match_legacy_behavior(
+    normalize_whitespace: bool,
+    expected_text: str,
+) -> None:
+    values = pa.array(["a\u2003\u2003b", "\u2003"])
+    keep = pa.array(["first", "second"])
+    compiled = compile_normalization_plan(
+        _sample((values, keep), ("text", "keep")),
+        _parse_plan(normalize_whitespace=normalize_whitespace),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values, keep], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == [expected_text, None]
+    assert result.column(1).to_pylist() == ["first", "second"]
+
+
 def test_zero_column_normalized_batch_drops_every_empty_row() -> None:
     sample = _sample(
         (),
@@ -454,6 +533,22 @@ def test_zero_column_normalized_batch_drops_every_empty_row() -> None:
     assert result.num_columns == 0
     assert result.num_rows == 0
     assert result.schema.equals(compiled.schema, check_metadata=True)
+
+
+def test_dense_column_skips_all_null_row_validity_mask_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = pa.record_batch(
+        [pa.array([1, 2]), pa.array([None, 3])],
+        names=["dense", "sparse"],
+    )
+
+    def unexpected_validity_mask(_array: pa.Array) -> pa.Array:
+        raise AssertionError("dense metadata must bypass validity masks")
+
+    monkeypatch.setattr(arrow_pipeline.pc, "is_valid", unexpected_validity_mask)
+
+    assert arrow_pipeline._drop_all_null_rows(batch) is batch
 
 
 def test_late_value_uses_global_input_offset_across_filtered_rows() -> None:
@@ -1080,6 +1175,34 @@ def test_cross_type_condition_operand_is_a_harmless_non_match(operand: object) -
     assert result.column(0).to_pylist() == ["a", "b"]
 
 
+@pytest.mark.parametrize(
+    ("values", "operand", "expected"),
+    [
+        (pa.array([1, 2], type=pa.int64()), True, [2]),
+        (pa.array([0, 1], type=pa.int64()), False, [1]),
+        (pa.array([1.0, 2.0], type=pa.float64()), True, [2.0]),
+        (pa.array([True, False]), 1, [False]),
+        (pa.array([True, False]), 1.0, [False]),
+        (pa.array([True, False]), 0, [True]),
+    ],
+)
+def test_boolean_numeric_conditions_match_characterized_pandas_equality(
+    values: pa.Array,
+    operand: object,
+    expected: list[object],
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(drop_conditions=[{"column": "value", "value": operand}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == expected
+
+
 def test_duplicate_subset_condition_raises_after_prior_condition_drops_every_row() -> None:
     sample = _sample(
         (pa.array(["drop"]), pa.array(["drop"]), pa.array(["x"])),
@@ -1422,6 +1545,25 @@ def test_python_only_or_unicode_regex_uses_exact_fallback(pattern: str) -> None:
     assert result.column(0).to_pylist() == ["---"]
 
 
+def test_regex_dollar_anchor_matches_before_a_final_newline_like_python() -> None:
+    values = pa.array(["x\n", "\nx", ""])
+    keep = pa.array(["before-final-newline", "at-end", "empty"])
+    compiled = compile_normalization_plan(
+        _sample((values, keep), ("value", "keep")),
+        _parse_plan(
+            batch_size=3,
+            drop_regex=r"x$",
+            normalize_whitespace=False,
+        ),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values, keep], schema=compiled.input_schema)
+    )
+
+    assert result.column(1).to_pylist() == ["empty"]
+
+
 def test_operation_does_not_retain_prior_batches_or_use_forbidden_materializers() -> None:
     source = inspect.getsource(arrow_pipeline)
     assert ".to_pylist(" not in source
@@ -1442,6 +1584,64 @@ def test_operation_does_not_retain_prior_batches_or_use_forbidden_materializers(
     gc.collect()
 
     assert batch_ref() is None
+
+
+@pytest.mark.parametrize(
+    "values",
+    [pa.array([1.5, 2.5], type=pa.float64()), pa.array(["alpha", "beta"])],
+)
+def test_clean_float_and_string_normalization_reuses_input_buffers(
+    values: pa.Array,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(),
+    )
+    batch = pa.record_batch([values], schema=compiled.input_schema)
+
+    result = ArrowNormalizationOperation(compiled).normalize(batch)
+
+    assert result is batch
+    assert tuple(
+        None if buffer is None else buffer.address for buffer in result.column(0).buffers()
+    ) == tuple(None if buffer is None else buffer.address for buffer in values.buffers())
+
+
+def test_missing_marker_array_is_cached_once_per_operation_and_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left = pa.array(["alpha", "beta"])
+    right = pa.array(["gamma", "delta"])
+    compiled = compile_normalization_plan(
+        _sample((left, right), ("left", "right")),
+        _parse_plan(),
+    )
+    marker_values = tuple(sorted(compiled.columns[0].missing_values))
+    real_array = arrow_pipeline.pa.array
+    marker_constructions = 0
+    marker_ref: weakref.ReferenceType[pa.Array] | None = None
+
+    def counted_array(values: object, *args: object, **kwargs: object) -> pa.Array:
+        nonlocal marker_constructions, marker_ref
+        result = real_array(values, *args, **kwargs)
+        if isinstance(values, (list, tuple)) and tuple(values) == marker_values:
+            marker_constructions += 1
+            if marker_ref is None:
+                marker_ref = weakref.ref(result)
+        return result
+
+    monkeypatch.setattr(arrow_pipeline.pa, "array", counted_array)
+    operation = ArrowNormalizationOperation(compiled)
+    batch = pa.record_batch([left, right], schema=compiled.input_schema)
+
+    assert operation.normalize(batch) is batch
+    assert operation.normalize(batch) is batch
+    assert marker_constructions == 1
+    assert marker_ref is not None and marker_ref() is not None
+
+    del operation
+    gc.collect()
+    assert marker_ref() is None
 
 
 def test_compiled_plan_does_not_retain_hostile_label_or_condition_operand() -> None:
@@ -1478,6 +1678,86 @@ def test_compiled_plan_does_not_retain_hostile_label_or_condition_operand() -> N
     assert operand_ref() is None
     assert len(compiled.final_display_names) == 1
     assert type(compiled.final_display_names[0]) is str
+
+
+@pytest.mark.parametrize("sanitize", [False, True])
+def test_hostile_label_type_metadata_is_never_executed_or_retained(
+    sanitize: bool,
+) -> None:
+    callbacks: list[str] = []
+
+    class HostileMetadata:
+        def __str__(self) -> str:
+            callbacks.append("str")
+            raise AssertionError("metadata str must not run")
+
+        def __repr__(self) -> str:
+            callbacks.append("repr")
+            raise AssertionError("metadata repr must not run")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("format")
+            raise AssertionError("metadata format must not run")
+
+        def __hash__(self) -> int:
+            callbacks.append("hash")
+            raise AssertionError("metadata hash must not run")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("eq")
+            raise AssertionError("metadata equality must not run")
+
+    class HostileTextMetadata(str):
+        def __str__(self) -> str:
+            callbacks.append("str")
+            raise AssertionError("metadata str must not run")
+
+        def __repr__(self) -> str:
+            callbacks.append("repr")
+            raise AssertionError("metadata repr must not run")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("format")
+            raise AssertionError("metadata format must not run")
+
+        def __hash__(self) -> int:
+            callbacks.append("hash")
+            raise AssertionError("metadata hash must not run")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("eq")
+            raise AssertionError("metadata equality must not run")
+
+    class HostileLabel:
+        pass
+
+    module = HostileMetadata()
+    qualname = HostileTextMetadata("HostileLabel")
+    HostileLabel.__module__ = module  # type: ignore[assignment]
+    HostileLabel.__qualname__ = qualname
+    label = HostileLabel()
+    label_ref = weakref.ref(label)
+    module_ref = weakref.ref(module)
+    sample = _sample((pa.array(["x"]),), (label,))
+
+    first = compile_normalization_plan(
+        sample,
+        _parse_plan(sanitize_column_names=sanitize),
+    )
+    second = compile_normalization_plan(
+        sample,
+        _parse_plan(sanitize_column_names=sanitize),
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert callbacks == []
+    HostileLabel.__module__ = "test_streaming_normalization"
+    HostileLabel.__qualname__ = "HostileLabel"
+    del sample, label, module, qualname
+    gc.collect()
+    assert label_ref() is None
+    assert module_ref() is None
 
 
 def test_semantic_error_never_triggers_pre_output_fallback() -> None:
@@ -1608,6 +1888,88 @@ def test_invalid_normalization_plan_closes_source_and_never_falls_back() -> None
     assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
 
 
+def test_reader_schema_compatibility_failure_can_fall_back_after_cleanup() -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]),), ("amount",)),
+        _parse_plan(),
+    )
+    schema_error = CoordinateCompatibilityError("unsupported schema")
+
+    class SchemaFailureReader:
+        close_calls = 0
+
+        @property
+        def schema(self) -> pa.Schema:
+            raise schema_error
+
+        def read_next_batch(self) -> pa.RecordBatch | None:
+            raise AssertionError("schema failure must occur before reads")
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    primary = SchemaFailureReader()
+    fallback = _Reader(compiled.schema)
+
+    assert (
+        list(
+            FallbackCoordinator(lambda error: error is schema_error).batches(
+                lambda: NormalizedStreamingReader(primary, compiled),  # type: ignore[arg-type]
+                lambda: fallback,
+            )
+        )
+        == []
+    )
+    assert primary.close_calls == 1
+    assert fallback.close_calls == 1
+    assert _fallback_block_reason(schema_error) is None
+
+
+def test_reader_schema_cleanup_failure_blocks_compatible_fallback() -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]),), ("amount",)),
+        _parse_plan(),
+    )
+    schema_error = CoordinateCompatibilityError("unsupported schema")
+    cleanup_error = OSError("cleanup")
+
+    class SchemaFailureReader:
+        close_calls = 0
+
+        @property
+        def schema(self) -> pa.Schema:
+            raise schema_error
+
+        def read_next_batch(self) -> pa.RecordBatch | None:
+            raise AssertionError("schema failure must occur before reads")
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise cleanup_error
+
+    primary = SchemaFailureReader()
+    fallback_calls = 0
+
+    def fallback_factory() -> _Reader:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return _Reader(compiled.schema)
+
+    with pytest.raises(CoordinateCompatibilityError) as captured:
+        list(
+            FallbackCoordinator(lambda error: error is schema_error).batches(
+                lambda: NormalizedStreamingReader(primary, compiled),  # type: ignore[arg-type]
+                fallback_factory,
+            )
+        )
+
+    assert captured.value is schema_error
+    assert primary.close_calls == 1
+    assert fallback_calls == 0
+    assert _fallback_block_reason(schema_error) is _FallbackBlockReason.SOURCE_OWNERSHIP
+    assert schema_error.backend_context["cleanup_failure"] == {"type": "OSError"}
+
+
 @pytest.mark.parametrize("descriptor", [False, True])
 def test_non_callable_owned_close_blocks_retryable_fallback(descriptor: bool) -> None:
     compiled = compile_normalization_plan(
@@ -1700,6 +2062,172 @@ def test_distinct_bytes_labels_keep_distinct_sanitized_names() -> None:
 
     assert compiled.source_display_names == (b"a", b"b")
     assert compiled.final_display_names == ("b_a", "b_b")
+
+
+def test_distinct_tuple_labels_resolve_hints_renames_and_conditions_positionally() -> None:
+    labels = (("left",), ("right",))
+    arrays = (pa.array(["1", "2"]), pa.array(["keep", "drop"]))
+    hinted = compile_normalization_plan(
+        _sample(arrays, labels),
+        _parse_plan(type_hints={("left",): "INTEGER"}),
+    )
+    renamed = compile_normalization_plan(
+        _sample(arrays, labels),
+        _parse_plan(column_renames={("right",): "renamed"}),
+    )
+    conditioned = compile_normalization_plan(
+        _sample(arrays, labels),
+        _parse_plan(drop_conditions=[{"column": ("right",), "value": "drop"}]),
+    )
+
+    result = ArrowNormalizationOperation(conditioned).normalize(
+        pa.record_batch(list(arrays), schema=conditioned.input_schema)
+    )
+
+    assert hinted.schema.types == [pa.int64(), pa.string()]
+    assert tuple(rule.explicit_hint for rule in hinted.columns) == ("INTEGER", None)
+    assert renamed.final_display_names == (("left",), "renamed")
+    assert result.to_pydict() == {"0": [1], "1": ["keep"]}
+
+
+def test_tuple_label_snapshots_preserve_nested_values_and_sanitize_safely() -> None:
+    nested = (
+        "outer",
+        (b"bytes", date(2024, 1, 2), datetime(2024, 1, 2, 3, 4), time(3, 4)),
+    )
+    raw = compile_normalization_plan(
+        _sample((pa.array(["x"]),), (nested,)),
+        _parse_plan(),
+    )
+    sanitized = compile_normalization_plan(
+        _sample((pa.array(["x"]), pa.array(["y"])), (("left",), ("right",))),
+        _parse_plan(sanitize_column_names=True),
+    )
+
+    assert raw.source_display_names == (nested,)
+    assert raw.final_display_names == (nested,)
+    assert sanitized.source_display_names == (("left",), ("right",))
+    assert sanitized.final_display_names == ("unsafe_label", "unsafe_label_1")
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [(True, 1), (1, 1.0), (0.0, -0.0), (b"a", b"b")],
+)
+def test_tuple_label_members_keep_exact_type_tagged_identity(
+    left: object,
+    right: object,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["x"]), pa.array(["y"])), ((left,), (right,))),
+        _parse_plan(),
+    )
+
+    assert compiled.source_label_tokens[0] != compiled.source_label_tokens[1]
+    assert hash(compiled.source_label_tokens[0]) != hash(compiled.source_label_tokens[1])
+
+
+def test_nested_tuple_nan_labels_have_deterministic_plan_identity() -> None:
+    first = compile_normalization_plan(
+        _sample((pa.array(["x"]),), (("value", (float("nan"),)),)),
+        _parse_plan(),
+    )
+    second = compile_normalization_plan(
+        _sample((pa.array(["x"]),), (("value", (float("nan"),)),)),
+        _parse_plan(),
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+
+
+def test_hostile_tuple_label_member_is_never_executed_or_retained() -> None:
+    callbacks: list[str] = []
+
+    class HostileMember:
+        def __str__(self) -> str:
+            callbacks.append("str")
+            raise AssertionError("str must not run")
+
+        def __repr__(self) -> str:
+            callbacks.append("repr")
+            raise AssertionError("repr must not run")
+
+        def __format__(self, _spec: str) -> str:
+            callbacks.append("format")
+            raise AssertionError("format must not run")
+
+        def __hash__(self) -> int:
+            callbacks.append("hash")
+            raise AssertionError("hash must not run")
+
+        def __eq__(self, _other: object) -> bool:
+            callbacks.append("eq")
+            raise AssertionError("equality must not run")
+
+    member = HostileMember()
+    member_ref = weakref.ref(member)
+    label = ("safe", member)
+    sample = _sample((pa.array(["x"]),), (label,))
+
+    compiled = compile_normalization_plan(sample, _parse_plan())
+
+    assert hash(compiled)
+    assert callbacks == []
+    del sample, label, member
+    gc.collect()
+    assert member_ref() is None
+
+
+def test_tuple_label_structuralization_has_a_bounded_depth() -> None:
+    label: object = "leaf"
+    for _ in range(40):
+        label = (label,)
+
+    with pytest.raises(ValueError, match="tuple label exceeds structural limits"):
+        compile_normalization_plan(
+            _sample((pa.array(["x"]),), (label,)),
+            _parse_plan(),
+        )
+
+
+def test_label_mapping_and_condition_resolution_are_linear_in_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    width = 80
+    labels = tuple(f"column-{ordinal:03d}" for ordinal in range(width))
+    renamed = tuple(f"renamed-{ordinal:03d}" for ordinal in range(width))
+    token_calls = 0
+    equality_calls = 0
+    real_token = normalization_plan._display_label_token
+    real_equality = normalization_plan._LabelToken.__eq__
+
+    def counted_token(value: object, *args: object, **kwargs: object) -> object:
+        nonlocal token_calls
+        token_calls += 1
+        return real_token(value, *args, **kwargs)  # type: ignore[arg-type]
+
+    def counted_equality(left: object, right: object) -> object:
+        nonlocal equality_calls
+        equality_calls += 1
+        return real_equality(left, right)
+
+    monkeypatch.setattr(normalization_plan, "_display_label_token", counted_token)
+    monkeypatch.setattr(normalization_plan._LabelToken, "__eq__", counted_equality)
+    arrays = tuple(pa.array(["1"]) for _ in range(width))
+
+    compiled = compile_normalization_plan(
+        _sample(arrays, labels),
+        _parse_plan(
+            type_hints=dict.fromkeys(labels, "INTEGER"),
+            column_renames=dict(zip(labels, renamed, strict=True)),
+            drop_conditions=[{"column": label, "value": -1} for label in renamed],
+        ),
+    )
+
+    assert len(compiled.columns) == width
+    assert token_calls <= width * 6
+    assert equality_calls <= width * 6
 
 
 @pytest.mark.parametrize("sanitize", [False, True])

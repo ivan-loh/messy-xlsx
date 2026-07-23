@@ -33,6 +33,12 @@ from messy_xlsx.parsing.streams import _run_cleanups
 
 _HORIZONTAL_SPACE: Final = re.compile(r"[ \t\xa0]+")
 _ALL_SPACE: Final = re.compile(r"[\s\xa0]+")
+_ARROW_UNICODE_SPACE_CHARS: Final = (
+    r"\x09-\x0d\x1c-\x20\x{0085}\x{00a0}\x{1680}"
+    r"\x{2000}-\x{200a}\x{2028}-\x{2029}\x{202f}\x{205f}\x{3000}"
+)
+_ARROW_ALL_SPACE: Final = rf"[{_ARROW_UNICODE_SPACE_CHARS}]+"
+_ARROW_BLANK: Final = rf"^[{_ARROW_UNICODE_SPACE_CHARS}]*$"
 _CURRENCY: Final = re.compile(r"(?:[$€£¥₹]|CHF|kr|zł)")
 _ACCOUNTING: Final = re.compile(r"^\((.*)\)$")
 _INTEGER_TEXT: Final = re.compile(r"^[+-]?\d+$")
@@ -54,6 +60,7 @@ class ArrowNormalizationOperation:
         self._plan = plan
         self._row_offset = 0
         self._terminal = False
+        self._missing_marker_arrays: dict[pa.DataType, pa.Array] = {}
 
     @property
     def schema(self) -> pa.Schema:
@@ -119,7 +126,7 @@ class ArrowNormalizationOperation:
     ) -> pa.Array:
         if pa.types.is_null(rule.output_type):
             return self._normalize_null_column(array, rule, row_base)
-        fast = _normalize_arrow_column(array, rule)
+        fast = _normalize_arrow_column(array, rule, self._missing_marker_arrays)
         if fast is not None:
             return fast
         if rule.semantic is SemanticOperation.DATE and (
@@ -178,7 +185,7 @@ class ArrowNormalizationOperation:
         rule: ColumnNormalization,
         row_base: int,
     ) -> pa.Array:
-        cleaned = _normalize_arrow_strings(array, rule)
+        cleaned = _normalize_arrow_strings(array, rule, self._missing_marker_arrays)
         series = cleaned.to_pandas()
         parsed = pd.to_datetime(
             series,
@@ -225,8 +232,16 @@ class NormalizedStreamingReader:
         self._terminal = False
         try:
             operation = ArrowNormalizationOperation(plan)
-            self._operation = operation
-            self._schema = operation.schema
+        except BaseException as error:
+            _mark_semantic_failure(error)
+            self._terminate(
+                primary_error=error,
+                primary_traceback=_exception_traceback(error),
+            )
+            raise
+        self._operation = operation
+        self._schema = operation.schema
+        try:
             raw_schema = reader.schema
             if not isinstance(raw_schema, pa.Schema) or not raw_schema.equals(
                 operation.input_schema,
@@ -236,7 +251,6 @@ class NormalizedStreamingReader:
                     "normalized reader input schema does not match its compiled plan"
                 )
         except BaseException as error:
-            _mark_semantic_failure(error)
             self._terminate(
                 primary_error=error,
                 primary_traceback=_exception_traceback(error),
@@ -344,12 +358,13 @@ class NormalizedStreamingReader:
 def _normalize_arrow_column(
     array: pa.Array,
     rule: ColumnNormalization,
+    missing_marker_arrays: dict[pa.DataType, pa.Array],
 ) -> pa.Array | None:
     if rule.semantic is SemanticOperation.PASSTHROUGH and array.type == rule.output_type:
         return _normalize_arrow_passthrough(array, rule)
     if rule.semantic in {SemanticOperation.TEXT, SemanticOperation.IDENTIFIER}:
         if pa.types.is_string(array.type) or pa.types.is_large_string(array.type):
-            normalized = _normalize_arrow_strings(array, rule)
+            normalized = _normalize_arrow_strings(array, rule, missing_marker_arrays)
             return (
                 normalized
                 if normalized.type == rule.output_type
@@ -360,14 +375,14 @@ def _normalize_arrow_column(
     if rule.semantic is SemanticOperation.NUMBER and (
         pa.types.is_string(array.type) or pa.types.is_large_string(array.type)
     ):
-        return _normalize_arrow_number_strings(array, rule)
+        return _normalize_arrow_number_strings(array, rule, missing_marker_arrays)
     if rule.semantic is SemanticOperation.DATE:
         if pa.types.is_integer(array.type) or pa.types.is_floating(array.type):
             return _normalize_arrow_serial_dates(array, rule)
         if rule.date_format not in {None, "mixed"} and (
             pa.types.is_string(array.type) or pa.types.is_large_string(array.type)
         ):
-            return _normalize_arrow_fixed_dates(array, rule)
+            return _normalize_arrow_fixed_dates(array, rule, missing_marker_arrays)
     return None
 
 
@@ -386,30 +401,40 @@ def _normalize_arrow_passthrough(
     if "missing" not in rule.enabled_stages or not pa.types.is_floating(array.type):
         return array
     nan_mask = pc.fill_null(pc.is_nan(array), False)
+    if pc.any(nan_mask).as_py() is not True:
+        return array
     return pc.if_else(nan_mask, pa.scalar(None, type=array.type), array)
 
 
 def _normalize_arrow_strings(
     array: pa.Array,
     rule: ColumnNormalization,
+    missing_marker_arrays: dict[pa.DataType, pa.Array],
 ) -> pa.Array:
     normalized = array
     if "whitespace" in rule.enabled_stages:
-        normalized = pc.replace_substring_regex(
+        candidate = pc.replace_substring_regex(
             normalized,
-            pattern=r"[\s\x{00a0}]+",
+            pattern=_ARROW_ALL_SPACE,
             replacement=" ",
         )
-        normalized = pc.utf8_trim_whitespace(normalized)
+        candidate = pc.utf8_trim_whitespace(candidate)
+        if not _arrow_values_equal(candidate, normalized):
+            normalized = candidate
     if "missing" not in rule.enabled_stages:
         return normalized
-    markers = pa.array(sorted(rule.missing_values), type=normalized.type)
+    markers = missing_marker_arrays.get(normalized.type)
+    if markers is None:
+        markers = pa.array(sorted(rule.missing_values), type=normalized.type)
+        missing_marker_arrays[normalized.type] = markers
     marker_mask = pc.fill_null(pc.is_in(normalized, value_set=markers), False)
     blank_mask = pc.fill_null(
-        pc.match_substring_regex(normalized, pattern=r"^[\s\x{00a0}]*$"),
+        pc.match_substring_regex(normalized, pattern=_ARROW_BLANK),
         False,
     )
     missing_mask = pc.or_(marker_mask, blank_mask)
+    if pc.any(missing_mask).as_py() is not True:
+        return normalized
     return pc.if_else(
         missing_mask,
         pa.scalar(None, type=normalized.type),
@@ -417,11 +442,19 @@ def _normalize_arrow_strings(
     )
 
 
+def _arrow_values_equal(left: pa.Array, right: pa.Array) -> bool:
+    if len(left) == 0:
+        return True
+    equal = pc.fill_null(pc.equal(left, right), True)
+    return pc.all(equal).as_py() is True
+
+
 def _normalize_arrow_number_strings(
     array: pa.Array,
     rule: ColumnNormalization,
+    missing_marker_arrays: dict[pa.DataType, pa.Array],
 ) -> pa.Array | None:
-    normalized = _normalize_arrow_strings(array, rule)
+    normalized = _normalize_arrow_strings(array, rule, missing_marker_arrays)
     try:
         text = pc.replace_substring_regex(
             normalized,
@@ -508,10 +541,11 @@ def _normalize_arrow_serial_dates(
 def _normalize_arrow_fixed_dates(
     array: pa.Array,
     rule: ColumnNormalization,
+    missing_marker_arrays: dict[pa.DataType, pa.Array],
 ) -> pa.Array | None:
     assert rule.date_format is not None
     try:
-        cleaned = _normalize_arrow_strings(array, rule)
+        cleaned = _normalize_arrow_strings(array, rule, missing_marker_arrays)
         parsed = pc.strptime(
             cleaned,
             format=rule.date_format,
@@ -656,6 +690,8 @@ def _drop_all_null_rows(batch: pa.RecordBatch) -> pa.RecordBatch:
         return batch
     if batch.num_columns == 0:
         return _record_batch([], batch.schema, 0)
+    if any(column.null_count == 0 for column in batch.columns):
+        return batch
     keep = pc.is_valid(batch.column(0))
     for ordinal in range(1, batch.num_columns):
         keep = pc.or_(keep, pc.is_valid(batch.column(ordinal)))
@@ -728,7 +764,7 @@ def _scalar_regex_mask(
 
 def _is_arrow_safe_regex(pattern: re.Pattern[str]) -> bool:
     source = pattern.pattern
-    if pattern.flags & ~re.UNICODE or not source.isascii() or "(?" in source:
+    if pattern.flags & ~re.UNICODE or not source.isascii() or "(?" in source or "$" in source:
         return False
     unsafe_tokens = (
         r"\d",
