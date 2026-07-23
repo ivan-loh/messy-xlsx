@@ -25,7 +25,8 @@ from messy_xlsx.normalization.encoded import (
     encoded_logical_type,
     encoded_logical_validity,
     encoded_logical_view,
-    filter_run_end_encoded,
+    filter_encoded,
+    mask_encoded,
 )
 from messy_xlsx.normalization.plan import (
     ColumnNormalization,
@@ -747,15 +748,7 @@ def _drop_all_null_rows(batch: pa.RecordBatch) -> pa.RecordBatch:
         keep = pc.or_(keep, _logical_validity(batch.column(ordinal)))
     if pc.all(keep).as_py() is True:
         return batch
-    if not any(isinstance(column, pa.RunEndEncodedArray) for column in batch.columns):
-        return batch.filter(keep)
-    arrays: list[pa.Array] = []
-    for column in batch.columns:
-        if not isinstance(column, pa.RunEndEncodedArray):
-            arrays.append(cast("pa.Array", pc.filter(column, keep)))
-            continue
-        arrays.append(_filter_run_end_encoded(column, keep))
-    return _record_batch(arrays, batch.schema, len(arrays[0]))
+    return _filter_batch(batch, keep)
 
 
 def _has_no_logical_nulls(array: pa.Array) -> bool:
@@ -774,13 +767,6 @@ def _dictionary_logical_validity(array: pa.DictionaryArray) -> pa.BooleanArray:
     return encoded_logical_validity(array)
 
 
-def _filter_run_end_encoded(
-    array: pa.RunEndEncodedArray,
-    keep: pa.BooleanArray,
-) -> pa.RunEndEncodedArray:
-    return filter_run_end_encoded(array, keep)
-
-
 def _apply_regex_filter(
     batch: pa.RecordBatch,
     pattern: re.Pattern[str] | None,
@@ -795,7 +781,19 @@ def _apply_regex_filter(
         drop = pc.or_(drop, column_drop)
     if pc.any(drop).as_py() is not True:
         return batch
-    return batch.filter(pc.invert(drop))
+    return _filter_batch(batch, pc.invert(drop))
+
+
+def _filter_batch(
+    batch: pa.RecordBatch,
+    keep: pa.BooleanArray,
+) -> pa.RecordBatch:
+    safe_keep = cast("pa.BooleanArray", pc.fill_null(keep, False))
+    if pc.all(safe_keep).as_py() is True:
+        return batch
+    arrays = [filter_encoded(column, safe_keep) for column in batch.columns]
+    row_count = int(pc.sum(safe_keep).as_py())
+    return _record_batch(arrays, batch.schema, row_count)
 
 
 def _arrow_regex_mask(
@@ -912,7 +910,9 @@ def _apply_condition(
         if operand is None:
             return batch
         equal = _condition_equal(batch.column(ordinal), operand)
-        return batch if pc.any(equal).as_py() is not True else batch.filter(pc.invert(equal))
+        return (
+            batch if pc.any(equal).as_py() is not True else _filter_batch(batch, pc.invert(equal))
+        )
 
     arrays = list(batch.columns)
     changed = False
@@ -922,16 +922,14 @@ def _apply_condition(
         equal = _condition_equal(arrays[ordinal], operand)
         if pc.any(equal).as_py() is not True:
             continue
-        arrays[ordinal] = pc.if_else(
-            equal,
-            pa.nulls(batch.num_rows, type=arrays[ordinal].type),
-            arrays[ordinal],
-        )
+        arrays[ordinal] = mask_encoded(arrays[ordinal], equal)
         changed = True
     return _record_batch(arrays, batch.schema, batch.num_rows) if changed else batch
 
 
 def _condition_equal(array: pa.Array, operand: pa.Scalar) -> pa.BooleanArray:
+    if isinstance(array, (pa.DictionaryArray, pa.RunEndEncodedArray)):
+        array = encoded_logical_view(array)
     if pa.types.is_float16(array.type):
         array = cast("pa.Array", pc.cast(array, pa.float32(), safe=True))
         operand = pa.scalar(operand.as_py(), type=pa.float32())

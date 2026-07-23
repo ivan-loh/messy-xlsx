@@ -42,6 +42,52 @@ def encoded_logical_validity(array: pa.Array) -> pa.BooleanArray:
     return cast("pa.BooleanArray", pc.fill_null(projected, False))
 
 
+def filter_encoded(array: pa.Array, keep: pa.BooleanArray) -> pa.Array:
+    """Filter an array while retaining any recursive dictionary/REE type."""
+    if len(array) != len(keep):
+        raise ValueError("encoded filter mask length must match the logical slice")
+    safe_keep = cast("pa.BooleanArray", pc.fill_null(keep, False))
+    if pc.all(safe_keep).as_py() is True:
+        return array
+    if isinstance(array, pa.RunEndEncodedArray):
+        return filter_run_end_encoded(array, safe_keep)
+    return cast("pa.Array", pc.filter(array, safe_keep))
+
+
+def mask_encoded(array: pa.Array, mask: pa.BooleanArray) -> pa.Array:
+    """Replace selected logical values with null while retaining encoded type."""
+    if len(array) != len(mask):
+        raise ValueError("encoded mask length must match the logical slice")
+    safe_mask = cast("pa.BooleanArray", pc.fill_null(mask, False))
+    if pc.any(safe_mask).as_py() is not True:
+        return array
+    if isinstance(array, pa.RunEndEncodedArray):
+        encoded_logical_type(array.type)
+        return _mask_run_end_encoded(array, safe_mask, 0, [MAX_ENCODED_NODES])
+    if isinstance(array, pa.DictionaryArray):
+        indices = cast(
+            "pa.Array",
+            pc.if_else(
+                safe_mask,
+                pa.nulls(len(array), type=array.indices.type),
+                array.indices,
+            ),
+        )
+        return pa.DictionaryArray.from_arrays(
+            indices,
+            array.dictionary,
+            ordered=cast("pa.DictionaryType", array.type).ordered,
+        )
+    return cast(
+        "pa.Array",
+        pc.if_else(
+            safe_mask,
+            pa.nulls(len(array), type=array.type),
+            array,
+        ),
+    )
+
+
 def filter_run_end_encoded(
     array: pa.RunEndEncodedArray,
     keep: pa.BooleanArray,
@@ -76,16 +122,27 @@ def _project_encoded(
     leaf_projection: Callable[[pa.Array], pa.Array],
     depth: int,
     budget: list[int],
+    indices: pa.Array | None = None,
 ) -> pa.Array:
     _consume_projection_budget(array, depth, budget)
+    if indices is not None:
+        unique_indices, restore_indices = _compact_take_indices(indices, len(array))
+        projected_unique = _project_unique_encoded(
+            array,
+            unique_indices,
+            leaf_projection,
+            depth,
+            budget,
+        )
+        return cast("pa.Array", pc.take(projected_unique, restore_indices))
     if isinstance(array, pa.DictionaryArray):
-        dictionary_view = _project_encoded(
+        return _project_encoded(
             array.dictionary,
             leaf_projection,
             depth + 1,
             budget,
+            array.indices,
         )
-        return cast("pa.Array", pc.take(dictionary_view, array.indices))
     if isinstance(array, pa.RunEndEncodedArray):
         return _project_run_end_encoded(
             array,
@@ -94,6 +151,71 @@ def _project_encoded(
             budget,
         )
     return leaf_projection(array)
+
+
+def _project_unique_encoded(
+    array: pa.Array,
+    indices: pa.Array,
+    leaf_projection: Callable[[pa.Array], pa.Array],
+    depth: int,
+    budget: list[int],
+) -> pa.Array:
+    if isinstance(array, pa.DictionaryArray):
+        dictionary_indices = cast("pa.Array", pc.take(array.indices, indices))
+        return _project_encoded(
+            array.dictionary,
+            leaf_projection,
+            depth + 1,
+            budget,
+            dictionary_indices,
+        )
+    if isinstance(array, pa.RunEndEncodedArray):
+        physical_indices = _run_end_physical_indices(array, indices)
+        return _project_encoded(
+            array.values,
+            leaf_projection,
+            depth + 1,
+            budget,
+            physical_indices,
+        )
+    selected = cast("pa.Array", pc.take(array, indices))
+    return leaf_projection(selected)
+
+
+def _compact_take_indices(
+    indices: pa.Array,
+    upper_bound: int,
+) -> tuple[pa.Int64Array, pa.Int64Array]:
+    unique: list[int] = []
+    positions: dict[int, int] = {}
+    restore: list[int | None] = []
+    for scalar in indices:
+        if not scalar.is_valid:
+            restore.append(None)
+            continue
+        value = cast("int", scalar.as_py())
+        if value < 0 or value >= upper_bound:
+            raise IndexError("encoded logical index is out of bounds")
+        position = positions.get(value)
+        if position is None:
+            position = len(unique)
+            positions[value] = position
+            unique.append(value)
+        restore.append(position)
+    return (
+        pa.array(unique, type=pa.int64()),
+        pa.array(restore, type=pa.int64()),
+    )
+
+
+def _run_end_physical_indices(
+    array: pa.RunEndEncodedArray,
+    indices: pa.Array,
+) -> pa.Int64Array:
+    return pa.array(
+        [array.slice(cast("int", scalar.as_py()), 1).find_physical_offset() for scalar in indices],
+        type=pa.int64(),
+    )
 
 
 def _project_run_end_encoded(
@@ -146,6 +268,31 @@ def _take_run_end_encoded(
     return _rebuild_run_end_encoded(
         trimmed,
         selected_positions,
+        depth,
+        budget,
+    )
+
+
+def _mask_run_end_encoded(
+    array: pa.RunEndEncodedArray,
+    mask: pa.BooleanArray,
+    depth: int,
+    budget: list[int],
+) -> pa.RunEndEncodedArray:
+    _consume_projection_budget(array, depth, budget)
+    trimmed = trim_run_end_encoded(array)
+    physical_positions = _decode_physical_positions(trimmed)
+    masked_positions = cast(
+        "pa.Array",
+        pc.if_else(
+            mask,
+            pa.nulls(len(mask), type=physical_positions.type),
+            physical_positions,
+        ),
+    )
+    return _rebuild_run_end_encoded(
+        trimmed,
+        masked_positions,
         depth,
         budget,
     )

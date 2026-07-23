@@ -478,17 +478,18 @@ def _compile_condition_operand(
     value: object,
     output_type: pa.DataType,
 ) -> pa.Scalar | None:
-    if value is None or pa.types.is_null(output_type):
+    logical_type = encoded_logical_type(output_type)
+    if value is None or pa.types.is_null(logical_type):
         return None
     if isinstance(value, float) and math.isnan(value):
         return None
     if isinstance(value, tuple) and value[:1] == ("unsupported",):
         return None
-    if not _condition_value_matches_type(value, output_type):
+    if not _condition_value_matches_type(value, logical_type):
         return None
-    scalar_value = _coerce_condition_value(value, output_type)
+    scalar_value = _coerce_condition_value(value, logical_type)
     try:
-        return pa.scalar(scalar_value, type=output_type)
+        return pa.scalar(scalar_value, type=logical_type)
     except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError, TypeError, ValueError):
         return None
 

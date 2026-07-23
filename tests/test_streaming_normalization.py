@@ -16,6 +16,7 @@ import pyarrow as pa
 import pytest
 
 import messy_xlsx.normalization.arrow_pipeline as arrow_pipeline
+import messy_xlsx.normalization.encoded as encoded
 import messy_xlsx.normalization.plan as normalization_plan
 from messy_xlsx import SheetConfig
 from messy_xlsx._fallback_signals import _fallback_block_reason, _FallbackBlockReason
@@ -749,6 +750,80 @@ def test_nested_dictionary_logical_nulls_are_filtered_recursively() -> None:
     assert result.schema.equals(batch.schema, check_metadata=True)
 
 
+def test_nested_dictionary_projection_decodes_only_referenced_ree_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dictionary = pa.RunEndEncodedArray.from_arrays(
+        pa.array([500_000, 1_000_000], type=pa.int32()),
+        pa.array([None, 7], type=pa.int64()),
+    )
+    values = pa.DictionaryArray.from_arrays(
+        pa.array([999_999, None, 0, 999_999], type=pa.int32()),
+        dictionary,
+    )
+    decoded_lengths: list[int] = []
+    decoded_buffer_bytes: list[int] = []
+    real_decode = encoded.pc.run_end_decode
+
+    def counted_decode(array: pa.RunEndEncodedArray) -> pa.Array:
+        decoded = real_decode(array)
+        decoded_lengths.append(len(array))
+        decoded_buffer_bytes.append(
+            sum(buffer.size for buffer in decoded.buffers() if buffer is not None)
+        )
+        return decoded
+
+    monkeypatch.setattr(encoded.pc, "run_end_decode", counted_decode)
+
+    logical = encoded.encoded_logical_view(values)
+    validity = encoded.encoded_logical_validity(values)
+
+    assert logical.to_pylist() == [7, None, None, 7]
+    assert validity.to_pylist() == [True, False, False, True]
+    assert max(decoded_lengths, default=0) <= 2
+    assert max(decoded_buffer_bytes, default=0) <= 64
+
+
+def test_nested_dictionary_projection_takes_only_referenced_dictionary_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inner_indices = pa.concat_arrays(
+        [
+            pa.repeat(pa.scalar(0, type=pa.int8()), 500_000),
+            pa.repeat(pa.scalar(1, type=pa.int8()), 500_000),
+        ]
+    )
+    dictionary = pa.DictionaryArray.from_arrays(
+        inner_indices,
+        pa.array([None, 7], type=pa.int64()),
+    )
+    values = pa.DictionaryArray.from_arrays(
+        pa.array([999_999, None, 0, 999_999], type=pa.int32()),
+        dictionary,
+    )
+    taken_lengths: list[int] = []
+    taken_buffer_bytes: list[int] = []
+    real_take = encoded.pc.take
+
+    def counted_take(array: pa.Array, indices: pa.Array) -> pa.Array:
+        taken = real_take(array, indices)
+        taken_lengths.append(len(taken))
+        taken_buffer_bytes.append(
+            sum(buffer.size for buffer in taken.buffers() if buffer is not None)
+        )
+        return taken
+
+    monkeypatch.setattr(encoded.pc, "take", counted_take)
+
+    logical = encoded.encoded_logical_view(values)
+    validity = encoded.encoded_logical_validity(values)
+
+    assert logical.to_pylist() == [7, None, None, 7]
+    assert validity.to_pylist() == [True, False, False, True]
+    assert max(taken_lengths, default=0) <= 4
+    assert max(taken_buffer_bytes, default=0) <= 64
+
+
 @pytest.mark.parametrize(
     ("indices", "expected", "unchanged"),
     [
@@ -874,6 +949,181 @@ def test_trailing_dense_ree_slice_preserves_batch_identity() -> None:
     result = arrow_pipeline._drop_all_null_rows(batch)
 
     assert result is batch
+
+
+def test_passthrough_ree_regex_filter_preserves_encoded_schema() -> None:
+    values = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 3], type=pa.int16()),
+        pa.array([1, 2], type=pa.int64()),
+    )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(drop_regex=r"^2$", batch_size=3),
+    )
+    batch = pa.record_batch([values], schema=compiled.input_schema)
+
+    result = ArrowNormalizationOperation(compiled).normalize(batch)
+
+    assert result.column(0).to_pylist() == [1]
+    assert result.column(0).type == values.type
+    assert result.schema.equals(compiled.schema, check_metadata=True)
+
+
+def test_passthrough_ree_condition_uses_logical_leaf_and_encoded_filter() -> None:
+    values = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 3], type=pa.int16()),
+        pa.array([1, 2], type=pa.int64()),
+    )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(
+            drop_conditions=[{"column": "value", "value": 2}],
+            batch_size=3,
+        ),
+    )
+    batch = pa.record_batch([values], schema=compiled.input_schema)
+
+    result = ArrowNormalizationOperation(compiled).normalize(batch)
+
+    assert compiled.drop_conditions[0].operands == (pa.scalar(2, type=pa.int64()),)
+    assert result.column(0).to_pylist() == [1]
+    assert result.column(0).type == values.type
+    assert result.schema.equals(compiled.schema, check_metadata=True)
+
+
+@pytest.mark.parametrize(
+    "filter_config",
+    [
+        {"drop_regex": r"^999$"},
+        {"drop_conditions": [{"column": "value", "value": 999}]},
+    ],
+)
+def test_passthrough_ree_all_keep_and_empty_filters_preserve_identity(
+    filter_config: dict[str, object],
+) -> None:
+    values = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2], type=pa.int16()),
+        pa.array([1, 2], type=pa.int64()),
+    )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(**filter_config),
+    )
+    batch = pa.record_batch([values], schema=compiled.input_schema)
+    empty_batch = pa.record_batch([values.slice(0, 0)], schema=compiled.input_schema)
+
+    result = ArrowNormalizationOperation(compiled).normalize(batch)
+    empty_result = ArrowNormalizationOperation(compiled).normalize(empty_batch)
+
+    assert result is batch
+    assert empty_result is empty_batch
+
+
+@pytest.mark.parametrize(
+    "filter_config",
+    [
+        {"drop_regex": r"^2$"},
+        {"drop_conditions": [{"column": "value", "value": 2}]},
+    ],
+)
+def test_passthrough_ree_all_drop_filters_preserve_empty_encoded_schema(
+    filter_config: dict[str, object],
+) -> None:
+    values = pa.RunEndEncodedArray.from_arrays(
+        pa.array([2], type=pa.int16()),
+        pa.array([2], type=pa.int64()),
+    )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(**filter_config),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.num_rows == 0
+    assert result.column(0).type == values.type
+    assert result.schema.equals(compiled.schema, check_metadata=True)
+
+
+def test_passthrough_sliced_ree_filter_decodes_only_the_logical_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = pa.RunEndEncodedArray.from_arrays(
+        pa.array([500_000, 1_000_000], type=pa.int32()),
+        pa.array([1, 2], type=pa.int64()),
+    )
+    values = parent.slice(499_999, 2)
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(drop_regex=r"^2$"),
+    )
+    decoded_lengths: list[int] = []
+    decoded_buffer_bytes: list[int] = []
+    real_decode = encoded.pc.run_end_decode
+
+    def counted_decode(array: pa.RunEndEncodedArray) -> pa.Array:
+        decoded = real_decode(array)
+        decoded_lengths.append(len(array))
+        decoded_buffer_bytes.append(
+            sum(buffer.size for buffer in decoded.buffers() if buffer is not None)
+        )
+        return decoded
+
+    monkeypatch.setattr(encoded.pc, "run_end_decode", counted_decode)
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == [1]
+    assert result.column(0).type == values.type
+    assert max(decoded_lengths, default=0) <= 2
+    assert max(decoded_buffer_bytes, default=0) <= 64
+
+
+@pytest.mark.parametrize("nesting", ["dictionary_ree", "ree_dictionary", "ree_ree"])
+def test_passthrough_nested_encoded_conditions_preserve_schema(nesting: str) -> None:
+    if nesting == "dictionary_ree":
+        dictionary = pa.RunEndEncodedArray.from_arrays(
+            pa.array([1, 2], type=pa.int16()),
+            pa.array([1, 2], type=pa.int64()),
+        )
+        values: pa.Array = pa.DictionaryArray.from_arrays(
+            pa.array([0, 1], type=pa.int8()),
+            dictionary,
+        )
+    elif nesting == "ree_dictionary":
+        run_values = pa.DictionaryArray.from_arrays(
+            pa.array([0, 1], type=pa.int8()),
+            pa.array([1, 2], type=pa.int64()),
+        )
+        values = pa.RunEndEncodedArray.from_arrays(
+            pa.array([1, 2], type=pa.int16()),
+            run_values,
+        )
+    else:
+        inner = pa.RunEndEncodedArray.from_arrays(
+            pa.array([1, 2], type=pa.int16()),
+            pa.array([1, 2], type=pa.int64()),
+        )
+        values = pa.RunEndEncodedArray.from_arrays(
+            pa.array([1, 2], type=pa.int16()),
+            inner,
+        )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(drop_conditions=[{"column": "value", "value": 2}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == [1]
+    assert result.column(0).type == values.type
+    assert result.schema.equals(compiled.schema, check_metadata=True)
 
 
 def test_late_value_uses_global_input_offset_across_filtered_rows() -> None:
@@ -1738,6 +1988,35 @@ def test_decimal_condition_preserves_duplicate_label_positional_masking() -> Non
     )
 
     assert result.to_pydict() == {"0": [None, 2], "1": [None, 3]}
+
+
+def test_passthrough_ree_duplicate_condition_masks_encoded_values() -> None:
+    arrays = (
+        pa.RunEndEncodedArray.from_arrays(
+            pa.array([1, 2], type=pa.int16()),
+            pa.array([1, 2], type=pa.int64()),
+        ),
+        pa.RunEndEncodedArray.from_arrays(
+            pa.array([1, 2], type=pa.int16()),
+            pa.array([1, 3], type=pa.int64()),
+        ),
+    )
+    compiled = compile_normalization_plan(
+        _sample(arrays, ("value", "value")),
+        _parse_plan(
+            drop_conditions=[{"column": "value", "value": 1}],
+            batch_size=2,
+        ),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch(list(arrays), schema=compiled.input_schema)
+    )
+
+    assert result.to_pydict() == {"0": [None, 2], "1": [None, 3]}
+    assert result.schema.equals(compiled.schema, check_metadata=True)
+    assert result.column(0).type == arrays[0].type
+    assert result.column(1).type == arrays[1].type
 
 
 def test_hostile_numeric_subclass_condition_is_never_executed_or_retained() -> None:
