@@ -676,18 +676,25 @@ def _freeze(  # noqa: C901
         if preserve_identity_reference:
             return _freeze_identity_reference(value)
         raise TypeError(_ENUM_SNAPSHOT_ERROR)
-    if value is None or type(value) in {bool, int, str, bytes}:
+    value_type = type(value)
+    if (
+        value is None
+        or value_type is bool
+        or value_type is int
+        or value_type is str
+        or value_type is bytes
+    ):
         return value
-    if type(value) is float:
+    if value_type is float:
         return _FrozenFloat(value.hex())
-    if type(value) is complex:
+    if value_type is complex:
         return _FrozenComplex(
             _FrozenFloat(value.real.hex()),
             _FrozenFloat(value.imag.hex()),
         )
-    if type(value) is Decimal:
+    if value_type is Decimal:
         return _FrozenDecimal(str(value))
-    if type(value) is datetime:
+    if value_type is datetime:
         frozen_timezone = _freeze_stdlib_timezone(value.tzinfo, "datetime")
         return _FrozenDatetime(
             value.year,
@@ -700,9 +707,9 @@ def _freeze(  # noqa: C901
             frozen_timezone,
             value.fold,
         )
-    if type(value) is date:
+    if value_type is date:
         return _FrozenDate(value.year, value.month, value.day)
-    if type(value) is time:
+    if value_type is time:
         return _FrozenTime(
             value.hour,
             value.minute,
@@ -711,9 +718,9 @@ def _freeze(  # noqa: C901
             _freeze_stdlib_timezone(value.tzinfo, "time"),
             value.fold,
         )
-    if type(value) is timedelta:
+    if value_type is timedelta:
         return _FrozenTimedelta(value.days, value.seconds, value.microseconds)
-    if type(value) is UUID:
+    if value_type is UUID:
         return _FrozenUUID(value.int)
     if isinstance(value, type):
         type_module, type_qualname = _safe_type_description(value)
@@ -1231,17 +1238,17 @@ def _safe_type_description(value_type: type[Any]) -> tuple[str, str]:
 
 def _is_safely_reconstructable_python_object(value: Any) -> bool:
     """Reject C-backed values whose complete hidden state cannot be captured."""
-    return _has_object_allocation_layout(type(value), set())
+    return _has_object_allocation_layout(type(value), [])
 
 
 def _has_object_allocation_layout(
     value_type: type[Any],
-    seen: set[type[Any]],
+    seen: list[type[Any]],
 ) -> bool:
     """Accept Python allocation overrides only over object-layout base types."""
-    if value_type is object or value_type in seen:
+    if value_type is object or any(value_type is candidate for candidate in seen):
         return True
-    seen.add(value_type)
+    seen.append(value_type)
 
     try:
         flags = type.__getattribute__(value_type, "__flags__")

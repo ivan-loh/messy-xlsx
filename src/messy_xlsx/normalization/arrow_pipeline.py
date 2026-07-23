@@ -39,6 +39,10 @@ _ARROW_UNICODE_SPACE_CHARS: Final = (
 )
 _ARROW_ALL_SPACE: Final = rf"[{_ARROW_UNICODE_SPACE_CHARS}]+"
 _ARROW_BLANK: Final = rf"^[{_ARROW_UNICODE_SPACE_CHARS}]*$"
+_ARROW_NORMALIZED_WHITESPACE: Final = (
+    rf"^(?:[^{_ARROW_UNICODE_SPACE_CHARS}]+"
+    rf"(?: [^{_ARROW_UNICODE_SPACE_CHARS}]+)*)?$"
+)
 _CURRENCY: Final = re.compile(r"(?:[$€£¥₹]|CHF|kr|zł)")
 _ACCOUNTING: Final = re.compile(r"^\((.*)\)$")
 _INTEGER_TEXT: Final = re.compile(r"^[+-]?\d+$")
@@ -124,8 +128,18 @@ class ArrowNormalizationOperation:
         rule: ColumnNormalization,
         row_base: int,
     ) -> pa.Array:
+        array = _decode_dictionary_strings(array)
         if pa.types.is_null(rule.output_type):
             return self._normalize_null_column(array, rule, row_base)
+        if (
+            rule.semantic is SemanticOperation.DATE
+            and rule.timezone is not None
+            and (pa.types.is_string(array.type) or pa.types.is_large_string(array.type))
+        ):
+            mismatch = _first_fixed_timezone_mismatch(array, rule.timezone)
+            if mismatch is not None:
+                offset, value = mismatch
+                self._raise_incompatible(rule, row_base + offset, value)
         fast = _normalize_arrow_column(array, rule, self._missing_marker_arrays)
         if fast is not None:
             return fast
@@ -225,23 +239,21 @@ class NormalizedStreamingReader:
         reader: StreamingBatchReader,
         plan: NormalizationPlan,
     ) -> None:
-        self._reader: StreamingBatchReader | None = reader
-        self._schema = pa.schema([])
+        self._reader: StreamingBatchReader | None = None
+        self._schema: pa.Schema | None = None
         self._operation: ArrowNormalizationOperation | None = None
         self._closed = False
         self._terminal = False
+        self._reader = reader
         try:
-            operation = ArrowNormalizationOperation(plan)
-        except BaseException as error:
-            _mark_semantic_failure(error)
-            self._terminate(
-                primary_error=error,
-                primary_traceback=_exception_traceback(error),
-            )
-            raise
-        self._operation = operation
-        self._schema = operation.schema
-        try:
+            self._schema = pa.schema([])
+            try:
+                operation = ArrowNormalizationOperation(plan)
+            except BaseException as error:
+                _mark_semantic_failure(error)
+                raise
+            self._operation = operation
+            self._schema = operation.schema
             raw_schema = reader.schema
             if not isinstance(raw_schema, pa.Schema) or not raw_schema.equals(
                 operation.input_schema,
@@ -259,7 +271,9 @@ class NormalizedStreamingReader:
 
     @property
     def schema(self) -> pa.Schema:
-        return self._schema
+        schema = self._schema
+        assert schema is not None
+        return schema
 
     def read_next_batch(self) -> pa.RecordBatch | None:
         """Return the next non-empty normalized batch or sticky EOF."""
@@ -386,6 +400,15 @@ def _normalize_arrow_column(
     return None
 
 
+def _decode_dictionary_strings(array: pa.Array) -> pa.Array:
+    if not isinstance(array, pa.DictionaryArray):
+        return array
+    value_type = cast("pa.DictionaryType", array.type).value_type
+    if not (pa.types.is_string(value_type) or pa.types.is_large_string(value_type)):
+        return array
+    return cast("pa.Array", pc.dictionary_decode(array))
+
+
 def _close_owned_reader(reader: object) -> None:
     """Close the required source-reader capability without optional semantics."""
     close = getattr(reader, "close", None)
@@ -413,14 +436,20 @@ def _normalize_arrow_strings(
 ) -> pa.Array:
     normalized = array
     if "whitespace" in rule.enabled_stages:
-        candidate = pc.replace_substring_regex(
-            normalized,
-            pattern=_ARROW_ALL_SPACE,
-            replacement=" ",
+        already_normalized = pc.fill_null(
+            pc.match_substring_regex(
+                normalized,
+                pattern=_ARROW_NORMALIZED_WHITESPACE,
+            ),
+            True,
         )
-        candidate = pc.utf8_trim_whitespace(candidate)
-        if not _arrow_values_equal(candidate, normalized):
-            normalized = candidate
+        if pc.all(already_normalized).as_py() is not True:
+            normalized = pc.replace_substring_regex(
+                normalized,
+                pattern=_ARROW_ALL_SPACE,
+                replacement=" ",
+            )
+            normalized = pc.utf8_trim_whitespace(normalized)
     if "missing" not in rule.enabled_stages:
         return normalized
     markers = missing_marker_arrays.get(normalized.type)
@@ -440,13 +469,6 @@ def _normalize_arrow_strings(
         pa.scalar(None, type=normalized.type),
         normalized,
     )
-
-
-def _arrow_values_equal(left: pa.Array, right: pa.Array) -> bool:
-    if len(left) == 0:
-        return True
-    equal = pc.fill_null(pc.equal(left, right), True)
-    return pc.all(equal).as_py() is True
 
 
 def _normalize_arrow_number_strings(
@@ -562,6 +584,28 @@ def _normalize_arrow_fixed_dates(
         )
     except _ARROW_CONVERSION_ERRORS:
         return None
+
+
+def _first_fixed_timezone_mismatch(
+    array: pa.Array,
+    expected_timezone: str,
+) -> tuple[int, str] | None:
+    match = re.fullmatch(r"([+-])(\d{2}):(\d{2})", expected_timezone)
+    if match is None:
+        raise RuntimeError("compiled text timezone must be a fixed offset")
+    direction = 1 if match.group(1) == "+" else -1
+    expected_offset = direction * (int(match.group(2)) * 3_600 + int(match.group(3)) * 60)
+    for offset, scalar in enumerate(array):
+        if not scalar.is_valid:
+            continue
+        value = cast("str", scalar.as_py())
+        try:
+            parsed_offset = pd.Timestamp(value).utcoffset()
+        except (OverflowError, TypeError, ValueError):
+            continue
+        if parsed_offset is None or parsed_offset.total_seconds() != expected_offset:
+            return offset, value
+    return None
 
 
 def _normalize_scalar(value: object, rule: ColumnNormalization) -> object | None:
@@ -690,14 +734,37 @@ def _drop_all_null_rows(batch: pa.RecordBatch) -> pa.RecordBatch:
         return batch
     if batch.num_columns == 0:
         return _record_batch([], batch.schema, 0)
-    if any(column.null_count == 0 for column in batch.columns):
+    if any(_has_no_logical_nulls(column) for column in batch.columns):
         return batch
-    keep = pc.is_valid(batch.column(0))
+    keep = _logical_validity(batch.column(0))
     for ordinal in range(1, batch.num_columns):
-        keep = pc.or_(keep, pc.is_valid(batch.column(ordinal)))
+        keep = pc.or_(keep, _logical_validity(batch.column(ordinal)))
     if pc.all(keep).as_py() is True:
         return batch
-    return batch.filter(keep)
+    if not any(isinstance(column, pa.RunEndEncodedArray) for column in batch.columns):
+        return batch.filter(keep)
+    arrays: list[pa.Array] = []
+    for column in batch.columns:
+        if not isinstance(column, pa.RunEndEncodedArray):
+            arrays.append(cast("pa.Array", pc.filter(column, keep)))
+            continue
+        decoded = cast("pa.Array", pc.run_end_decode(column))
+        filtered = cast("pa.Array", pc.filter(decoded, keep))
+        run_end_type = cast("pa.RunEndEncodedType", column.type).run_end_type
+        arrays.append(pc.run_end_encode(filtered, run_end_type=run_end_type))
+    return _record_batch(arrays, batch.schema, len(arrays[0]))
+
+
+def _has_no_logical_nulls(array: pa.Array) -> bool:
+    if isinstance(array, pa.RunEndEncodedArray):
+        return bool(array.values.null_count == 0)
+    return bool(array.null_count == 0)
+
+
+def _logical_validity(array: pa.Array) -> pa.BooleanArray:
+    if isinstance(array, pa.RunEndEncodedArray):
+        array = cast("pa.Array", pc.run_end_decode(array))
+    return cast("pa.BooleanArray", pc.is_valid(array))
 
 
 def _apply_regex_filter(
@@ -749,6 +816,8 @@ def _scalar_regex_mask(
     column: pa.Array,
     pattern: re.Pattern[str],
 ) -> pa.BooleanArray:
+    if not _supports_scalar_regex_text(column.type):
+        return cast("pa.BooleanArray", pa.repeat(pa.scalar(False), len(column)))
     drop: list[bool] = []
     for scalar in column:
         if not scalar.is_valid:
@@ -760,6 +829,25 @@ def _scalar_regex_mask(
             and pattern.search(_regex_text(value)) is not None
         )
     return pa.array(drop, type=pa.bool_())
+
+
+def _supports_scalar_regex_text(value_type: pa.DataType) -> bool:
+    while pa.types.is_dictionary(value_type) or pa.types.is_run_end_encoded(value_type):
+        value_type = value_type.value_type
+    return bool(
+        pa.types.is_string(value_type)
+        or pa.types.is_large_string(value_type)
+        or pa.types.is_binary(value_type)
+        or pa.types.is_large_binary(value_type)
+        or pa.types.is_fixed_size_binary(value_type)
+        or pa.types.is_boolean(value_type)
+        or pa.types.is_integer(value_type)
+        or pa.types.is_floating(value_type)
+        or pa.types.is_decimal(value_type)
+        or pa.types.is_date(value_type)
+        or pa.types.is_timestamp(value_type)
+        or pa.types.is_time(value_type)
+    )
 
 
 def _is_arrow_safe_regex(pattern: re.Pattern[str]) -> bool:
@@ -840,10 +928,11 @@ def _record_batch(
 
 
 def _safe_display_label(value: object) -> str:
-    if type(value) is str:
-        return f"str label(length={len(value)})"
-    if type(value) in {int, float, bool}:
-        return f"{type(value).__name__} label"
+    value_type = type(value)
+    if value_type is str:
+        return f"str label(length={len(cast('str', value))})"
+    if value_type is int or value_type is float or value_type is bool:
+        return f"{value_type.__name__} label"
     return "non-string label"
 
 
@@ -853,7 +942,14 @@ def _safe_value_description(value: object) -> str:
     if isinstance(value, bytes):
         return f"bytes(length={len(value)})"
     value_type = type(value)
-    if value_type in {int, float, bool, date, datetime, time}:
+    if (
+        value_type is int
+        or value_type is float
+        or value_type is bool
+        or value_type is date
+        or value_type is datetime
+        or value_type is time
+    ):
         return value_type.__name__
     return "unsupported value"
 
@@ -864,7 +960,15 @@ def _regex_text(value: object) -> str:
         return str.__str__(value)
     if value_type is bytes:
         return bytes.__str__(value)
-    if value_type in {int, float, bool, Decimal, date, datetime, time}:
+    if (
+        value_type is int
+        or value_type is float
+        or value_type is bool
+        or value_type is Decimal
+        or value_type is date
+        or value_type is datetime
+        or value_type is time
+    ):
         return str(value)
     return ""
 

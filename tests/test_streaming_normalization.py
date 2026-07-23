@@ -7,7 +7,7 @@ import inspect
 import math
 import re
 import weakref
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, dataclass
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from decimal import Decimal
 from typing import Any
@@ -551,6 +551,33 @@ def test_dense_column_skips_all_null_row_validity_mask_allocation(
     assert arrow_pipeline._drop_all_null_rows(batch) is batch
 
 
+def test_run_end_encoded_logical_nulls_do_not_take_the_dense_shortcut() -> None:
+    mixed = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2], type=pa.int16()),
+        pa.array([None, "x"]),
+    )
+    all_null = pa.RunEndEncodedArray.from_arrays(
+        pa.array([2], type=pa.int16()),
+        pa.array([None], type=pa.string()),
+    )
+    dense = pa.RunEndEncodedArray.from_arrays(
+        pa.array([1, 2], type=pa.int16()),
+        pa.array(["x", "y"]),
+    )
+    mixed_batch = pa.record_batch([mixed], names=["value"])
+    all_null_batch = pa.record_batch([all_null], names=["value"])
+    dense_batch = pa.record_batch([dense], names=["value"])
+
+    mixed_result = arrow_pipeline._drop_all_null_rows(mixed_batch)
+    all_null_result = arrow_pipeline._drop_all_null_rows(all_null_batch)
+
+    assert mixed_result.column(0).to_pylist() == ["x"]
+    assert mixed_result.schema.equals(mixed_batch.schema, check_metadata=True)
+    assert all_null_result.num_rows == 0
+    assert all_null_result.schema.equals(all_null_batch.schema, check_metadata=True)
+    assert arrow_pipeline._drop_all_null_rows(dense_batch) is dense_batch
+
+
 def test_late_value_uses_global_input_offset_across_filtered_rows() -> None:
     sample = _sample(
         (pa.array(["1", "2"]), pa.array(["keep", "drop"])),
@@ -722,6 +749,78 @@ def test_normalized_reader_validates_schema_transactionally_and_retains_schema()
 
     assert raw.close_calls == 1
     assert _fallback_block_reason(captured.value) is _FallbackBlockReason.CONFIGURATION
+
+
+@pytest.mark.parametrize("step", ["empty_schema", "operation_schema"])
+@pytest.mark.parametrize("failure_type", [OSError, MemoryError])
+def test_normalized_reader_constructor_closes_every_post_ownership_failure(
+    step: str,
+    failure_type: type[BaseException],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]),), ("amount",)),
+        _parse_plan(),
+    )
+    failure = failure_type(step)
+    raw = _Reader(compiled.input_schema)
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise failure
+
+    if step == "empty_schema":
+        monkeypatch.setattr(arrow_pipeline.pa, "schema", fail)
+    else:
+        monkeypatch.setattr(ArrowNormalizationOperation, "schema", property(fail))
+
+    with pytest.raises(failure_type) as captured:
+        NormalizedStreamingReader(raw, compiled)
+
+    assert captured.value is failure
+    assert raw.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("primary_type", "cleanup_type", "cleanup_wins"),
+    [
+        (OSError, RuntimeError, False),
+        (OSError, MemoryError, True),
+        (MemoryError, OSError, False),
+    ],
+)
+def test_normalized_reader_constructor_cleanup_preserves_failure_precedence(
+    primary_type: type[BaseException],
+    cleanup_type: type[BaseException],
+    cleanup_wins: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]),), ("amount",)),
+        _parse_plan(),
+    )
+    primary = primary_type("operation schema")
+    cleanup = cleanup_type("cleanup")
+    raw = _Reader(compiled.input_schema, close_error=cleanup)
+
+    def fail_schema(_operation: object) -> object:
+        raise primary
+
+    monkeypatch.setattr(
+        ArrowNormalizationOperation,
+        "schema",
+        property(fail_schema),
+    )
+
+    expected = cleanup if cleanup_wins else primary
+    with pytest.raises(type(expected)) as captured:
+        NormalizedStreamingReader(raw, compiled)
+
+    assert captured.value is expected
+    if cleanup_wins:
+        assert cleanup.backend_context["operation_failure"] == {"type": primary_type.__name__}
+    else:
+        assert primary.backend_context["cleanup_failure"] == {"type": cleanup_type.__name__}
+    assert raw.close_calls == 1
 
 
 def test_normalized_reader_suppresses_empty_outputs_and_closes_at_sticky_eof() -> None:
@@ -1415,6 +1514,36 @@ def test_string_regex_filter_uses_arrow_kernel(monkeypatch: pytest.MonkeyPatch) 
     assert result.column(0).to_pylist() == ["keep"]
 
 
+@pytest.mark.parametrize(
+    "values",
+    [
+        pa.array([["drop"], ["keep"]]),
+        pa.array(
+            [{"field": "drop"}, {"field": "keep"}],
+            type=pa.struct([("field", pa.string())]),
+        ),
+    ],
+)
+def test_nested_regex_columns_are_type_gated_before_scalar_materialization(
+    values: pa.Array,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((values,), ("nested",)),
+        _parse_plan(drop_regex="drop", batch_size=2),
+    )
+    batch = pa.record_batch([values], schema=compiled.input_schema)
+
+    def fail_materialization(_value: object) -> str:
+        raise AssertionError("nested regex values must not be materialized")
+
+    monkeypatch.setattr(arrow_pipeline, "_regex_text", fail_materialization)
+
+    result = ArrowNormalizationOperation(compiled).normalize(batch)
+
+    assert result is batch
+
+
 def test_mixed_date_fallback_calls_pandas_once_for_one_bounded_column(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1607,6 +1736,27 @@ def test_clean_float_and_string_normalization_reuses_input_buffers(
     ) == tuple(None if buffer is None else buffer.address for buffer in values.buffers())
 
 
+def test_clean_string_preflight_skips_replacement_and_trim_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = pa.array(["alpha", "two words"])
+    compiled = compile_normalization_plan(
+        _sample((values,), ("value",)),
+        _parse_plan(),
+    )
+    batch = pa.record_batch([values], schema=compiled.input_schema)
+
+    def fail_candidate(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("clean strings must not materialize transform candidates")
+
+    monkeypatch.setattr(arrow_pipeline.pc, "replace_substring_regex", fail_candidate)
+    monkeypatch.setattr(arrow_pipeline.pc, "utf8_trim_whitespace", fail_candidate)
+
+    result = ArrowNormalizationOperation(compiled).normalize(batch)
+
+    assert result is batch
+
+
 def test_missing_marker_array_is_cached_once_per_operation_and_released(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1758,6 +1908,70 @@ def test_hostile_label_type_metadata_is_never_executed_or_retained(
     gc.collect()
     assert label_ref() is None
     assert module_ref() is None
+
+
+@pytest.mark.parametrize("sanitize", [False, True])
+def test_hostile_metaclass_hash_is_not_used_for_label_classification(
+    sanitize: bool,
+) -> None:
+    callbacks: list[str] = []
+
+    class HostileMetaclass(type):
+        def __hash__(cls) -> int:
+            callbacks.append("metaclass-hash")
+            return type.__hash__(cls)
+
+    class HostileLabel(metaclass=HostileMetaclass):
+        pass
+
+    label = HostileLabel()
+    label_ref = weakref.ref(label)
+    sample = _sample((pa.array(["x"]),), (label,))
+
+    compiled = compile_normalization_plan(
+        sample,
+        _parse_plan(sanitize_column_names=sanitize),
+    )
+
+    assert normalization_plan._safe_name_text(label) == ""
+    assert arrow_pipeline._safe_display_label(label) == "non-string label"
+    assert arrow_pipeline._safe_value_description(label) == "unsupported value"
+    assert arrow_pipeline._regex_text(label) == ""
+    assert callbacks == []
+    assert hash(compiled)
+    del sample, label
+    gc.collect()
+    assert label_ref() is None
+
+
+def test_hostile_metaclass_hash_is_not_used_for_condition_snapshotting() -> None:
+    callbacks: list[str] = []
+
+    class HostileMetaclass(type):
+        def __hash__(cls) -> int:
+            callbacks.append("metaclass-hash")
+            return type.__hash__(cls)
+
+    @dataclass
+    class HostileOperand(metaclass=HostileMetaclass):
+        value: int
+
+    operand = HostileOperand(1)
+    operand_ref = weakref.ref(operand)
+    parse_plan = _parse_plan(
+        drop_conditions=[{"column": "value", "value": operand}],
+    )
+
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["keep"]),), ("value",)),
+        parse_plan,
+    )
+
+    assert compiled.drop_conditions[0].operands == (None,)
+    assert callbacks == []
+    del parse_plan, operand
+    gc.collect()
+    assert operand_ref() is None
 
 
 def test_semantic_error_never_triggers_pre_output_fallback() -> None:
@@ -2790,6 +3004,86 @@ def test_sample_budget_counts_nested_dictionary_backing_buffers() -> None:
     with pytest.raises(ValueError, match="bytes"):
         _sample((nested,), ("payload",))
 
+    shared_dictionary = pa.array(["x" * (MAX_SAMPLE_BYTES // 2 + 1)])
+    left = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        shared_dictionary,
+    )
+    right = pa.DictionaryArray.from_arrays(
+        pa.array([0], type=pa.int8()),
+        shared_dictionary,
+    )
+    accepted = _sample((left, right), ("left", "right"))
+    assert accepted.row_count == 1
+
+
+def test_dictionary_encoded_strings_match_plain_normalization_across_late_batches() -> None:
+    dictionary = pa.array(["  alpha  ", "NA", None])
+    encoded = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, 2, None], type=pa.int8()),
+        dictionary,
+    )
+    plain = pa.array(encoded.to_pylist(), type=pa.string())
+    encoded_plan = compile_normalization_plan(
+        _sample((encoded,), ("value",)),
+        _parse_plan(batch_size=4),
+    )
+    plain_plan = compile_normalization_plan(
+        _sample((plain,), ("value",)),
+        _parse_plan(batch_size=4),
+    )
+    encoded_operation = ArrowNormalizationOperation(encoded_plan)
+    plain_operation = ArrowNormalizationOperation(plain_plan)
+
+    encoded_result = encoded_operation.normalize(
+        pa.record_batch([encoded], schema=encoded_plan.input_schema)
+    )
+    plain_result = plain_operation.normalize(
+        pa.record_batch([plain], schema=plain_plan.input_schema)
+    )
+    late_dictionary = pa.array(["  beta  ", "NA", None])
+    late_encoded = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, 2, None], type=pa.int8()),
+        late_dictionary,
+    )
+    late_plain = pa.array(late_encoded.to_pylist(), type=pa.string())
+    encoded_late_result = encoded_operation.normalize(
+        pa.record_batch([late_encoded], schema=encoded_plan.input_schema)
+    )
+    plain_late_result = plain_operation.normalize(
+        pa.record_batch([late_plain], schema=plain_plan.input_schema)
+    )
+
+    assert encoded_plan.schema == plain_plan.schema == pa.schema([("0", pa.string())])
+    assert encoded_result.to_pydict() == plain_result.to_pydict() == {"0": ["alpha"]}
+    assert encoded_late_result.to_pydict() == plain_late_result.to_pydict() == {"0": ["beta"]}
+
+
+def test_shared_string_dictionary_columns_normalize_independently() -> None:
+    dictionary = pa.array(["  alpha  ", "NA"])
+    left = pa.DictionaryArray.from_arrays(
+        pa.array([0, 1, None], type=pa.int8()),
+        dictionary,
+    )
+    right = pa.DictionaryArray.from_arrays(
+        pa.array([0, 0, 0], type=pa.int8()),
+        dictionary,
+    )
+    compiled = compile_normalization_plan(
+        _sample((left, right), ("left", "right")),
+        _parse_plan(batch_size=3),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([left, right], schema=compiled.input_schema)
+    )
+
+    assert compiled.schema.types == [pa.string(), pa.string()]
+    assert result.to_pydict() == {
+        "0": ["alpha", None, None],
+        "1": ["alpha", "alpha", "alpha"],
+    }
+
 
 @pytest.mark.parametrize(
     "filter_config",
@@ -2831,6 +3125,55 @@ def test_uniform_timezone_text_hint_preserves_fixed_offset_schema_and_values() -
         "2024-01-01T12:00:00+08:00",
         "2024-01-02T13:30:00+08:00",
     ]
+
+
+@pytest.mark.parametrize(
+    "incompatible",
+    [
+        "2024-01-04T15:00:00",
+        "2024-01-04T15:00:00+09:00",
+    ],
+)
+def test_late_timestamp_text_must_match_compiled_fixed_timezone_policy(
+    incompatible: str,
+) -> None:
+    sample_values = pa.array(["2024-01-01T12:00:00+08:00", "2024-01-02T13:30:00+08:00"])
+    compiled = compile_normalization_plan(
+        _sample((sample_values,), ("created_at",)),
+        _parse_plan(type_hints={"created_at": "TIMESTAMP"}),
+    )
+    compatible = pa.record_batch(
+        [pa.array(["2024-01-03T14:00:00+08:00"])],
+        schema=compiled.input_schema,
+    )
+    late = pa.record_batch([pa.array([incompatible])], schema=compiled.input_schema)
+    raw = _Reader(compiled.input_schema, [compatible, late])
+    reader = NormalizedStreamingReader(raw, compiled)
+
+    assert reader.read_next_batch() is not None
+    with pytest.raises(StreamingTypeError) as captured:
+        reader.read_next_batch()
+
+    assert captured.value.context["row_offset"] == 1
+    assert captured.value.context["expected_type"] == "timestamp[ns, tz=+08:00]"
+    assert raw.close_calls == 1
+
+
+def test_late_timestamp_text_with_the_compiled_fixed_offset_remains_compatible() -> None:
+    sample_values = pa.array(["2024-01-01T12:00:00+08:00", "2024-01-02T13:30:00+08:00"])
+    compiled = compile_normalization_plan(
+        _sample((sample_values,), ("created_at",)),
+        _parse_plan(type_hints={"created_at": "TIMESTAMP"}),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch(
+            [pa.array(["2024-01-03T14:00:00+08:00"])],
+            schema=compiled.input_schema,
+        )
+    )
+
+    assert result.column(0)[0].as_py().isoformat() == "2024-01-03T14:00:00+08:00"
 
 
 def test_mixed_timezone_text_hint_is_rejected_during_compilation() -> None:
@@ -2889,19 +3232,28 @@ def test_known_invalid_date_sample_evidence_does_not_compile_strict_date() -> No
     assert result.column(0)[-1].as_py() == "not-a-date"
 
 
-def test_missing_marker_does_not_prevent_strict_date_compilation() -> None:
-    values = pa.array([*(f"2024-01-{day:02d}" for day in range(1, 10)), "NA"])
+@pytest.mark.parametrize(
+    "values",
+    [
+        ["1", "2", "NA"],
+        ["2024-01-01", "NA"],
+    ],
+)
+def test_missing_markers_are_applied_after_numeric_and_date_inference(
+    values: list[str],
+) -> None:
+    evidence = pa.array(values)
     compiled = compile_normalization_plan(
-        _sample((values,), ("event_date",)),
-        _parse_plan(batch_size=10),
+        _sample((evidence,), ("value",)),
+        _parse_plan(batch_size=len(values)),
     )
 
     result = ArrowNormalizationOperation(compiled).normalize(
-        pa.record_batch([values], schema=compiled.input_schema)
+        pa.record_batch([evidence], schema=compiled.input_schema)
     )
 
-    assert compiled.schema.types == [pa.timestamp("us")]
-    assert result.num_rows == 9
+    assert compiled.schema.types == [pa.string()]
+    assert result.column(0).to_pylist() == values[:-1]
 
 
 def test_known_invalid_numeric_date_sample_stays_numeric() -> None:

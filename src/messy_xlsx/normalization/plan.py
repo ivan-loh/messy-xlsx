@@ -489,37 +489,51 @@ def _compile_condition_operand(
 
 
 def _condition_value_matches_type(value: object, output_type: pa.DataType) -> bool:
+    value_type = type(value)
     if pa.types.is_string(output_type) or pa.types.is_large_string(output_type):
-        return type(value) is str
+        return value_type is str
     if pa.types.is_binary(output_type) or pa.types.is_large_binary(output_type):
-        return type(value) is bytes
+        return value_type is bytes
     if pa.types.is_boolean(output_type):
-        return type(value) is bool or (type(value) in {int, float, Decimal} and value in {0, 1})
+        return value_type is bool or (
+            (value_type is int or value_type is float or value_type is Decimal) and value in {0, 1}
+        )
     if pa.types.is_integer(output_type):
-        return type(value) in {bool, int} or (
-            type(value) is float and math.isfinite(value) and value.is_integer()
+        return (
+            value_type is bool
+            or value_type is int
+            or (
+                value_type is float
+                and math.isfinite(cast("float", value))
+                and cast("float", value).is_integer()
+            )
         )
     if pa.types.is_floating(output_type):
-        return type(value) in {bool, int, float, Decimal}
+        return (
+            value_type is bool or value_type is int or value_type is float or value_type is Decimal
+        )
     if pa.types.is_decimal(output_type):
-        return type(value) in {bool, int, Decimal}
+        return value_type is bool or value_type is int or value_type is Decimal
     if pa.types.is_date(output_type):
-        return type(value) is date
+        return value_type is date
     if pa.types.is_timestamp(output_type):
-        return type(value) is datetime
+        return value_type is datetime
     if pa.types.is_time(output_type):
-        return type(value) is time
+        return value_type is time
     return False
 
 
 def _coerce_condition_value(value: object, output_type: pa.DataType) -> object:
     """Project characterized pandas boolean/numeric equality into Arrow scalars."""
-    if pa.types.is_boolean(output_type) and type(value) in {int, float, Decimal}:
+    value_type = type(value)
+    if pa.types.is_boolean(output_type) and (
+        value_type is int or value_type is float or value_type is Decimal
+    ):
         return value == 1
-    if (pa.types.is_integer(output_type) or pa.types.is_decimal(output_type)) and type(
-        value
-    ) is bool:
-        return int(value)
+    if (
+        pa.types.is_integer(output_type) or pa.types.is_decimal(output_type)
+    ) and value_type is bool:
+        return int(cast("bool", value))
     return value
 
 
@@ -538,10 +552,11 @@ def _compile_column_decision(
 ) -> _ColumnDecision:
     if not normalize:
         return _decision(SemanticOperation.PASSTHROUGH, observed_type)
+    logical_observed_type = _dictionary_string_value_type(observed_type)
     if explicit_hint is not None:
         return _hint_decision(
             explicit_hint,
-            observed_type,
+            logical_observed_type,
             values,
             decimal_separator,
             thousands_separator,
@@ -560,7 +575,7 @@ def _compile_column_decision(
     if not present:
         return _decision(SemanticOperation.PASSTHROUGH, pa.null())
     return _decision_for_observed_values(
-        observed_type,
+        logical_observed_type,
         non_null,
         present,
         source_name,
@@ -603,7 +618,7 @@ def _decision_for_observed_values(
     if pa.types.is_string(observed_type) or pa.types.is_large_string(observed_type):
         return _string_observed_decision(
             observed_type,
-            present,
+            non_null,
             inferred,
             enabled_stages,
             decimal_separator,
@@ -896,7 +911,8 @@ def _detect_sample_numeric_locale(
 ) -> tuple[str, str]:
     samples: list[str] = []
     for column in sample.columns:
-        if not (pa.types.is_string(column.type) or pa.types.is_large_string(column.type)):
+        logical_type = _dictionary_string_value_type(column.type)
+        if not (pa.types.is_string(logical_type) or pa.types.is_large_string(logical_type)):
             continue
         strings = tuple(
             value
@@ -905,6 +921,15 @@ def _detect_sample_numeric_locale(
         )[:50]
         samples.extend(value for value in strings if _NUMERIC_CHARS_PATTERN.match(value))
     return _detected_numeric_separators(tuple(samples))
+
+
+def _dictionary_string_value_type(observed_type: pa.DataType) -> pa.DataType:
+    if not pa.types.is_dictionary(observed_type):
+        return observed_type
+    value_type = cast("pa.DictionaryType", observed_type).value_type
+    if pa.types.is_string(value_type) or pa.types.is_large_string(value_type):
+        return value_type
+    return observed_type
 
 
 def _detected_numeric_separators(samples: tuple[str, ...]) -> tuple[str, str]:
@@ -1050,44 +1075,65 @@ def _snapshot_display_name(
     _budget: list[int] | None = None,
 ) -> object:
     budget = _consume_label_budget(_depth, _budget)
-    if value is None or type(value) in {str, int, float, bool, bytes, date}:
+    value_type = type(value)
+    if (
+        value is None
+        or value_type is str
+        or value_type is int
+        or value_type is float
+        or value_type is bool
+        or value_type is bytes
+        or value_type is date
+    ):
         return value
-    if type(value) is tuple:
+    if value_type is tuple:
+        tuple_value = cast("tuple[object, ...]", value)
         return tuple(
-            _snapshot_display_name(item, _depth=_depth + 1, _budget=budget) for item in value
+            _snapshot_display_name(item, _depth=_depth + 1, _budget=budget) for item in tuple_value
         )
-    if type(value) in {datetime, time}:
+    if value_type is datetime or value_type is time:
         temporal = cast("datetime | time", value)
         tz = temporal.tzinfo
         if _timezone_label_projection(tz)[1]:
             return value
-        module, qualname = _safe_type_description(type(value))
+        module, qualname = _safe_type_description(value_type)
         return f"<{module}.{qualname} label>"
-    module, qualname = _safe_type_description(type(value))
+    module, qualname = _safe_type_description(value_type)
     return f"<{module}.{qualname}>"
 
 
 def _snapshot_condition_value(value: object) -> object:
-    if value is None or type(value) in {
-        str,
-        int,
-        float,
-        bool,
-        bytes,
-        Decimal,
-        date,
-        datetime,
-        time,
-    }:
+    value_type = type(value)
+    if (
+        value is None
+        or value_type is str
+        or value_type is int
+        or value_type is float
+        or value_type is bool
+        or value_type is bytes
+        or value_type is Decimal
+        or value_type is date
+        or value_type is datetime
+        or value_type is time
+    ):
         return value
-    module, qualname = _safe_type_description(type(value))
+    module, qualname = _safe_type_description(value_type)
     return ("unsupported", module, qualname)
 
 
 def _is_sanitizable_display_name(value: object) -> bool:
-    if value is None or type(value) in {str, int, float, bool, bytes, date}:
+    value_type = type(value)
+    if (
+        value is None
+        or value_type is str
+        or value_type is int
+        or value_type is float
+        or value_type is bool
+        or value_type is bytes
+        or value_type is date
+    ):
         return True
-    if type(value) in {datetime, time}:
+    if value_type is datetime or value_type is time:
         temporal = cast("datetime | time", value)
         return _timezone_label_projection(temporal.tzinfo)[1]
     return False
@@ -1222,9 +1268,10 @@ def _consume_label_budget(depth: int, budget: list[int] | None) -> list[int]:
 
 
 def _safe_name_text(value: object) -> str:
-    if type(value) is str:
-        return value
-    if type(value) in {int, float, bool}:
+    value_type = type(value)
+    if value_type is str:
+        return cast("str", value)
+    if value_type is int or value_type is float or value_type is bool:
         return str(value)
     return ""
 
