@@ -98,7 +98,7 @@
 | 9 | Closable stream lifecycle | 3, 6 | [x] |
 | 10 | Openpyxl bounded-row OOXML reader | 8, 9 | [x] |
 | 11 | Streaming normalization and schema enforcement | 9, 10 | [x] |
-| 12 | Public Arrow, batch, and pandas-chunk APIs | 7, 9, 11 | [ ] |
+| 12 | Public Arrow, batch, and pandas-chunk APIs | 7, 9, 11 | [x] |
 | 13 | Unified multi-sheet planning and `SheetStream` | 5, 7, 12 | [ ] |
 | 14 | CSV/TXT direct-stream and batch optimization | 3, 9, 11 | [ ] |
 | 15 | XLS streaming and custom registry compatibility | 6, 9, 12 | [ ] |
@@ -2553,7 +2553,7 @@ architecture, lifecycle, and performance reviews returned CLEAN.
 - Produces: frozen public `SheetResult`, ready for the multi-sheet stream in Task 13.
 - Exports: every new public type/function through `messy_xlsx.__all__`.
 
-- [ ] **Step 1: Write failing public API and ownership tests**
+- [x] **Step 1: Write failing public API and ownership tests**
 
 ```python
 # tests/test_arrow_api.py
@@ -2603,7 +2603,7 @@ Run: `.venv/bin/pytest tests/test_arrow_api.py -q`
 
 Expected: failures because public methods and conveniences are absent.
 
-- [ ] **Step 2: Add the exact workbook method signatures**
+- [x] **Step 2: Add the exact workbook method signatures**
 
 ```python
 @dataclass(frozen=True)
@@ -2671,7 +2671,7 @@ def iter_dataframe_chunks(
 
 `to_arrow()` applies materialized global normalization and all-null-column removal. It does not emit `LegacyAPIWarning`.
 
-- [ ] **Step 3: Add top-level ownership-safe conveniences**
+- [x] **Step 3: Add top-level ownership-safe conveniences**
 
 ```python
 def read_excel_arrow(
@@ -2715,7 +2715,7 @@ def read_excel_batches(
     return BatchStream(child, child.schema, close_owned)
 ```
 
-- [ ] **Step 4: Export all public types and verify typing**
+- [x] **Step 4: Export all public types and verify typing**
 
 Update `messy_xlsx.__all__`, keep `py.typed` in the wheel, and add explicit return annotations for every new public symbol.
 
@@ -2725,7 +2725,7 @@ Run: `.venv/bin/mypy src/messy_xlsx --ignore-missing-imports`
 
 Expected: public API tests pass and mypy reports no errors.
 
-- [ ] **Step 5: Commit the additive public APIs**
+- [x] **Step 5: Commit the additive public APIs**
 
 ```bash
 git add src/messy_xlsx/__init__.py src/messy_xlsx/workbook.py src/messy_xlsx/parsing/streams.py src/messy_xlsx/models.py tests/test_arrow_api.py tests/test_integration.py
