@@ -47,9 +47,7 @@ class FastexcelSession:
                 options["use_columns"] = list(range(min_column - 1, max_column))
             batch = self._reader.load_sheet(sheet, **options)
             frame = batch.to_pandas()
-            if min_column > 1:
-                frame.columns = range(min_column, min_column + len(frame.columns))
-                frame = frame.reindex(columns=range(1, max_column + 1))
+            frame.columns = range(min_column, min_column + len(frame.columns))
             frame.index = pd.RangeIndex(
                 window.start_row,
                 window.start_row + len(frame),
@@ -58,7 +56,7 @@ class FastexcelSession:
             rows.extend(int(row) for row in frame.index)
             frames.append(frame)
         values = pd.concat(frames, axis=0) if frames else pd.DataFrame()
-        return StructureEvidence(tuple(rows), values)
+        return StructureEvidence(tuple(rows), values, min_column=min_column)
 
     def materialize(
         self,

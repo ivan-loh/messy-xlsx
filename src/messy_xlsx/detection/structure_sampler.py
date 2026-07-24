@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,6 +26,7 @@ from messy_xlsx.ooxml.models import (
 _NUMERIC_EVIDENCE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?$")
 _MISSING_EVIDENCE = object()
 _DATE_EVIDENCE = object()
+MAX_STRUCTURE_SAMPLE_CELLS = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class StructureEvidence:
 
     row_numbers: tuple[int, ...]
     values: pd.DataFrame
+    min_column: int = 1
 
     def row(self, row_number: int) -> tuple[object, ...]:
         """Return retained values for one worksheet row, or an empty tuple."""
@@ -115,6 +117,7 @@ class _EvidenceWorksheet:
         self._retained_rows = frozenset(evidence.row_numbers)
         self._cell_evidence = manifest.cell_evidence
         self._semantic_nonempty_rows = manifest.semantic_nonempty_rows
+        self._min_column = evidence.min_column
         region = manifest.semantic_data_region
         self.max_row = region[1]
         self.max_column = region[3]
@@ -129,7 +132,8 @@ class _EvidenceWorksheet:
         if row not in self._retained_rows:
             return _MISSING_EVIDENCE
         values = self._evidence.row(row)
-        value = values[column - 1] if column <= len(values) else None
+        offset = column - self._min_column
+        value = values[offset] if 0 <= offset < len(values) else None
         return _worksheet_scalar(value, self._cell_evidence.code(row, column))
 
     def iter_rows(
@@ -295,16 +299,48 @@ class StructureSampler:
         if cached is not None:
             return cached
         manifest = self._manifest_reader.sheet(sheet)
-        start_row, end_row, _start_col, _end_col = manifest.semantic_data_region
+        start_row, end_row, start_col, end_col = manifest.semantic_data_region
         windows = structure_sample_windows(end_row, start_row)
+        sampled_rows = sum(window.n_rows for window in windows)
+        width_budget = max(1, MAX_STRUCTURE_SAMPLE_CELLS // max(1, sampled_rows))
+        sampled_end_col = min(end_col, start_col + width_budget - 1)
         evidence = self._excel_reader.sample_windows(
             sheet,
             windows=windows,
-            min_column=manifest.observed_min_col,
-            max_column=manifest.observed_max_col,
+            min_column=start_col,
+            max_column=sampled_end_col,
         )
-        result = analyze_structure_evidence(evidence, manifest, key[1])
+        analysis_manifest = manifest
+        if sampled_end_col < end_col:
+            analysis_manifest = replace(
+                manifest,
+                semantic_data_region=(
+                    start_row,
+                    end_row,
+                    start_col,
+                    sampled_end_col,
+                ),
+            )
+        result = analyze_structure_evidence(evidence, analysis_manifest, key[1])
+        if analysis_manifest is not manifest:
+            result = replace(
+                result,
+                data_start_col=start_col,
+                data_end_col=end_col,
+            )
         self._cache[key] = result
         if self._metrics is not None:
             self._metrics.sample_reads += 1
         return result
+
+
+__all__ = [
+    "MAX_STRUCTURE_SAMPLE_CELLS",
+    "SampleWindow",
+    "StructureEvidence",
+    "StructureSampler",
+    "analyze_structure_evidence",
+    "blank_row_sample_positions",
+    "coalesce_rows",
+    "structure_sample_windows",
+]

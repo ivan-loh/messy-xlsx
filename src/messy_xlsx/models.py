@@ -133,6 +133,30 @@ class SheetError:
         }
 
 
+@dataclass
+class SheetInfo:
+    """Information about a sheet's structure."""
+
+    name: str
+    row_count: int
+    col_count: int
+    header_row: int
+    is_empty: bool = False
+    is_pivot: bool = False
+    skip_reason: str | None = None
+
+    @property
+    def column_count(self) -> int:
+        """Number of columns (descriptive alias for ``col_count``)."""
+        return self.col_count
+
+
+# ``SheetInfo`` historically lived in ``multi_sheet``.  Keep its public type
+# identity and rendered annotations stable while allowing parser-layer code to
+# import the model without depending on the legacy adapter module.
+SheetInfo.__module__ = "messy_xlsx.multi_sheet"
+
+
 @dataclass(frozen=True)
 class SheetResult:
     """One successful or failed per-sheet materialized result."""

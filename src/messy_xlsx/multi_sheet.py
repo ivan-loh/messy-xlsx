@@ -6,14 +6,23 @@
 
 import warnings as _warnings
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
 from messy_xlsx.detection.header_detector import detect_header_row
-from messy_xlsx.models import SheetConfig
+from messy_xlsx.detection.structure_sampler import SampleWindow
+from messy_xlsx.models import SheetConfig, SheetInfo
+from messy_xlsx.parsing.parse_plan import ParsePlan, compile_parse_plan
+from messy_xlsx.parsing.sheet_planner import (
+    PlannedSheet,
+    PlannedSheetState,
+    PlanningFailureStage,
+    SheetPlanner,
+)
 from messy_xlsx.warnings import LegacyAPIWarning, warn_legacy
 
 # ============================================================================
@@ -34,24 +43,6 @@ PIVOT_INDICATORS = [
 # ============================================================================
 # Models
 # ============================================================================
-
-
-@dataclass
-class SheetInfo:
-    """Information about a sheet's structure."""
-
-    name: str
-    row_count: int
-    col_count: int
-    header_row: int  # 0-indexed row where headers are
-    is_empty: bool = False
-    is_pivot: bool = False
-    skip_reason: str | None = None
-
-    @property
-    def column_count(self) -> int:
-        """Number of columns (descriptive alias for ``col_count``)."""
-        return self.col_count
 
 
 @dataclass
@@ -138,6 +129,20 @@ class MultiSheetParser:
         from messy_xlsx.workbook import MessyWorkbook
 
         with MessyWorkbook(self.file_path) as workbook:
+            if workbook._uses_builtin_ooxml_planner():
+                planned = self._plan_shared_ooxml(
+                    workbook,
+                    compile_outputs=False,
+                    select_all=True,
+                )
+                return [item.info for item in planned]
+            if workbook._uses_builtin_xls_planner():
+                planned = self._plan_shared_xls(
+                    workbook,
+                    compile_outputs=False,
+                    select_all=True,
+                )
+                return [item.info for item in planned]
             return [self._analyze_sheet(workbook, name) for name in workbook.sheet_names]
 
     def parse_all(self) -> dict[str, pd.DataFrame]:
@@ -156,6 +161,43 @@ class MultiSheetParser:
 
         results = {}
         with MessyWorkbook(self.file_path) as workbook:
+            if workbook._uses_builtin_ooxml_planner() or workbook._uses_builtin_xls_planner():
+                lease = workbook._materialized_operation()
+                with lease:
+                    try:
+                        lease._body_started()
+                        planned = (
+                            self._plan_shared_ooxml(
+                                workbook,
+                                compile_outputs=True,
+                                select_all=False,
+                            )
+                            if workbook._uses_builtin_ooxml_planner()
+                            else self._plan_shared_xls(
+                                workbook,
+                                compile_outputs=True,
+                                select_all=False,
+                            )
+                        )
+                        for item in planned:
+                            if item.state is PlannedSheetState.SKIPPED:
+                                continue
+                            if item.state is PlannedSheetState.ERROR:
+                                assert item.error is not None
+                                if item.failure_stage is PlanningFailureStage.ANALYSIS:
+                                    continue
+                                raise item.error
+                            assert item.parse_plan is not None
+                            frame = workbook._materialize_compiled_plan(
+                                item.name,
+                                item.parse_plan,
+                            )
+                            if not frame.empty:
+                                results[item.name] = frame
+                        return results
+                    finally:
+                        lease._body_complete()
+
             sheet_infos = [self._analyze_sheet(workbook, name) for name in workbook.sheet_names]
 
             for info in sheet_infos:
@@ -171,6 +213,214 @@ class MultiSheetParser:
                     results[info.name] = df
 
         return results
+
+    def _plan_shared_ooxml(
+        self,
+        workbook: Any,
+        *,
+        compile_outputs: bool,
+        select_all: bool,
+    ) -> tuple[PlannedSheet, ...]:
+        """Plan built-in OOXML sheets with bounded evidence and no raw parse."""
+        structures: dict[str, Any] = {}
+
+        def analyze(name: str) -> SheetInfo:
+            return self._analyze_sheet_bounded(workbook, name, structures)
+
+        def compile_selected(name: str, info: SheetInfo) -> ParsePlan:
+            return compile_parse_plan(
+                self._config_for_info(info),
+                structures.get(name),
+                workbook.format_type,
+            )
+
+        planner = SheetPlanner(
+            analyze,
+            compile_selected,
+            should_propagate=lambda error: workbook._should_propagate_sheet_error(error),
+            analysis_failure_info=lambda name, error: SheetInfo(
+                name=name,
+                row_count=0,
+                col_count=0,
+                header_row=0,
+                is_empty=True,
+                skip_reason=f"Parse error: {error}",
+            ),
+        )
+        return planner.plan(
+            workbook.sheet_names,
+            options=None if select_all else self.options,
+            select_all=select_all,
+            compile_outputs=compile_outputs,
+        )
+
+    def _plan_shared_xls(
+        self,
+        workbook: Any,
+        *,
+        compile_outputs: bool,
+        select_all: bool,
+    ) -> tuple[PlannedSheet, ...]:
+        """Plan untouched built-in XLS sheets from one bounded xlrd inspection."""
+        structures: dict[str, Any] = {}
+        with (
+            workbook._source_handle.open_backend() as backend_source,
+            closing(pd.ExcelFile(backend_source, engine="xlrd")) as excel,
+        ):
+
+            def analyze(name: str) -> SheetInfo:
+                return self._analyze_sheet_bounded_xls(excel, name)
+
+            def compile_selected(name: str, info: SheetInfo) -> ParsePlan:
+                return compile_parse_plan(
+                    self._config_for_info(info),
+                    structures.get(name),
+                    workbook.format_type,
+                )
+
+            planner = SheetPlanner(
+                analyze,
+                compile_selected,
+                should_propagate=lambda error: workbook._should_propagate_sheet_error(error),
+                analysis_failure_info=lambda name, error: SheetInfo(
+                    name=name,
+                    row_count=0,
+                    col_count=0,
+                    header_row=0,
+                    is_empty=True,
+                    skip_reason=f"Parse error: {error}",
+                ),
+            )
+            return planner.plan(
+                workbook.sheet_names,
+                options=None if select_all else self.options,
+                select_all=select_all,
+                compile_outputs=compile_outputs,
+            )
+
+    def _analyze_sheet_bounded(
+        self,
+        workbook: Any,
+        sheet_name: str,
+        structures: dict[str, Any],
+    ) -> SheetInfo:
+        """Analyze built-in OOXML using manifest dimensions and bounded values."""
+        manifest = workbook._get_sheet_manifest(sheet_name)
+        start_row, end_row, start_col, end_col = manifest.semantic_data_region
+        has_values = manifest.semantic_nonempty_rows.contains(start_row)
+        row_count = end_row - start_row + 1 if has_values else 0
+        col_count = end_col - start_col + 1 if has_values else 0
+
+        if row_count == 0 or col_count == 0:
+            return SheetInfo(
+                name=sheet_name,
+                row_count=0,
+                col_count=0,
+                header_row=0,
+                is_empty=True,
+                skip_reason="Empty sheet" if self.options.skip_empty else None,
+            )
+
+        if row_count < self.options.min_rows or col_count < self.options.min_cols:
+            return SheetInfo(
+                name=sheet_name,
+                row_count=row_count,
+                col_count=col_count,
+                header_row=0,
+                is_empty=True,
+                skip_reason="Too small" if self.options.skip_empty else None,
+            )
+
+        pivot_sample = (
+            workbook._get_fastexcel_session()
+            .sample_windows(
+                sheet_name,
+                windows=(SampleWindow(start_row, min(20, row_count)),),
+                min_column=start_col,
+                max_column=end_col,
+            )
+            .values
+        )
+        workbook.parse_metrics.sample_reads += 1
+        is_pivot = self._looks_like_pivot(pivot_sample)
+        if is_pivot and self.options.skip_pivots:
+            return SheetInfo(
+                name=sheet_name,
+                row_count=row_count,
+                col_count=col_count,
+                header_row=0,
+                is_pivot=True,
+                skip_reason="Pivot table",
+            )
+
+        structure = workbook._analyze_stream_structure(sheet_name, SheetConfig())
+        structures[sheet_name] = structure
+        header_row = max(0, (structure.header_row or 1) - 1)
+        if header_row >= self.options.header_scan_rows:
+            header_row = 0
+        return SheetInfo(
+            name=sheet_name,
+            row_count=row_count,
+            col_count=col_count,
+            header_row=header_row,
+            is_pivot=is_pivot,
+        )
+
+    def _analyze_sheet_bounded_xls(
+        self,
+        excel: pd.ExcelFile,
+        sheet_name: str,
+    ) -> SheetInfo:
+        """Analyze one XLS sheet from metadata plus a bounded value preview."""
+        worksheet = excel.book.sheet_by_name(sheet_name)
+        row_count = int(worksheet.nrows)
+        col_count = int(worksheet.ncols)
+        if row_count == 0 or col_count == 0:
+            return SheetInfo(
+                name=sheet_name,
+                row_count=0,
+                col_count=0,
+                header_row=0,
+                is_empty=True,
+                skip_reason="Empty sheet" if self.options.skip_empty else None,
+            )
+        if row_count < self.options.min_rows or col_count < self.options.min_cols:
+            return SheetInfo(
+                name=sheet_name,
+                row_count=row_count,
+                col_count=col_count,
+                header_row=0,
+                is_empty=True,
+                skip_reason="Too small" if self.options.skip_empty else None,
+            )
+
+        preview_rows = max(20, self.options.header_scan_rows)
+        preview = excel.parse(
+            sheet_name=sheet_name,
+            header=None,
+            nrows=preview_rows,
+            na_values=[],
+        )
+        is_pivot = self._looks_like_pivot(preview)
+        if is_pivot and self.options.skip_pivots:
+            return SheetInfo(
+                name=sheet_name,
+                row_count=row_count,
+                col_count=col_count,
+                header_row=0,
+                is_pivot=True,
+                skip_reason="Pivot table",
+            )
+        header_row = detect_header_row(preview, self.options.header_scan_rows)
+        if header_row >= self.options.header_scan_rows:
+            header_row = 0
+        return SheetInfo(
+            name=sheet_name,
+            row_count=row_count,
+            col_count=col_count,
+            header_row=header_row,
+            is_pivot=is_pivot,
+        )
 
     def parse_sheet(self, sheet_name: str) -> pd.DataFrame:
         """
@@ -190,6 +440,25 @@ class MultiSheetParser:
         from messy_xlsx.workbook import MessyWorkbook
 
         with MessyWorkbook(self.file_path) as workbook:
+            if workbook._uses_builtin_ooxml_planner() and sheet_name in workbook.sheet_names:
+                lease = workbook._materialized_operation()
+                with lease:
+                    try:
+                        lease._body_started()
+                        structures: dict[str, Any] = {}
+                        info = self._analyze_sheet_bounded(
+                            workbook,
+                            sheet_name,
+                            structures,
+                        )
+                        plan = compile_parse_plan(
+                            self._config_for_info(info),
+                            structures.get(sheet_name),
+                            workbook.format_type,
+                        )
+                        return workbook._materialize_compiled_plan(sheet_name, plan)
+                    finally:
+                        lease._body_complete()
             info = self._analyze_sheet(workbook, sheet_name)
             return self._parse_sheet(workbook, info)
 
@@ -283,7 +552,14 @@ class MultiSheetParser:
 
     def _parse_sheet(self, workbook: Any, info: SheetInfo) -> pd.DataFrame:
         """Parse and clean a single sheet."""
-        config = SheetConfig(
+        return workbook._to_dataframe_compat(
+            info.name,
+            config=self._config_for_info(info),
+        )
+
+    def _config_for_info(self, info: SheetInfo) -> SheetConfig:
+        """Compile the legacy final-parse configuration for one analyzed sheet."""
+        return SheetConfig(
             auto_detect=False,
             skip_rows=info.header_row,
             header_rows=1,
@@ -296,7 +572,6 @@ class MultiSheetParser:
             decimal_separator=self.options.decimal_separator,
             thousands_separator=self.options.thousands_separator,
         )
-        return workbook._to_dataframe_compat(info.name, config=config)
 
 
 # ============================================================================
@@ -312,7 +587,7 @@ def _parse_all_compat(parser: MultiSheetParser) -> dict[str, pd.DataFrame]:
         getattr(parse_all, "__func__", None) is _MULTI_SHEET_PARSER_PARSE_ALL
         and getattr(parse_all, "__self__", None) is parser
     ):
-        return parser._parse_all_compat()
+        return cast(dict[str, pd.DataFrame], parser._parse_all_compat())
     with _warnings.catch_warnings():
         _warnings.simplefilter("ignore", LegacyAPIWarning)
         return parse_all()

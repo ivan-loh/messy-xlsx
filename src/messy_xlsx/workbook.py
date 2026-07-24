@@ -7,6 +7,7 @@
 import logging
 import re
 import weakref
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -38,7 +39,14 @@ from messy_xlsx.enums import MergeStrategy
 from messy_xlsx.exceptions import FileError, FormatError, StreamingTypeError
 from messy_xlsx.formulas.config import FormulaConfig, FormulaEvaluationMode
 from messy_xlsx.formulas.engine import FormulaEngine
-from messy_xlsx.models import CellValue, SheetConfig, SheetError, StructureInfo
+from messy_xlsx.models import (
+    CellValue,
+    SheetConfig,
+    SheetError,
+    SheetInfo,
+    SheetResult,
+    StructureInfo,
+)
 from messy_xlsx.normalization import (
     NormalizationSample,
     compile_normalization_plan,
@@ -57,7 +65,7 @@ from messy_xlsx.normalization.plan import (
 )
 from messy_xlsx.ooxml.manifest import ManifestReader
 from messy_xlsx.ooxml.models import IntervalIndex, SheetManifest
-from messy_xlsx.parsing.contracts import BackendKind, OutputMode
+from messy_xlsx.parsing.contracts import BackendKind, OutputMode, ParseMetrics
 from messy_xlsx.parsing.coordinates import (
     CoordinateBatch,
     CoordinateOperation,
@@ -91,12 +99,19 @@ from messy_xlsx.parsing.physical_values import (
     temporal_payload,
 )
 from messy_xlsx.parsing.router import BackendRouter, WorkbookContext
+from messy_xlsx.parsing.sheet_planner import (
+    PlannedSheet,
+    PlannedSheetState,
+    SheetPlanner,
+)
 from messy_xlsx.parsing.streams import (
     BatchStream,
     DataFrameChunkStream,
+    SheetStream,
     _close_if_present,
     _run_cleanups,
 )
+from messy_xlsx.parsing.xls_handler import XLSHandler
 from messy_xlsx.parsing.xlsx_handler import (
     XLSXHandler,
     _is_fastexcel_materialized_plan,
@@ -925,6 +940,24 @@ def _contains_active_operation_error(error: BaseException) -> bool:
     return any(isinstance(candidate, _ActiveOperationError) for candidate in candidates)
 
 
+def _sheet_error(name: str, error: BaseException) -> SheetError:
+    """Project one ordinary per-sheet failure without retaining its traceback."""
+    context = getattr(error, "context", {})
+    if not isinstance(context, dict):
+        context = {}
+    return SheetError(
+        sheet_name=name,
+        error_type=type(error).__name__,
+        message=str(error),
+        context=context.copy(),
+    )
+
+
+def _failure_sheet_result(name: str, error: BaseException) -> SheetResult:
+    """Return the public frozen failure representation for one sheet."""
+    return SheetResult(name=name, error=_sheet_error(name, error))
+
+
 def _release_operation_and_confirm(
     workbook: "MessyWorkbook",
     token: object,
@@ -1151,12 +1184,28 @@ class _MaterializedOperationLease:
         )
 
 
+def _finalize_stream_operation_lease(
+    workbook_ref: weakref.ReferenceType["MessyWorkbook"],
+    token: object,
+) -> None:
+    """Release a reservation whose lease never crossed its return boundary."""
+    workbook = workbook_ref()
+    if workbook is not None:
+        workbook._end_operation(token)
+
+
 class _StreamOperationLease:
     """Workbook-visible construction placeholder and child-stream owner."""
 
     def __init__(self, workbook: "MessyWorkbook", token: object) -> None:
         self._workbook: MessyWorkbook | None = workbook
         self._token = token
+        self._abandonment_finalizer = weakref.finalize(
+            self,
+            _finalize_stream_operation_lease,
+            weakref.ref(workbook),
+            token,
+        )
         self._partial: _CloseOnceOwner[Any] | None = None
         self._stream_ref: weakref.ReferenceType[Any] | None = None
         self._bound = False
@@ -1296,6 +1345,7 @@ class _StreamOperationLease:
                 self._released = True
                 self._stream_ref = None
                 self._workbook = None
+                self._abandonment_finalizer.detach()
 
     def __enter__(self) -> "_StreamOperationLease":
         return self
@@ -1346,6 +1396,9 @@ class MessyWorkbook:
         """
         self._closed = False
         self._active_operation_token: object | None = None
+        self._active_stream_slot: Any | weakref.ReferenceType[Any] | None = None
+        self._active_stream_cleanup: Any | None = None
+        self._active_stream_lease_ref: weakref.ReferenceType[_StreamOperationLease] | None = None
         self._active_stream: Any | None = None
         self._active_materialized_lease: _MaterializedOperationLease | None = None
         self._sheets: dict[str, MessySheet] = {}
@@ -1359,6 +1412,7 @@ class MessyWorkbook:
         self._stream_structure_sampler: StructureSampler | None = None
         self._sample_owner: _SampleResourceOwner | None = None
         self._source_handle_close_pending = False
+        self._parse_metrics = ParseMetrics()
 
         self._sheet_config = sheet_config or SheetConfig()
         self._formula_config = formula_config or FormulaConfig()
@@ -1421,10 +1475,43 @@ class MessyWorkbook:
             )
             raise
 
+    @property
+    def _active_stream(self) -> Any | None:
+        """Resolve the active child without keeping public streams alive."""
+        slot = self.__dict__.get("_active_stream_slot")
+        if isinstance(slot, weakref.ReferenceType):
+            return slot()
+        return slot
+
+    @_active_stream.setter
+    def _active_stream(self, stream: Any | None) -> None:
+        cleanup_state = getattr(stream, "_cleanup_state", None)
+        if stream is not None and cleanup_state is not None:
+            self.__dict__["_active_stream_slot"] = weakref.ref(stream)
+            self.__dict__["_active_stream_cleanup"] = cleanup_state
+            return
+        self.__dict__["_active_stream_slot"] = stream
+        self.__dict__["_active_stream_cleanup"] = None
+
+    def _recover_abandoned_stream_operation(self) -> None:
+        """Finish cleanup for a stream or lease lost at a return boundary."""
+        token = getattr(self, "_active_operation_token", None)
+        if token is None or self._active_stream is not None:
+            return
+        cleanup_state = self.__dict__.get("_active_stream_cleanup")
+        if cleanup_state is not None:
+            cleanup_state.close()
+            if getattr(self, "_active_operation_token", None) is not token:
+                return
+        lease_ref = getattr(self, "_active_stream_lease_ref", None)
+        if lease_ref is not None and lease_ref() is None:
+            self._end_operation(token)
+
     def _begin_operation(self, token: object | None = None) -> object:
         """Reserve the workbook for one parse or child stream."""
         if getattr(self, "_closed", False):
             raise _operation_error("MessyWorkbook is closed")
+        self._recover_abandoned_stream_operation()
         retained_lease = getattr(self, "_active_materialized_lease", None)
         if (
             retained_lease is not None
@@ -1445,6 +1532,7 @@ class MessyWorkbook:
         if getattr(self, "_active_operation_token", None) is not token:
             return
         self._active_stream = None
+        self._active_stream_lease_ref = None
         self._active_operation_token = None
 
     def _register_materialized_lease(
@@ -1490,6 +1578,7 @@ class MessyWorkbook:
         lease = _StreamOperationLease(self, token)
         try:
             self._begin_operation(token)
+            self._active_stream_lease_ref = weakref.ref(lease)
             return lease
         except BaseException as error:
             _run_cleanups(
@@ -1604,6 +1693,15 @@ class MessyWorkbook:
         """Detected file format (xlsx, xls, csv, etc.)."""
         return cast(str, self._format_info.format_type)
 
+    @property
+    def parse_metrics(self) -> ParseMetrics:
+        """Return cumulative parser-work counters owned by this workbook."""
+        metrics = getattr(self, "_parse_metrics", None)
+        if metrics is None:
+            metrics = ParseMetrics()
+            self._parse_metrics = metrics
+        return metrics
+
     def get_sheet(self, name: str | None = None) -> MessySheet:
         """Get a sheet by name."""
         if name is None:
@@ -1712,6 +1810,57 @@ class MessyWorkbook:
             stream = DataFrameChunkStream(frames(), lease.release_after_source_cleanup)
             return lease.bind(stream)
 
+    def iter_sheets(
+        self,
+        config: SheetConfig | None = None,
+    ) -> SheetStream:
+        """Return one ordered success or ordinary failure result per sheet."""
+        self._validate_public_config(config)
+        with self._stream_operation() as lease:
+            pending = deque(self._plan_workbook_sheets(config))
+
+            def results() -> Iterator[SheetResult]:
+                result: SheetResult | None = None
+                frame: pd.DataFrame | None = None
+                current: PlannedSheet | None = None
+                while pending:
+                    # Release the prior yielded frame before opening the next
+                    # sheet-local materializer.
+                    result = None
+                    frame = None
+                    current = pending.popleft()
+                    if current.state is PlannedSheetState.ERROR:
+                        assert current.error is not None
+                        result = _failure_sheet_result(current.name, current.error)
+                    elif current.state is PlannedSheetState.READY:
+                        assert current.parse_plan is not None
+                        try:
+                            frame = self._materialize_compiled_plan(
+                                current.name,
+                                current.parse_plan,
+                            )
+                        except BaseException as error:
+                            if (
+                                not isinstance(error, Exception)
+                                or _contains_active_operation_error(error)
+                                or _contains_process_failure(error)
+                            ):
+                                raise
+                            result = _failure_sheet_result(current.name, error)
+                        else:
+                            result = SheetResult(name=current.name, dataframe=frame)
+                    else:
+                        current = None
+                        continue
+                    assert result is not None
+                    current = None
+                    yield result
+                    result = None
+                    frame = None
+
+            stream = SheetStream(results(), lease.release_after_source_cleanup)
+            return lease.bind(stream)
+
     def to_dataframes(
         self,
         config: SheetConfig | None = None,
@@ -1743,9 +1892,21 @@ class MessyWorkbook:
                 lease._body_started()
                 result = {}
                 errors: list[SheetError] = []
-                for name in self._sheet_names:
+                for item in self._plan_workbook_sheets(config):
+                    name = item.name
+                    if item.state is PlannedSheetState.ERROR:
+                        assert item.error is not None
+                        if include_errors:
+                            errors.append(_sheet_error(name, item.error))
+                        continue
+                    if item.state is not PlannedSheetState.READY:
+                        continue
+                    assert item.parse_plan is not None
                     try:
-                        result[name] = self._parse_sheet_unreserved(name, config)
+                        result[name] = self._materialize_compiled_plan(
+                            name,
+                            item.parse_plan,
+                        )
                     except _ActiveOperationError:
                         raise
                     except Exception as e:
@@ -1753,17 +1914,7 @@ class MessyWorkbook:
                             raise
                         logger.warning("Failed to parse sheet %r, skipping", name, exc_info=True)
                         if include_errors:
-                            context = {}
-                            if hasattr(e, "context"):
-                                context = e.context
-                            errors.append(
-                                SheetError(
-                                    sheet_name=name,
-                                    error_type=type(e).__name__,
-                                    message=str(e),
-                                    context=context,
-                                )
-                            )
+                            errors.append(_sheet_error(name, e))
                 if include_errors:
                     return result, errors
                 return result
@@ -1856,6 +2007,124 @@ class MessyWorkbook:
                 file_path=self._source_handle.description,
             )
         return name
+
+    def _uses_builtin_ooxml_planner(self) -> bool:
+        """Return whether manifest/sampler planning may bypass no extensions."""
+        if self.format_type not in {"xlsx", "xlsm"}:
+            return False
+        if type(self._registry) is not HandlerRegistry:
+            return False
+        if not self._registry._uses_builtin_components():
+            return False
+        return type(self._registry.get_handler(self.format_type)) is XLSXHandler
+
+    def _uses_builtin_xls_planner(self) -> bool:
+        """Return whether bounded xlrd inspection may bypass no extensions."""
+        if self.format_type != "xls":
+            return False
+        if type(self._registry) is not HandlerRegistry:
+            return False
+        if not self._registry._uses_builtin_components():
+            return False
+        return type(self._registry.get_handler(self.format_type)) is XLSHandler
+
+    @staticmethod
+    def _should_propagate_sheet_error(error: BaseException) -> bool:
+        """Return whether an adapter must not convert a per-sheet failure."""
+        return (
+            not isinstance(error, Exception)
+            or _contains_active_operation_error(error)
+            or _contains_process_failure(error)
+        )
+
+    def _plan_workbook_sheets(
+        self,
+        config: SheetConfig | None,
+    ) -> tuple[PlannedSheet, ...]:
+        """Compile immutable plans for all sheets before any output is exposed."""
+        active_config = config if config is not None else self._sheet_config
+        format_type = self.format_type
+        use_ooxml = self._uses_builtin_ooxml_planner()
+        has_custom_registry = type(self._registry) is not HandlerRegistry
+        if not has_custom_registry:
+            has_custom_registry = not self._registry._uses_builtin_components()
+        planning_config = (
+            replace(active_config, auto_detect=False)
+            if has_custom_registry and active_config.auto_detect
+            else active_config
+        )
+        structures: dict[str, StructureInfo] = {}
+
+        def analyze(name: str) -> SheetInfo:
+            structure: StructureInfo | None = None
+            manifest = self._get_sheet_manifest(name) if use_ooxml else None
+            has_ooxml_values = manifest is not None and manifest.semantic_nonempty_rows.contains(
+                manifest.semantic_data_region[0]
+            )
+            if (
+                not has_custom_registry
+                and (not use_ooxml or has_ooxml_values)
+                and requires_structure_analysis(planning_config, format_type)
+            ):
+                structure = (
+                    self._analyze_stream_structure(name, planning_config)
+                    if use_ooxml
+                    else self._analyze_structure(name, planning_config)
+                )
+                structures[name] = structure
+
+            if not use_ooxml:
+                return SheetInfo(
+                    name=name,
+                    row_count=0,
+                    col_count=0,
+                    header_row=0,
+                )
+
+            assert manifest is not None
+            start_row, end_row, start_col, end_col = manifest.semantic_data_region
+            header_row = 0
+            if structure is not None:
+                header_row = max(0, (structure.header_row or 1) - 1)
+            is_empty = not has_ooxml_values
+            return SheetInfo(
+                name=name,
+                row_count=end_row - start_row + 1 if has_ooxml_values else 0,
+                col_count=end_col - start_col + 1 if has_ooxml_values else 0,
+                header_row=header_row,
+                is_empty=is_empty,
+            )
+
+        def compile_selected(name: str, info: SheetInfo) -> ParsePlan:
+            sheet_config = planning_config
+            if (
+                use_ooxml
+                and info.is_empty
+                and requires_structure_analysis(planning_config, format_type)
+            ):
+                sheet_config = replace(planning_config, auto_detect=False)
+            return compile_parse_plan(
+                sheet_config,
+                structures.get(name),
+                format_type,
+            )
+
+        planner = SheetPlanner(
+            analyze,
+            compile_selected,
+            should_propagate=lambda error: (
+                _contains_active_operation_error(error) or _contains_process_failure(error)
+            ),
+            analysis_failure_info=lambda name, error: SheetInfo(
+                name=name,
+                row_count=0,
+                col_count=0,
+                header_row=0,
+                is_empty=True,
+                skip_reason=f"Parse error: {error}",
+            ),
+        )
+        return planner.plan(self._sheet_names, select_all=True)
 
     def _prepare_streaming_operation(
         self,
@@ -2285,8 +2554,15 @@ class MessyWorkbook:
         if requires_structure_analysis(config, format_type):
             structure = self._analyze_structure(sheet, config)
         plan = compile_parse_plan(config, structure, format_type)
+        return self._materialize_compiled_plan(sheet, plan)
 
-        df = self._materialize_raw_frame(sheet, format_type, plan)
+    def _materialize_compiled_plan(
+        self,
+        sheet: str,
+        plan: ParsePlan,
+    ) -> pd.DataFrame:
+        """Materialize and normalize one already-frozen plan."""
+        df = self._materialize_raw_frame_counted(sheet, self.format_type, plan)
 
         if plan.normalize:
             semantic_hints = plan.thaw_type_hints()
@@ -2351,6 +2627,26 @@ class MessyWorkbook:
 
         return df
 
+    def _materialize_raw_frame_counted(
+        self,
+        sheet: str,
+        format_type: str,
+        plan: ParsePlan,
+    ) -> pd.DataFrame:
+        """Count one raw backend result unless its coordinator already did."""
+        metrics = self.parse_metrics
+        full_before = metrics.full_materializations
+        failures_before = metrics.failed_attempts
+        try:
+            frame = self._materialize_raw_frame(sheet, format_type, plan)
+        except BaseException:
+            if metrics.failed_attempts == failures_before:
+                metrics.failed_attempts += 1
+            raise
+        if metrics.full_materializations == full_before:
+            metrics.full_materializations += 1
+        return frame
+
     def _materialize_raw_frame(
         self,
         sheet: str,
@@ -2361,6 +2657,18 @@ class MessyWorkbook:
         built_in = self._parse_builtin_materialized(sheet, format_type, plan)
         if built_in is _NO_BUILTIN_MATERIALIZATION:
             with self._registry_source() as source:
+                parse = self._registry.parse
+                if (
+                    getattr(parse, "__func__", None) is HandlerRegistry.parse
+                    and getattr(parse, "__self__", None) is self._registry
+                ):
+                    return self._registry._parse_counted(
+                        source,
+                        sheet=sheet,
+                        options=plan.to_parse_options(),
+                        format_type=format_type,
+                        metrics=self.parse_metrics,
+                    )
                 return self._registry.parse(
                     source,
                     sheet=sheet,
@@ -2386,6 +2694,7 @@ class MessyWorkbook:
         handler = self._registry.get_handler(format_type)
         if type(handler) is not XLSXHandler:
             return _NO_BUILTIN_MATERIALIZATION
+        assert handler is not None
         if not _is_fastexcel_materialized_plan(plan):
             return _NO_BUILTIN_MATERIALIZATION
         transform: CoordinateTransform | None = None
@@ -2407,6 +2716,7 @@ class MessyWorkbook:
                 sheet,
                 plan,
                 self._get_fastexcel_session,
+                metrics=self.parse_metrics,
                 transform=transform,
             )
         except Exception as error:
@@ -2435,6 +2745,7 @@ class MessyWorkbook:
         if reader is None:
             reader = ManifestReader(self._source_handle)
             self._manifest_reader = reader
+            self.parse_metrics.manifest_builds += 1
         return reader
 
     def _get_sheet_manifest(self, sheet: str) -> SheetManifest:
@@ -2450,6 +2761,7 @@ class MessyWorkbook:
             sampler = StructureSampler(
                 self._get_fastexcel_session(),
                 self._get_manifest_reader(),
+                metrics=self.parse_metrics,
             )
             self._stream_structure_sampler = sampler
         return cast(StructureInfo, sampler.analyze(sheet, config.header_patterns))
@@ -2650,7 +2962,10 @@ class MessyWorkbook:
                     self._close_sample_owner,
                 )
             )
-        if getattr(self, "_active_stream", None) is not None:
+        if (
+            getattr(self, "_active_stream", None) is not None
+            or self.__dict__.get("_active_stream_cleanup") is not None
+        ):
             cleanups.append(("active stream invalidation", self._invalidate_active_stream))
         elif getattr(self, "_active_materialized_lease", None) is not None:
             cleanups.append(
@@ -2697,13 +3012,16 @@ class MessyWorkbook:
 
     def _invalidate_active_stream(self) -> None:
         stream = getattr(self, "_active_stream", None)
-        if stream is None:
+        cleanup_state = self.__dict__.get("_active_stream_cleanup")
+        if stream is None and cleanup_state is None:
             return
         token = getattr(self, "_active_operation_token", None)
         invalidate = getattr(stream, "invalidate_from_owner", None)
         try:
             if callable(invalidate):
                 invalidate()
+            elif cleanup_state is not None:
+                cleanup_state.close()
             if token is not None:
                 self._end_operation(token)
             else:
@@ -2741,6 +3059,7 @@ class MessyWorkbook:
         if (
             getattr(self, "_sample_owner", None) is not None
             or getattr(self, "_active_stream", None) is not None
+            or self.__dict__.get("_active_stream_cleanup") is not None
         ):
             return
         try:

@@ -25,6 +25,7 @@ from messy_xlsx.detection.format_detector import FormatDetector
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.models import FormatInfo
 from messy_xlsx.parsing.base_handler import FormatHandler, ParseOptions
+from messy_xlsx.parsing.contracts import ParseMetrics
 from messy_xlsx.parsing.csv_handler import CSVHandler
 from messy_xlsx.parsing.xls_handler import XLSHandler
 from messy_xlsx.parsing.xlsx_handler import XLSXHandler
@@ -55,6 +56,11 @@ _FINGERPRINT_BOOTSTRAP_GLOBALS = frozenset(
 _NON_BEHAVIOR_CLASS_ATTRIBUTES = frozenset(
     {"__dict__", "__doc__", "__module__", "__qualname__", "__weakref__"}
 )
+
+
+def _record_handler_failure(metrics: ParseMetrics | None) -> None:
+    if metrics is not None:
+        metrics.failed_attempts += 1
 
 
 def _type_module(value_type: type[object]) -> str:
@@ -800,6 +806,24 @@ class HandlerRegistry:
         format_type: str | None = None,
     ) -> pd.DataFrame:
         """Parse file with automatic format detection and fallback."""
+        return self._parse_counted(
+            file_source,
+            sheet=sheet,
+            options=options,
+            format_type=format_type,
+            metrics=None,
+        )
+
+    def _parse_counted(
+        self,
+        file_source: SourceInput | SourceHandle,
+        *,
+        sheet: str | None,
+        options: ParseOptions | None,
+        format_type: str | None,
+        metrics: ParseMetrics | None,
+    ) -> pd.DataFrame:
+        """Parse while recording each caught handler attempt when requested."""
         with self._source_handle(file_source) as source:
             file_desc = source.description
             options = options or ParseOptions()
@@ -820,6 +844,7 @@ class HandlerRegistry:
             try:
                 return self._parse_with(handler, source, sheet, options)
             except Exception as error:
+                _record_handler_failure(metrics)
                 if _blocks_backend_retry(error):
                     raise
                 pass
@@ -833,6 +858,7 @@ class HandlerRegistry:
                 try:
                     return self._parse_with(fallback_handler, source, sheet, options)
                 except Exception as error:
+                    _record_handler_failure(metrics)
                     if _blocks_backend_retry(error):
                         raise
                     continue
@@ -924,12 +950,15 @@ class HandlerRegistry:
         accepts_handle = bool(type(self.detector).__dict__.get("_accepts_source_handle", False))
         if accepts_handle:
             if filename is None:
-                return self.detector.detect(source)
-            return self.detector.detect(source, filename=filename)
+                return cast(FormatInfo, self.detector.detect(source))
+            return cast(FormatInfo, self.detector.detect(source, filename=filename))
         with source.open_legacy() as legacy_source:
             if filename is None:
-                return self.detector.detect(legacy_source)
-            return self.detector.detect(legacy_source, filename=filename)
+                return cast(FormatInfo, self.detector.detect(legacy_source))
+            return cast(
+                FormatInfo,
+                self.detector.detect(legacy_source, filename=filename),
+            )
 
     @staticmethod
     def _handler_accepts_source_handle(handler: FormatHandler) -> bool:
@@ -943,9 +972,9 @@ class HandlerRegistry:
         options: ParseOptions,
     ) -> pd.DataFrame:
         if self._handler_accepts_source_handle(handler):
-            return handler.parse(source, sheet, options)  # type: ignore[arg-type]
+            return cast(pd.DataFrame, handler.parse(source, sheet, options))
         with source.open_legacy() as legacy_source:
-            return handler.parse(legacy_source, sheet, options)
+            return cast(pd.DataFrame, handler.parse(legacy_source, sheet, options))
 
     def _sheet_names_with(
         self,
@@ -953,9 +982,9 @@ class HandlerRegistry:
         source: SourceHandle,
     ) -> list[str]:
         if self._handler_accepts_source_handle(handler):
-            return handler.get_sheet_names(source)  # type: ignore[arg-type]
+            return cast(list[str], handler.get_sheet_names(source))
         with source.open_legacy() as legacy_source:
-            return handler.get_sheet_names(legacy_source)
+            return cast(list[str], handler.get_sheet_names(legacy_source))
 
     def _validate_with(
         self,
@@ -963,9 +992,9 @@ class HandlerRegistry:
         source: SourceHandle,
     ) -> tuple[bool, str | None]:
         if self._handler_accepts_source_handle(handler):
-            return handler.validate(source)  # type: ignore[arg-type]
+            return cast(tuple[bool, str | None], handler.validate(source))
         with source.open_legacy() as legacy_source:
-            return handler.validate(legacy_source)
+            return cast(tuple[bool, str | None], handler.validate(legacy_source))
 
 
 # ============================================================================
