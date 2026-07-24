@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import io
 import os
+import sys
 from pathlib import Path
 from typing import BinaryIO, NoReturn
 
@@ -321,6 +323,93 @@ def test_spill_resources_are_removed_when_setup_raises_non_oserror(
             _remove_test_resources(*created[0])
 
 
+@pytest.mark.parametrize(
+    "interruption",
+    [
+        OSError("spill ownership transition interrupted"),
+        MemoryError("spill ownership transition interrupted"),
+    ],
+    ids=["ordinary", "process"],
+)
+def test_mkstemp_result_is_owned_before_the_next_python_line(
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: BaseException,
+) -> None:
+    created = _track_temp_creation(monkeypatch)
+    real_close = spool_module.os.close
+    real_unlink = spool_module.os.unlink
+    close_calls = 0
+    unlink_calls = 0
+    interrupted = False
+    target_code = spool_module._create_spill.__code__
+
+    def track_close(descriptor: int) -> None:
+        nonlocal close_calls
+        if created and descriptor == created[0][0]:
+            close_calls += 1
+        real_close(descriptor)
+
+    def track_unlink(path: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> None:
+        nonlocal unlink_calls
+        if created and Path(path) == created[0][1]:
+            unlink_calls += 1
+        real_unlink(path)
+
+    def interrupt_after_mkstemp_return(
+        frame: object,
+        event: str,
+        _arg: object,
+    ) -> object:
+        nonlocal interrupted
+        frame_locals = getattr(frame, "f_locals", {})
+        created_descriptor = created[0][0] if created else None
+        if (
+            getattr(frame, "f_code", None) is target_code
+            and event == "line"
+            and created_descriptor is not None
+            and created_descriptor
+            in {
+                frame_locals.get("raw_descriptor"),
+                frame_locals.get("descriptor_owner"),
+            }
+            and not interrupted
+        ):
+            interrupted = True
+            sys.settrace(None)
+            frame.f_trace = None  # type: ignore[attr-defined]
+            raise type(interruption)(*interruption.args)
+        return interrupt_after_mkstemp_return
+
+    monkeypatch.setattr(spool_module.os, "close", track_close)
+    monkeypatch.setattr(spool_module.os, "unlink", track_unlink)
+    sys.settrace(interrupt_after_mkstemp_return)
+    try:
+        with pytest.raises(type(interruption), match="ownership transition interrupted"):
+            ReplaySpool.from_stream(io.BytesIO(b"x" * 32), memory_limit=1)
+    finally:
+        sys.settrace(None)
+
+    try:
+        assert interrupted
+        assert len(created) == 1
+        descriptor, path = created[0]
+        assert _descriptor_is_closed(descriptor)
+        assert not path.exists()
+        assert close_calls == 1
+        assert unlink_calls == 1
+    finally:
+        if created:
+            descriptor, path = created[0]
+            try:
+                real_close(descriptor)
+            except OSError:
+                pass
+            try:
+                real_unlink(path)
+            except FileNotFoundError:
+                pass
+
+
 def test_non_oserror_remains_primary_when_spill_cleanup_also_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -523,3 +612,55 @@ def test_completed_spool_process_cleanup_wins_over_restoration_failure(
         ReplaySpool.from_stream(source)
 
     assert captured.value is cleanup_error
+
+
+def test_replay_spool_return_gap_finalizer_removes_unadopted_spill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _track_temp_creation(monkeypatch)
+    target_code = ReplaySpool.from_stream.__func__.__code__
+    interrupted = False
+
+    def interrupt_public_return(frame: object, event: str, _arg: object) -> object:
+        nonlocal interrupted
+        if getattr(frame, "f_code", None) is target_code and event == "return" and not interrupted:
+            interrupted = True
+            sys.settrace(None)
+            frame.f_trace = None  # type: ignore[attr-defined]
+            raise MemoryError("replay spool return interrupted")
+        return interrupt_public_return
+
+    sys.settrace(interrupt_public_return)
+    try:
+        with pytest.raises(MemoryError, match="replay spool return interrupted"):
+            ReplaySpool.from_stream(io.BytesIO(b"x" * 64), memory_limit=1)
+    finally:
+        sys.settrace(None)
+    gc.collect()
+
+    assert interrupted
+    assert len(created) == 1
+    assert not created[0][1].exists()
+
+
+def test_replay_spool_rejects_adopter_that_does_not_confirm_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _track_temp_creation(monkeypatch)
+
+    class NoopAdopter:
+        def __call__(self, _spool: ReplaySpool) -> None:
+            return
+
+        def owns(self, _spool: ReplaySpool) -> bool:
+            return False
+
+    with pytest.raises(RuntimeError, match="adopt"):
+        ReplaySpool.from_stream(
+            io.BytesIO(b"x" * 64),
+            memory_limit=1,
+            _adopter=NoopAdopter(),
+        )
+
+    assert len(created) == 1
+    assert not created[0][1].exists()

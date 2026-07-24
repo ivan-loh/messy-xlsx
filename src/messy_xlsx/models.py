@@ -7,6 +7,8 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+import pandas as pd
+
 from messy_xlsx.enums import (
     DataType,
     FormatType,
@@ -129,6 +131,19 @@ class SheetError:
             "message": self.message,
             "context": self.context,
         }
+
+
+@dataclass(frozen=True)
+class SheetResult:
+    """One successful or failed per-sheet materialized result."""
+
+    name: str
+    dataframe: pd.DataFrame | None = None
+    error: SheetError | None = None
+
+    def __post_init__(self) -> None:
+        if (self.dataframe is None) == (self.error is None):
+            raise ValueError("exactly one of dataframe and error must be set")
 
 
 @dataclass

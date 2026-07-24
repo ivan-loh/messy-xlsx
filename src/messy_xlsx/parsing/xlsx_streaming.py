@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import TracebackType
 from typing import Any, Self
 
 import openpyxl
 import pyarrow as pa
 
-from messy_xlsx._fallback_signals import _exception_traceback
+from messy_xlsx._fallback_signals import _contains_process_failure, _exception_traceback
 from messy_xlsx._source import BackendSource, SourceHandle
 from messy_xlsx.enums import MergeStrategy
 from messy_xlsx.ooxml.models import SheetManifest
@@ -25,10 +25,50 @@ from messy_xlsx.parsing.coordinates import (
     PreparedCoordinateSchema,
 )
 from messy_xlsx.parsing.parse_plan import ParsePlan
+from messy_xlsx.parsing.physical_values import encode_physical_value
 from messy_xlsx.parsing.streams import _close_if_present, _run_cleanups
 
 _MAX_EXCEL_ROW = 1_048_576
 _MAX_EXCEL_COLUMN = 16_384
+
+
+class _RetryableSourceContext:
+    """Own a prearmed source context until exit and cursor restore complete."""
+
+    def __init__(self, source: SourceHandle) -> None:
+        self._source = source
+        self._context: AbstractContextManager[BackendSource] | None = None
+
+    def enter(
+        self,
+        context: AbstractContextManager[BackendSource],
+    ) -> BackendSource:
+        if self._context is not None:
+            raise RuntimeError("source context owner is already armed")
+        self._context = context
+        return context.__enter__()
+
+    def close(self) -> None:
+        context = self._context
+        if context is None:
+            self._source._retry_pending_cursor_restoration()
+            return
+        try:
+            context.__exit__(None, None, None)
+            self._source._retry_pending_cursor_restoration()
+        except BaseException as error:
+            if not _contains_process_failure(error):
+                self._context = None
+            raise
+        self._context = None
+
+
+def _enter_prearmed_context(
+    owner: _RetryableSourceContext,
+    context: AbstractContextManager[BackendSource],
+) -> BackendSource:
+    """Register source exit before invoking the acquiring enter hook."""
+    return owner.enter(context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +268,119 @@ def _read_bounds(
     return 1, max_row, 1, max_col
 
 
+@dataclass(frozen=True, slots=True)
+class _OoxmlExecutionWindow:
+    """Private full-reader framing after deterministic footer exclusion."""
+
+    coordinate_plan: ParsePlan
+    min_row: int | None
+    max_row: int | None
+    projection_stop_row: int | None
+
+
+def _compile_execution_window(
+    manifest: SheetManifest,
+    plan: ParsePlan,
+    layout: StreamingWorksheetLayout,
+) -> _OoxmlExecutionWindow:
+    """Push a deterministic worksheet tail out of the coordinate buffer."""
+    coordinate_plan = plan if plan.skip_footer == 0 else replace(plan, skip_footer=0)
+    if layout.min_row is None or layout.max_row is None:
+        return _OoxmlExecutionWindow(coordinate_plan, None, None, None)
+
+    projection = CoordinateOperation._parse_projection(plan.cell_range)
+    if projection is not None:
+        retained_stop = projection.max_row - min(
+            plan.skip_footer,
+            projection.max_row - projection.min_row + 1,
+        )
+        if retained_stop < projection.min_row:
+            return _OoxmlExecutionWindow(
+                coordinate_plan,
+                None,
+                None,
+                retained_stop,
+            )
+        min_row = projection.min_row
+        if MergeStrategy(plan.merge_strategy) is MergeStrategy.FILL:
+            for merged_range in manifest.merged_ranges:
+                if (
+                    merged_range.min_row <= retained_stop
+                    and merged_range.max_row >= projection.min_row
+                    and merged_range.min_col <= projection.max_col
+                    and merged_range.max_col >= projection.min_col
+                ):
+                    min_row = min(min_row, merged_range.min_row)
+        return _OoxmlExecutionWindow(
+            coordinate_plan,
+            min_row,
+            retained_stop,
+            retained_stop,
+        )
+
+    retained_row_stop = _last_retained_visible_row(
+        layout.min_row,
+        layout.max_row,
+        manifest,
+        skip_footer=plan.skip_footer,
+        ignore_hidden=plan.ignore_hidden,
+    )
+    if retained_row_stop is None:
+        return _OoxmlExecutionWindow(coordinate_plan, None, None, None)
+    return _OoxmlExecutionWindow(
+        coordinate_plan,
+        layout.min_row,
+        retained_row_stop,
+        None,
+    )
+
+
+def _last_retained_visible_row(
+    start_row: int,
+    end_row: int,
+    manifest: SheetManifest,
+    *,
+    skip_footer: int,
+    ignore_hidden: bool,
+) -> int | None:
+    if not ignore_hidden:
+        retained = end_row - start_row + 1 - skip_footer
+        return None if retained <= 0 else start_row + retained - 1
+
+    visible = _visible_row_intervals(start_row, end_row, manifest)
+    retained = sum(end - start + 1 for start, end in visible) - skip_footer
+    if retained <= 0:
+        return None
+    for start, end in visible:
+        length = end - start + 1
+        if retained <= length:
+            return start + retained - 1
+        retained -= length
+    raise RuntimeError("visible row cutoff could not be resolved")
+
+
+def _visible_row_intervals(
+    start_row: int,
+    end_row: int,
+    manifest: SheetManifest,
+) -> list[tuple[int, int]]:
+    visible: list[tuple[int, int]] = []
+    cursor = start_row
+    for hidden in manifest.hidden_rows.intervals:
+        if hidden.end < cursor:
+            continue
+        if hidden.start > end_row:
+            break
+        if cursor < hidden.start:
+            visible.append((cursor, min(end_row, hidden.start - 1)))
+        cursor = max(cursor, hidden.end + 1)
+        if cursor > end_row:
+            break
+    if cursor <= end_row:
+        visible.append((cursor, end_row))
+    return visible
+
+
 class _BatchRechunker:
     """Bounded carry that emits exact-size physical Arrow batches."""
 
@@ -296,6 +449,112 @@ def _record_batch_with_row_count(
     return pa.record_batch([pa.nulls(row_count)], names=["_row_count"]).select([])
 
 
+def _raw_coordinate_batch(
+    rows: Iterable[Sequence[Any]],
+    layout: StreamingWorksheetLayout,
+    start_row: int,
+    *,
+    max_cells: int | None = None,
+    max_bytes: int | None = None,
+    truncate_to_budget: bool = False,
+    budget: _RawBatchBudget | None = None,
+) -> CoordinateBatch:
+    """Build one raw window after enforcing optional sample budgets."""
+    width = len(layout.raw_column_numbers)
+    active_budget = budget
+    if active_budget is None and (max_cells is not None or max_bytes is not None):
+        active_budget = _RawBatchBudget(
+            max_cells=max_cells,
+            max_bytes=max_bytes,
+            truncate_to_budget=truncate_to_budget,
+        )
+    if (
+        active_budget is not None
+        and active_budget.max_cells is not None
+        and width > active_budget.max_cells
+    ):
+        raise ValueError(f"sample raw window may retain at most {active_budget.max_cells} cells")
+
+    columns: list[list[object | None]] = [[] for _column in layout.raw_column_numbers]
+    accepted_rows = 0
+    for row in rows:
+        row_bytes = 0
+        for position in range(width):
+            raw_value = row[position] if position < len(row) else None
+            encoded = _coerce_raw_value(
+                raw_value,
+                layout.raw_schema.field(position).type,
+            )
+            columns[position].append(encoded)
+            row_bytes += _raw_scalar_byte_cost(encoded)
+        if active_budget is not None and not active_budget.accept_row(width, row_bytes):
+            for values in columns:
+                values.pop()
+            break
+        accepted_rows += 1
+
+    arrays = [
+        pa.array(values, type=field.type)
+        for values, field in zip(columns, layout.raw_schema, strict=True)
+    ]
+    batch = _record_batch_with_row_count(arrays, layout.raw_schema, accepted_rows)
+    return CoordinateBatch(
+        batch=batch,
+        row_numbers=pa.array(
+            range(start_row, start_row + accepted_rows),
+            type=pa.int64(),
+        ),
+        column_numbers=layout.raw_column_numbers,
+    )
+
+
+@dataclass(slots=True)
+class _RawBatchBudget:
+    """Cumulative pre-Arrow admission budget shared by sample windows."""
+
+    max_rows: int | None = None
+    max_cells: int | None = None
+    max_bytes: int | None = None
+    truncate_to_budget: bool = False
+    used_rows: int = 0
+    used_cells: int = 0
+    used_bytes: int = 0
+    exhausted_reason: str | None = None
+
+    def accept_row(self, width: int, row_bytes: int) -> bool:
+        if self.max_bytes is not None and row_bytes > self.max_bytes:
+            raise ValueError(f"sample raw window may retain at most {self.max_bytes} Arrow bytes")
+        reason: str | None = None
+        if self.max_rows is not None and self.used_rows + 1 > self.max_rows:
+            reason = "rows"
+        elif self.max_cells is not None and self.used_cells + width > self.max_cells:
+            reason = "cells"
+        elif self.max_bytes is not None and self.used_bytes + row_bytes > self.max_bytes:
+            reason = "bytes"
+        if reason is not None:
+            self.exhausted_reason = reason
+            if self.truncate_to_budget:
+                return False
+            limit = {
+                "rows": self.max_rows,
+                "cells": self.max_cells,
+                "bytes": self.max_bytes,
+            }[reason]
+            raise ValueError(f"sample raw window may retain at most {limit} {reason}")
+        self.used_rows += 1
+        self.used_cells += width
+        self.used_bytes += row_bytes
+        return True
+
+
+def _raw_scalar_byte_cost(value: object) -> int:
+    if isinstance(value, str):
+        return len(value.encode("utf-8", errors="surrogatepass")) + 16
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value) + 16
+    return 16
+
+
 class OpenpyxlStreamingReader:
     """Read one OOXML worksheet pass into bounded Arrow row windows."""
 
@@ -309,6 +568,60 @@ class OpenpyxlStreamingReader:
         metrics: ParseMetrics | None = None,
         *,
         raw_column_numbers: tuple[int, ...] | None = None,
+    ) -> None:
+        self._initialize(
+            source,
+            manifest,
+            plan,
+            raw_schema_or_layout,
+            transform,
+            metrics,
+            raw_column_numbers=raw_column_numbers,
+        )
+        try:
+            self.start()
+        except BaseException as error:
+            self._close_resources(
+                primary_error=error,
+                primary_traceback=_exception_traceback(error),
+            )
+            raise
+
+    @classmethod
+    def prepare(
+        cls,
+        source: SourceHandle,
+        manifest: SheetManifest,
+        plan: ParsePlan,
+        raw_schema_or_layout: pa.Schema | StreamingWorksheetLayout,
+        transform: CoordinateTransform,
+        metrics: ParseMetrics | None = None,
+        *,
+        raw_column_numbers: tuple[int, ...] | None = None,
+    ) -> Self:
+        """Return an inert closeable reader before any external resource acquisition."""
+        reader = cls.__new__(cls)
+        reader._initialize(
+            source,
+            manifest,
+            plan,
+            raw_schema_or_layout,
+            transform,
+            metrics,
+            raw_column_numbers=raw_column_numbers,
+        )
+        return reader
+
+    def _initialize(
+        self,
+        source: SourceHandle,
+        manifest: SheetManifest,
+        plan: ParsePlan,
+        raw_schema_or_layout: pa.Schema | StreamingWorksheetLayout,
+        transform: CoordinateTransform,
+        metrics: ParseMetrics | None,
+        *,
+        raw_column_numbers: tuple[int, ...] | None,
     ) -> None:
         if not isinstance(source, SourceHandle):
             raise TypeError("source must be a SourceHandle")
@@ -341,37 +654,48 @@ class OpenpyxlStreamingReader:
         self._plan = plan
         self._layout = layout
         self._schema = layout.output_schema
+        execution = _compile_execution_window(manifest, plan, layout)
         self._operation: CoordinateOperation | None = transform.open(
             plan,
             layout.prepared_schema,
+            execution_plan=execution.coordinate_plan,
+            projection_stop_row=execution.projection_stop_row,
         )
+        self._read_min_row = execution.min_row
+        self._read_max_row = execution.max_row
         self._batch_size = batch_size
         self._rechunker: _BatchRechunker | None = _BatchRechunker(
             self._schema,
             batch_size,
         )
-        self._backend_context: AbstractContextManager[BackendSource] | None = None
+        self._backend_stack: _RetryableSourceContext | None = _RetryableSourceContext(source)
         self._workbook: Any | None = None
-        self._rows: Iterator[tuple[Any, ...]] = iter(())
-        self._next_input_row = layout.min_row
-        self._row_source_exhausted = layout.min_row is None
+        self._rows: Iterator[tuple[Any, ...]] | None = iter(())
+        self._next_input_row = execution.min_row
+        self._row_source_exhausted = execution.min_row is None
         self._coordinate_finished = False
         self._terminal = False
         self._closed = False
+        self._started = False
 
-        try:
-            self._open()
-        except BaseException as error:
-            self._close_resources(
-                primary_error=error,
-                primary_traceback=_exception_traceback(error),
-            )
-            raise
+    def start(self) -> None:
+        """Acquire the source, workbook, and row iterator after ownership is armed."""
+        if self._closed:
+            raise RuntimeError("stream reader is closed")
+        if self._started:
+            return
+        self._open()
+        self._started = True
 
     @property
     def schema(self) -> pa.Schema:
         """Return the persistent physical output schema."""
         return self._schema
+
+    @property
+    def _backend_context(self) -> _RetryableSourceContext | None:
+        """Compatibility view of the active transactional source context."""
+        return self._backend_stack
 
     def _open(self) -> None:
         backend_context: AbstractContextManager[BackendSource]
@@ -379,30 +703,31 @@ class OpenpyxlStreamingReader:
             backend_context = self._source.open_binary()
         else:
             backend_context = self._source.open_backend()
-        backend = backend_context.__enter__()
-        self._backend_context = backend_context
-        workbook = openpyxl.load_workbook(
+        backend_stack = self._backend_stack
+        assert backend_stack is not None
+        backend = _enter_prearmed_context(backend_stack, backend_context)
+        self._workbook = openpyxl.load_workbook(
             backend,
             read_only=True,
             data_only=self._plan.data_only,
             keep_links=False,
             keep_vba=False,
         )
-        self._workbook = workbook
+        workbook = self._workbook
         worksheet = workbook[self._manifest.name]
         reset_dimensions = getattr(worksheet, "reset_dimensions", None)
         if callable(reset_dimensions):
             reset_dimensions()
-        if self._layout.min_row is None:
+        if self._read_min_row is None:
             return
-        assert self._layout.max_row is not None
+        assert self._read_max_row is not None
         assert self._layout.min_col is not None
         assert self._layout.max_col is not None
         self._rows = iter(
             worksheet.iter_rows(
                 values_only=True,
-                min_row=self._layout.min_row,
-                max_row=self._layout.max_row,
+                min_row=self._read_min_row,
+                max_row=self._read_max_row,
                 min_col=self._layout.min_col,
                 max_col=self._layout.max_col,
             )
@@ -441,46 +766,37 @@ class OpenpyxlStreamingReader:
 
     def _read_raw_window(self) -> CoordinateBatch | None:
         next_row = self._next_input_row
-        max_row = self._layout.max_row
+        max_row = self._read_max_row
         if next_row is None or max_row is None or next_row > max_row:
             return None
         count = min(self._batch_size, max_row - next_row + 1)
         assert count > 0
-        columns: list[list[object]] = [[] for _column in self._layout.raw_column_numbers]
-        for _offset in range(count):
-            row: tuple[Any, ...]
-            if self._row_source_exhausted:
-                row = ()
-            else:
+
+        def rows() -> Iterator[tuple[Any, ...]]:
+            row_iterator = self._rows
+            assert row_iterator is not None
+            for _offset in range(count):
+                if self._row_source_exhausted:
+                    yield ()
+                    continue
                 try:
-                    row = tuple(next(self._rows))
+                    yield tuple(next(row_iterator))
                 except StopIteration:
                     self._row_source_exhausted = True
-                    row = ()
-            for position, values in enumerate(columns):
-                raw_value = row[position] if position < len(row) else None
-                values.append(
-                    _coerce_raw_value(
-                        raw_value,
-                        self._layout.raw_schema.field(position).type,
-                    )
-                )
-        arrays = [
-            pa.array(values, type=field.type)
-            for values, field in zip(columns, self._layout.raw_schema, strict=True)
-        ]
-        batch = pa.record_batch(arrays, schema=self._layout.raw_schema)
-        row_numbers = pa.array(range(next_row, next_row + count), type=pa.int64())
-        self._next_input_row = next_row + count
-        return CoordinateBatch(
-            batch=batch,
-            row_numbers=row_numbers,
-            column_numbers=self._layout.raw_column_numbers,
-        )
+                    yield ()
+
+        raw = _raw_coordinate_batch(rows(), self._layout, next_row)
+        self._next_input_row = next_row + raw.batch.num_rows
+        return raw
 
     def close(self) -> None:
         """Close the workbook and active source borrow exactly once."""
-        if self._closed:
+        if (
+            self._closed
+            and self._rows is None
+            and self._workbook is None
+            and self._backend_stack is None
+        ):
             return
         self._closed = True
         self._close_resources()
@@ -491,25 +807,18 @@ class OpenpyxlStreamingReader:
         primary_error: BaseException | None = None,
         primary_traceback: TracebackType | None = None,
     ) -> None:
-        rows = self._rows
-        workbook = self._workbook
-        backend_context = self._backend_context
-        self._rows = iter(())
-        self._workbook = None
-        self._backend_context = None
         self._operation = None
         self._rechunker = None
         self._terminal = True
-        cleanups: list[tuple[str, Any]] = [
-            ("worksheet row iterator cleanup", lambda: _close_if_present(rows))
-        ]
-        if workbook is not None:
-            cleanups.append(("openpyxl workbook cleanup", workbook.close))
-        if backend_context is not None:
+
+        cleanups: list[tuple[str, Any]] = [("worksheet row iterator cleanup", self._close_rows)]
+        if self._workbook is not None:
+            cleanups.append(("openpyxl workbook cleanup", self._close_workbook))
+        if self._backend_stack is not None:
             cleanups.append(
                 (
                     "source borrow cleanup",
-                    lambda: backend_context.__exit__(None, None, None),
+                    self._close_backend_stack,
                 )
             )
         _run_cleanups(
@@ -517,6 +826,39 @@ class OpenpyxlStreamingReader:
             primary_error=primary_error,
             primary_traceback=primary_traceback,
         )
+
+    def _close_rows(self) -> None:
+        rows = self._rows
+        if rows is None:
+            return
+        try:
+            self._rows = _close_if_present(rows)
+        except BaseException as error:
+            if not _contains_process_failure(error):
+                self._rows = None
+            raise
+
+    def _close_workbook(self) -> None:
+        workbook = self._workbook
+        if workbook is None:
+            return
+        try:
+            self._workbook = _close_if_present(workbook)
+        except BaseException as error:
+            if not _contains_process_failure(error):
+                self._workbook = None
+            raise
+
+    def _close_backend_stack(self) -> None:
+        backend_stack = self._backend_stack
+        if backend_stack is None:
+            return
+        try:
+            self._backend_stack = _close_if_present(backend_stack)
+        except BaseException as error:
+            if not _contains_process_failure(error):
+                self._backend_stack = None
+            raise
 
     def __enter__(self) -> Self:
         return self
@@ -531,8 +873,6 @@ class OpenpyxlStreamingReader:
         if exc_value is None:
             self.close()
             return
-        if self._closed:
-            return
         self._closed = True
         self._close_resources(primary_error=exc_value, primary_traceback=traceback)
 
@@ -543,6 +883,7 @@ class _ReaderBatchIterator(Iterator[pa.RecordBatch]):
     def __init__(self, reader: StreamingBatchReader) -> None:
         self._reader: StreamingBatchReader | None = reader
         self._closed = False
+        self._defer_retry_once = False
 
     def __iter__(self) -> Self:
         return self
@@ -557,6 +898,7 @@ class _ReaderBatchIterator(Iterator[pa.RecordBatch]):
             self._close(
                 primary_error=error,
                 primary_traceback=_exception_traceback(error),
+                defer_retry_to_owner=True,
             )
             raise
         if batch is None:
@@ -567,18 +909,43 @@ class _ReaderBatchIterator(Iterator[pa.RecordBatch]):
     def close(self) -> None:
         self._close()
 
+    def _defer_process_retry_to_owner(self) -> bool:
+        """Let a public owner expose the process failure before retrying it."""
+        if not self._defer_retry_once:
+            return False
+        self._defer_retry_once = False
+        return True
+
     def _close(
         self,
         *,
         primary_error: BaseException | None = None,
         primary_traceback: TracebackType | None = None,
+        defer_retry_to_owner: bool = False,
     ) -> None:
-        if self._closed:
+        if self._closed and self._reader is None:
             return
         self._closed = True
         reader = self._reader
-        self._reader = None
-        cleanups = [] if reader is None else [("streaming reader cleanup", reader.close)]
+        if reader is None:
+            cleanups = []
+        else:
+
+            def close_reader() -> None:
+                current = self._reader
+                if current is None:
+                    return
+                try:
+                    self._reader = current.close()
+                except BaseException as error:
+                    process_failure = _contains_process_failure(error)
+                    if process_failure and defer_retry_to_owner:
+                        self._defer_retry_once = True
+                    if not process_failure:
+                        self._reader = None
+                    raise
+
+            cleanups = [("streaming reader cleanup", close_reader)]
         _run_cleanups(
             cleanups,
             primary_error=primary_error,
@@ -610,7 +977,7 @@ def _coerce_raw_value(value: object, data_type: pa.DataType) -> object:
     if value is None:
         return None
     if pa.types.is_string(data_type) or pa.types.is_large_string(data_type):
-        return value if isinstance(value, str) else str(value)
+        return encode_physical_value(value)
     return value
 
 

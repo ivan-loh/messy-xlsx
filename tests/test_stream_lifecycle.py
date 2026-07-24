@@ -13,7 +13,10 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
+import messy_xlsx.parsing.streams as streams_module
+import messy_xlsx.parsing.xlsx_streaming as xlsx_streaming_module
 from messy_xlsx import MessyWorkbook
+from messy_xlsx.models import SheetConfig
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
 from messy_xlsx.parsing.streams import BatchStream, DataFrameChunkStream, SheetStream
 
@@ -762,7 +765,15 @@ def test_parent_close_invalidates_first_and_attempts_every_resource() -> None:
     child_error = OSError("secret child close")
     process_error = MemoryError("secret session close")
     child = _InvalidatedChild(events, child_error)
-    session = _EventResource("session", events, process_error)
+
+    class RetryOnceSession(_EventResource):
+        def close(self) -> None:
+            self.calls += 1
+            self._events.append(self.name)
+            if self.calls == 1:
+                raise process_error
+
+    session = RetryOnceSession("session", events)
     primary = _EventResource("workbook", events)
     cached = _EventResource("cached", events)
     workbook_source = _EventResource("workbook-source", events)
@@ -793,13 +804,69 @@ def test_parent_close_invalidates_first_and_attempts_every_resource() -> None:
         "source-handle",
     ]
     assert process_error.__dict__["backend_context"]["operation_failure"] == {"type": "OSError"}
-    assert workbook._active_operation_token is None
-    assert workbook._active_stream is None
-
     workbook.close()
     assert child.calls == 1
-    assert session.calls == 1
+    assert session.calls == 2
     assert source_handle.calls == 1
+    workbook.close()
+    assert session.calls == 2
+
+
+@pytest.mark.parametrize(
+    "slot",
+    [
+        "_active_stream",
+        "_fastexcel_session",
+        "_wb",
+        "_cached_wb",
+        "_wb_source",
+        "_cached_wb_source",
+        "_source_handle",
+    ],
+)
+def test_workbook_close_retries_each_process_failed_ownership_slot(
+    slot: str,
+) -> None:
+    class RetryOnceResource:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def close(self) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise MemoryError(f"{slot} interrupted")
+
+        def invalidate_from_owner(self) -> None:
+            self.close()
+
+    workbook = object.__new__(MessyWorkbook)
+    resource = RetryOnceResource()
+    workbook._closed = False
+    workbook._active_operation_token = object() if slot == "_active_stream" else None
+    workbook._active_stream = None
+    workbook._fastexcel_session = None
+    workbook._manifest_reader = None
+    workbook._stream_structure_sampler = None
+    workbook._wb = None
+    workbook._cached_wb = None
+    workbook._wb_source = None
+    workbook._cached_wb_source = None
+    workbook._source_handle = None
+    setattr(workbook, slot, resource)
+
+    with pytest.raises(MemoryError, match=slot):
+        workbook.close()
+    assert getattr(workbook, slot) is resource
+    assert resource.calls == 1
+
+    workbook.close()
+    workbook.close()
+    if slot == "_source_handle":
+        assert workbook._source_handle is resource
+        assert workbook._source_handle_close_pending is False
+    else:
+        assert getattr(workbook, slot) is None
+    assert resource.calls == 2
 
 
 def test_object_new_workbook_close_tolerates_all_new_fields_being_absent() -> None:
@@ -873,11 +940,255 @@ def test_stream_releases_source_and_callback_payload_references() -> None:
     assert callback_ref() is None
 
 
-def test_task9_keeps_stream_types_off_the_package_root() -> None:
+def test_task12_exports_stream_types_from_the_package_root() -> None:
     import messy_xlsx
     import messy_xlsx.parsing.streams as streams
 
     assert streams.__all__ == ["BatchStream", "DataFrameChunkStream", "SheetStream"]
-    assert "BatchStream" not in messy_xlsx.__all__
-    assert "DataFrameChunkStream" not in messy_xlsx.__all__
-    assert "SheetStream" not in messy_xlsx.__all__
+    assert "BatchStream" in messy_xlsx.__all__
+    assert "DataFrameChunkStream" in messy_xlsx.__all__
+    assert "SheetStream" in messy_xlsx.__all__
+
+
+def test_result_stream_close_process_interruption_remains_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _ClosableIterator([_batch()])
+    released: list[bool] = []
+    stream = BatchStream(source, _batch().schema, lambda: released.append(True))
+    real_run_cleanups = streams_module._run_cleanups
+    interrupted = False
+
+    def interrupt_once(*args: object, **kwargs: object) -> object:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise MemoryError("before result-stream cleanup")
+        return real_run_cleanups(*args, **kwargs)
+
+    monkeypatch.setattr(streams_module, "_run_cleanups", interrupt_once)
+    with pytest.raises(MemoryError, match="before result-stream cleanup"):
+        stream.close()
+    assert source.close_calls == 0
+    assert released == []
+
+    stream.close()
+    assert source.close_calls == 1
+    assert released == [True]
+
+
+def test_public_batch_stream_retries_callback_process_failure_then_is_idempotent() -> None:
+    source = _ClosableIterator([_batch()])
+    callback_calls = 0
+
+    def retryable_callback() -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+        if callback_calls == 1:
+            raise MemoryError("release callback interrupted")
+
+    stream = BatchStream(source, _batch().schema, retryable_callback)
+    with pytest.raises(MemoryError, match="release callback interrupted"):
+        stream.close()
+
+    assert source.close_calls == 1
+    assert callback_calls == 1
+
+    stream.close()
+    stream.close()
+    assert source.close_calls == 1
+    assert callback_calls == 2
+
+
+def test_successful_release_callback_is_not_retried_for_pending_source_cleanup() -> None:
+    class RetryableSource(_ClosableIterator):
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise MemoryError("source cleanup interrupted")
+
+    source = RetryableSource([_batch()])
+    callback_calls = 0
+
+    def successful_callback() -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+
+    stream = BatchStream(source, _batch().schema, successful_callback)
+    with pytest.raises(MemoryError, match="source cleanup interrupted"):
+        stream.close()
+
+    assert source.close_calls == 1
+    assert callback_calls == 1
+
+    stream.close()
+    stream.close()
+    assert source.close_calls == 2
+    assert callback_calls == 1
+
+
+def test_owner_invalidation_is_sticky_when_trace_interrupts_after_cleanup() -> None:
+    source = _ClosableIterator([_batch()])
+    stream = BatchStream(source, _batch().schema, lambda: None)
+    target_code = stream.invalidate_from_owner.__func__.__code__
+    interrupted = False
+
+    def interrupt_after_cleanup(frame: Any, event: str, _arg: object) -> Any:
+        nonlocal interrupted
+        if (
+            frame.f_code is target_code
+            and event in {"line", "return"}
+            and source.close_calls == 1
+            and not interrupted
+        ):
+            interrupted = True
+            import sys
+
+            sys.settrace(None)
+            frame.f_trace = None
+            raise MemoryError("owner invalidation interrupted")
+        return interrupt_after_cleanup
+
+    import sys
+
+    sys.settrace(interrupt_after_cleanup)
+    try:
+        with pytest.raises(MemoryError, match="owner invalidation interrupted"):
+            stream.invalidate_from_owner()
+    finally:
+        sys.settrace(None)
+
+    assert interrupted
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="MessyWorkbook is closed"):
+            next(stream)
+
+
+def test_operation_release_interruption_keeps_exact_token_retryable(
+    sample_xlsx: Any,
+) -> None:
+    workbook = MessyWorkbook(sample_xlsx)
+    lease = workbook._stream_operation()
+    stream = BatchStream(_ClosableIterator(), pa.schema([]), lease.release)
+    lease.bind(stream)
+    token = lease._token
+    target_code = workbook._end_operation.__func__.__code__
+    interrupted = False
+
+    def interrupt_between_fields(
+        frame: Any,
+        event: str,
+        _arg: object,
+    ) -> Any:
+        nonlocal interrupted
+        if frame.f_code is target_code and event == "line" and not interrupted:
+            active_token = workbook._active_operation_token
+            active_stream = workbook._active_stream
+            if (active_token is None) != (active_stream is None):
+                interrupted = True
+                raise MemoryError("operation release interrupted")
+        return interrupt_between_fields
+
+    import sys
+
+    sys.settrace(interrupt_between_fields)
+    try:
+        with pytest.raises(MemoryError, match="operation release interrupted"):
+            lease.release()
+    finally:
+        sys.settrace(None)
+
+    try:
+        assert workbook._active_stream is None
+        assert workbook._active_operation_token is token
+
+        lease.release()
+        assert workbook._active_stream is None
+        assert workbook._active_operation_token is None
+
+        new_token = workbook._begin_operation()
+        workbook._end_operation(token)
+        assert workbook._active_operation_token is new_token
+        workbook._end_operation(new_token)
+    finally:
+        stream.close()
+        workbook.close()
+
+
+def test_active_child_stream_keeps_parent_alive_until_terminal_close(
+    sample_xlsx: Any,
+) -> None:
+    source = io.BytesIO(sample_xlsx.read_bytes())
+    source.seek(31)
+    entry = source.tell()
+    workbook = MessyWorkbook(source, filename=sample_xlsx.name)
+    stream = workbook.iter_batches(batch_size=2)
+    workbook_ref = weakref.ref(workbook)
+    stream_ref = weakref.ref(stream)
+
+    del workbook
+    gc.collect()
+    assert workbook_ref() is not None
+
+    stream.close()
+    assert source.tell() == entry
+    del stream
+    gc.collect()
+
+    assert stream_ref() is None
+    assert workbook_ref() is None
+
+
+def test_parent_retries_reader_that_never_returns_after_open_cleanup_process_failure(
+    sample_xlsx: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = io.BytesIO(sample_xlsx.read_bytes())
+    source.seek(43)
+    entry = source.tell()
+    real_load_workbook = xlsx_streaming_module.openpyxl.load_workbook
+    load_calls = 0
+
+    class FailingFullWorkbook:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def __getitem__(self, _name: str) -> object:
+            raise ValueError("full reader open failed after workbook acquisition")
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise MemoryError("full workbook cleanup interrupted")
+
+    failing_workbook = FailingFullWorkbook()
+
+    def load_workbook(*args: object, **kwargs: object) -> object:
+        nonlocal load_calls
+        load_calls += 1
+        if load_calls == 1:
+            return real_load_workbook(*args, **kwargs)
+        return failing_workbook
+
+    monkeypatch.setattr(
+        xlsx_streaming_module.openpyxl,
+        "load_workbook",
+        load_workbook,
+    )
+    workbook = MessyWorkbook(source, filename=sample_xlsx.name)
+    try:
+        with pytest.raises(MemoryError, match="full workbook cleanup interrupted"):
+            workbook.iter_batches(config=SheetConfig(auto_detect=False))
+        assert failing_workbook.close_calls == 1
+
+        workbook.close()
+        workbook.close()
+        assert failing_workbook.close_calls == 2
+        assert workbook._active_operation_token is None
+        assert source.tell() == entry
+        assert workbook._source_handle._active_borrow is False
+    finally:
+        try:
+            workbook.close()
+        except BaseException:
+            pass

@@ -7,17 +7,22 @@ replay-required sources use a bounded-memory, spillable spool.
 
 from __future__ import annotations
 
+import atexit
 import io
 import os
-from collections.abc import Iterator
+import weakref
+from collections import deque
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import TracebackType
 from typing import BinaryIO, Literal, TypeAlias, cast
 
 from messy_xlsx._fallback_signals import (
     _attach_cleanup_failure,
     _attach_operation_failure,
     _contains_process_failure,
+    _exception_traceback,
     _FallbackBlockReason,
     _mark_fallback_blocked,
     _safe_add_note,
@@ -29,6 +34,116 @@ from messy_xlsx.exceptions import FileError
 SourceInput: TypeAlias = str | Path | BinaryIO
 SourceIdentity: TypeAlias = tuple[Literal["path", "stream"], str | int]
 BackendSource: TypeAlias = Path | BinaryIO
+_MAX_ORPHAN_SOURCE_STATES = 64
+
+
+class _SourceCleanupState:
+    """Finalizable cursor/spool obligations independent of ``SourceHandle``."""
+
+    __slots__ = ("caller_stream", "pending_restore_position", "spool")
+
+    def __init__(self) -> None:
+        self.caller_stream: BinaryIO | None = None
+        self.pending_restore_position: int | None = None
+        self.spool: ReplaySpool | None = None
+
+    def close_once(self) -> None:
+        failures: list[BaseException] = []
+        if self.pending_restore_position is not None and self.caller_stream is not None:
+            try:
+                self.caller_stream.seek(self.pending_restore_position)
+            except BaseException as error:
+                failures.append(error)
+            else:
+                self.pending_restore_position = None
+        spool = self.spool
+        if spool is not None:
+            try:
+                spool.close()
+            except BaseException as error:
+                failures.append(error)
+            else:
+                self.spool = None
+        if failures:
+            process_failure = next(
+                (error for error in failures if _contains_process_failure(error)),
+                None,
+            )
+            raise process_failure if process_failure is not None else failures[0]
+
+    @property
+    def pending(self) -> bool:
+        return self.pending_restore_position is not None or self.spool is not None
+
+
+_ORPHAN_SOURCE_STATES: deque[_SourceCleanupState] = deque()
+
+
+def _queue_orphan_source_state(state: _SourceCleanupState) -> None:
+    if not state.pending or any(candidate is state for candidate in _ORPHAN_SOURCE_STATES):
+        return
+    if len(_ORPHAN_SOURCE_STATES) >= _MAX_ORPHAN_SOURCE_STATES:
+        _drain_orphan_source_states()
+    if len(_ORPHAN_SOURCE_STATES) < _MAX_ORPHAN_SOURCE_STATES:
+        _ORPHAN_SOURCE_STATES.append(state)
+
+
+def _drain_orphan_source_states() -> None:
+    pending = tuple(_ORPHAN_SOURCE_STATES)
+    _ORPHAN_SOURCE_STATES.clear()
+    for state in pending:
+        try:
+            state.close_once()
+        except BaseException:
+            if len(_ORPHAN_SOURCE_STATES) < _MAX_ORPHAN_SOURCE_STATES:
+                _ORPHAN_SOURCE_STATES.append(state)
+
+
+def _finalize_source_state(state: _SourceCleanupState) -> None:
+    try:
+        state.close_once()
+    except BaseException:
+        _queue_orphan_source_state(state)
+
+
+atexit.register(_drain_orphan_source_states)
+
+
+class _SourceSpoolAdopter:
+    """Expose both transfer and hook-free ownership confirmation."""
+
+    __slots__ = ("_handle",)
+
+    def __init__(self, handle: SourceHandle) -> None:
+        self._handle = handle
+
+    def __call__(self, spool: ReplaySpool) -> None:
+        self._handle._adopt_spool(spool)
+
+    def owns(self, spool: ReplaySpool) -> bool:
+        return self._handle._spool is spool
+
+    def register_cursor_restore(self, stream: BinaryIO, position: int) -> None:
+        self._handle._register_pending_cursor_restoration(stream, position)
+
+    def confirm_cursor_restore(self, stream: BinaryIO, position: int) -> None:
+        self._handle._confirm_pending_cursor_restoration(stream, position)
+
+
+def _run_source_cleanups(
+    cleanups: list[tuple[str, Callable[[], object]]],
+    *,
+    primary_error: BaseException,
+    primary_traceback: TracebackType | None,
+) -> None:
+    """Load the shared lifecycle helper lazily to avoid a parsing import cycle."""
+    from messy_xlsx.parsing.streams import _run_cleanups
+
+    _run_cleanups(
+        cleanups,
+        primary_error=primary_error,
+        primary_traceback=primary_traceback,
+    )
 
 
 def _is_readable(value: object) -> bool:
@@ -94,24 +209,61 @@ class SourceHandle:
     into an owned replay spool and are never closed by the handle.
     """
 
+    _cleanup_state: _SourceCleanupState
+    _cleanup_finalizer: weakref.finalize
+
+    def __new__(cls, *_args: object, **_kwargs: object) -> SourceHandle:
+        handle = super().__new__(cls)
+        state = _SourceCleanupState()
+        handle._cleanup_state = state
+        handle._cleanup_finalizer = weakref.finalize(
+            handle,
+            _finalize_source_state,
+            state,
+        )
+        _drain_orphan_source_states()
+        return handle
+
     def __init__(self, source: SourceInput, filename: str | None = None) -> None:
+        self._initialize(source, filename)
+        try:
+            self.start()
+        except BaseException as error:
+            _run_source_cleanups(
+                [
+                    ("source construction rollback", self._close_spool),
+                    ("source construction rollback retry", self._close_spool),
+                ],
+                primary_error=error,
+                primary_traceback=_exception_traceback(error),
+            )
+            raise
+
+    @classmethod
+    def prepare(cls, source: SourceInput, filename: str | None = None) -> SourceHandle:
+        """Create an inert handle whose eager acquisition has not started."""
+        handle = cls.__new__(cls)
+        handle._initialize(source, filename)
+        return handle
+
+    def _initialize(self, source: SourceInput, filename: str | None) -> None:
         self._path: Path | None = None
         self._stream: BinaryIO | None = None
         self._spool: ReplaySpool | None = None
         self._backend_requires_copy: bool | None = None
         self._active_borrow = False
+        self._pending_restore_position: int | None = None
         self._closed = False
+        self._started = False
 
         if _is_readable(source):
             stream = cast(BinaryIO, source)
             self._stream = stream
+            self._cleanup_state.caller_stream = stream
             self._original: BackendSource = stream
             self._filename_hint = filename or _stream_name(stream)
             self._stream_is_seekable = self._probe_seekability(stream)
             self._identity: SourceIdentity = ("stream", id(stream))
-
-            if not self._stream_is_seekable:
-                self._ensure_spool()
         else:
             path = Path(cast(str | Path, source))
             self._path = path
@@ -123,6 +275,39 @@ class SourceHandle:
             except (OSError, RuntimeError):
                 resolved = path.absolute()
             self._identity = ("path", str(resolved))
+
+    @property
+    def _spool(self) -> ReplaySpool | None:
+        return self._cleanup_state.spool
+
+    @_spool.setter
+    def _spool(self, value: ReplaySpool | None) -> None:
+        self._cleanup_state.spool = value
+
+    @property
+    def _pending_restore_position(self) -> int | None:
+        return self._cleanup_state.pending_restore_position
+
+    @_pending_restore_position.setter
+    def _pending_restore_position(self, value: int | None) -> None:
+        self._cleanup_state.pending_restore_position = value
+
+    def start(self) -> None:
+        """Perform eager replay acquisition after an owner records this handle."""
+        self._ensure_open()
+        if self._started:
+            return
+        try:
+            if self._stream is not None and not self._stream_is_seekable:
+                self._ensure_spool()
+            self._started = True
+        except BaseException as error:
+            _run_source_cleanups(
+                [("source start rollback", self._close_spool)],
+                primary_error=error,
+                primary_traceback=_exception_traceback(error),
+            )
+            raise
 
     @classmethod
     def coerce(
@@ -328,17 +513,32 @@ class SourceHandle:
         """Release handle-owned replay storage; never close caller streams."""
         if self._closed:
             return
+        cleanups: list[tuple[str, Callable[[], object]]] = []
+        if self._pending_restore_position is not None:
+            cleanups.append(("caller cursor restoration", self._retry_pending_cursor_restoration))
         if self._spool is not None:
-            self._spool.close()
-            self._spool = None
+            cleanups.append(("temporary spool cleanup", self._close_spool))
+        if cleanups:
+            from messy_xlsx.parsing.streams import _run_cleanups
+
+            _run_cleanups(cleanups)
+        if self._pending_restore_position is not None or self._spool is not None:
+            return
         self._closed = True
         self._backend_requires_copy = None
+        self._cleanup_finalizer.detach()
 
     def _ensure_spool(self) -> ReplaySpool:
         if self._spool is not None:
             return self._spool
         try:
-            spool = ReplaySpool.from_stream(self._require_stream())
+            adopter = _SourceSpoolAdopter(self)
+            spool = ReplaySpool.from_stream(
+                self._require_stream(),
+                _adopter=adopter,
+            )
+            self._adopt_spool(spool)
+            return spool
         except _SpoolStorageError as error:
             source_error = FileError(
                 f"Cannot spool source: {error}",
@@ -349,21 +549,50 @@ class SourceHandle:
                 source_error,
                 _FallbackBlockReason.SOURCE_OWNERSHIP,
             ) from error
+        except BaseException as error:
+            owned_spool = self._spool
+            if owned_spool is None:
+                raise
+            _run_source_cleanups(
+                [("temporary spool cleanup", self._close_spool)],
+                primary_error=error,
+                primary_traceback=_exception_traceback(error),
+            )
+            raise
+
+    def _adopt_spool(self, spool: ReplaySpool) -> None:
+        """Record a completed spool before its constructor restores or returns."""
+        current = self._spool
+        if current is not None and current is not spool:
+            raise RuntimeError("SourceHandle already owns a different replay spool")
         self._spool = spool
-        return spool
+
+    def _close_spool(self) -> None:
+        spool = self._spool
+        if spool is None:
+            return
+        try:
+            spool.close()
+        except BaseException:
+            raise
+        self._spool = None
 
     @contextmanager
     def _borrow(self) -> Iterator[None]:
         self._ensure_open()
+        self._retry_pending_cursor_restoration()
         if self._active_borrow:
             error = RuntimeError("SourceHandle already has an active borrow")
             raise _mark_fallback_blocked(
                 error,
                 _FallbackBlockReason.SOURCE_OWNERSHIP,
             )
-        self._active_borrow = True
         try:
-            yield
+            try:
+                self._active_borrow = True
+                yield
+            finally:
+                self._active_borrow = False
         finally:
             self._active_borrow = False
 
@@ -402,35 +631,90 @@ class SourceHandle:
             consumer_error = error
             raise
         finally:
-            try:
-                caller_stream.seek(entry_position)
-            except BaseException as restore_error:
-                if consumer_error is None:
-                    _mark_fallback_blocked(
-                        restore_error,
-                        _FallbackBlockReason.SOURCE_OWNERSHIP,
-                    )
-                    raise
-                if _cleanup_takes_precedence(restore_error, consumer_error):
-                    _mark_fallback_blocked(
-                        restore_error,
-                        _FallbackBlockReason.SOURCE_OWNERSHIP,
-                    )
-                    _attach_operation_failure(restore_error, consumer_error)
-                    _safe_add_note(
-                        restore_error,
-                        f"source operation also failed: {_type_name(consumer_error)}",
-                    )
-                    raise
+            self._restore_caller_cursor(
+                caller_stream,
+                entry_position,
+                consumer_error,
+            )
+
+    def _restore_caller_cursor(
+        self,
+        caller_stream: BinaryIO,
+        entry_position: int,
+        consumer_error: BaseException | None,
+    ) -> None:
+        self._pending_restore_position = entry_position
+        try:
+            caller_stream.seek(entry_position)
+        except BaseException as restore_error:
+            if consumer_error is None:
                 _mark_fallback_blocked(
-                    consumer_error,
+                    restore_error,
                     _FallbackBlockReason.SOURCE_OWNERSHIP,
                 )
-                _attach_cleanup_failure(consumer_error, restore_error)
-                _safe_add_note(
-                    consumer_error,
-                    f"cursor restoration also failed: {_type_name(restore_error)}",
+                raise
+            if _cleanup_takes_precedence(restore_error, consumer_error):
+                _mark_fallback_blocked(
+                    restore_error,
+                    _FallbackBlockReason.SOURCE_OWNERSHIP,
                 )
+                _attach_operation_failure(restore_error, consumer_error)
+                _safe_add_note(
+                    restore_error,
+                    f"source operation also failed: {_type_name(consumer_error)}",
+                )
+                raise
+            _mark_fallback_blocked(
+                consumer_error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
+            _attach_cleanup_failure(consumer_error, restore_error)
+            _safe_add_note(
+                consumer_error,
+                f"cursor restoration also failed: {_type_name(restore_error)}",
+            )
+        else:
+            self._pending_restore_position = None
+
+    def _register_pending_cursor_restoration(
+        self,
+        caller_stream: BinaryIO,
+        position: int,
+    ) -> None:
+        """Own an exact caller cursor restoration before the stream is moved."""
+        if caller_stream is not self._require_stream():
+            raise RuntimeError("Cursor restoration belongs to a different source")
+        pending = self._pending_restore_position
+        if pending is not None and pending != position:
+            raise RuntimeError("SourceHandle already owns a different cursor restoration")
+        self._pending_restore_position = position
+
+    def _confirm_pending_cursor_restoration(
+        self,
+        caller_stream: BinaryIO,
+        position: int,
+    ) -> None:
+        """Clear one exact cursor obligation only after restoration succeeds."""
+        if caller_stream is not self._require_stream():
+            raise RuntimeError("Cursor restoration belongs to a different source")
+        if self._pending_restore_position == position:
+            self._pending_restore_position = None
+
+    def _retry_pending_cursor_restoration(self) -> None:
+        """Retry one interrupted caller cursor restoration."""
+        position = self._pending_restore_position
+        if position is None:
+            return
+        stream = self._require_stream()
+        try:
+            stream.seek(position)
+        except BaseException as restore_error:
+            _mark_fallback_blocked(
+                restore_error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
+            raise
+        self._pending_restore_position = None
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -492,4 +776,4 @@ def _cleanup_takes_precedence(
     primary_error: BaseException,
 ) -> bool:
     """Return whether source teardown must replace an operation failure."""
-    return _contains_process_failure(error, exclude=primary_error)
+    return bool(_contains_process_failure(error, exclude=primary_error))

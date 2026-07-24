@@ -8,6 +8,8 @@ import re
 
 import pandas as pd
 
+from messy_xlsx.normalization.plan import _safe_name_text
+
 # ============================================================================
 # Config
 # ============================================================================
@@ -102,6 +104,11 @@ _COMMON_DATE_FORMATS = [
 ]
 
 
+def _safe_column_name_text(value: object) -> str:
+    """Project nested inert labels without routing through virtual text hooks."""
+    return _safe_name_text(value)
+
+
 # ============================================================================
 # Core
 # ============================================================================
@@ -121,7 +128,7 @@ class DateNormalizer:
 
         for idx, col in enumerate(df.columns):
             series = df.iloc[:, idx]
-            col_name = str(col)
+            col_name = _safe_column_name_text(col)
             # Skip if semantic hint says not a date
             if col in semantic_hints:
                 hint = semantic_hints[col].upper()

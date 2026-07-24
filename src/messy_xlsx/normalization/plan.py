@@ -10,6 +10,7 @@ from decimal import Decimal
 from enum import StrEnum
 from itertools import pairwise
 from typing import Final, cast
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pyarrow as pa
@@ -27,6 +28,18 @@ from messy_xlsx.normalization.type_inference import SemanticTypeInference
 from messy_xlsx.parsing.contracts import OutputMode
 from messy_xlsx.parsing.coordinates import ColumnIdentity
 from messy_xlsx.parsing.parse_plan import ParsePlan
+from messy_xlsx.parsing.physical_values import (
+    PandasTemporalPayload,
+    UnsupportedPhysicalValueError,
+    arrow_temporal_array,
+    civil_from_proleptic_days,
+    convert_temporal_raw,
+    pandas_temporal_payload,
+    pandas_timestamp_label_text,
+)
+from messy_xlsx.parsing.physical_values import (
+    proleptic_days_from_civil as _proleptic_days_from_civil,
+)
 from messy_xlsx.utils import sanitize_column_name
 
 MAX_SAMPLE_VALUES: Final = 1_000
@@ -34,6 +47,8 @@ MAX_SAMPLE_CELLS: Final = 1_000_000
 MAX_SAMPLE_BYTES: Final = 8 * 1024 * 1024
 _MAX_LABEL_DEPTH: Final = 32
 _MAX_LABEL_NODES: Final = 1_024
+_MICROSECONDS_PER_DAY: Final = 86_400_000_000
+_NANOSECONDS_PER_MICROSECOND: Final = 1_000
 _INT64_MIN: Final = -(1 << 63)
 _INT64_MAX: Final = (1 << 63) - 1
 _UINT64_MAX: Final = (1 << 64) - 1
@@ -90,6 +105,178 @@ class _LabelToken:
 
     kind: str
     value: object
+    non_reflexive_identity: int | None = field(
+        default=None,
+        compare=False,
+        hash=False,
+        repr=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _DatetimeLabelProjection:
+    """Hook-free fields needed to reproduce characterized temporal equality."""
+
+    family: str
+    local_nanoseconds: int | None
+    utc_nanoseconds: int | None
+    fold: int
+    fold_sensitive: bool
+    timezone_identity: int | None = field(compare=False, hash=False, repr=False)
+    timezone_descriptor: object
+    trusted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _TimeLabelProjection:
+    """Hook-free fields for exact ``datetime.time`` label matching."""
+
+    local_microseconds: int
+    utc_microseconds: int | None
+    aware: bool
+    fold: int
+    timezone_identity: int | None = field(compare=False, hash=False, repr=False)
+    timezone_descriptor: object
+    trusted: bool
+
+
+@dataclass(slots=True)
+class _TokenizedMapping:
+    """Resolve Python aliases without changing typed structural plan identity."""
+
+    items: tuple[tuple[_LabelToken, object], ...]
+    index: _LabelResolutionIndex
+
+    def validate_targets(self, targets: tuple[_LabelToken, ...]) -> None:
+        target_index = _LabelResolutionIndex(targets)
+        for candidate, _value in self.items:
+            matches = tuple(token for _ordinal, token in target_index.matching(candidate))
+            _reject_ambiguous_temporal_resolution(candidate, matches)
+
+    def get(self, target: _LabelToken, default: object = None) -> object:
+        matches = self.index.matching(target)
+        if not matches:
+            return default
+        resolved = tuple(self.items[ordinal] for ordinal, _candidate in matches)
+        distinct_candidates = {candidate for candidate, _value in resolved}
+        if len(distinct_candidates) > 1:
+            raise ValueError("ambiguous temporal label configuration")
+        return resolved[0][1]
+
+
+@dataclass(slots=True)
+class _LabelResolutionIndex:
+    """Near-linear candidate index for safe Python/pandas label membership."""
+
+    tokens: tuple[_LabelToken, ...]
+    _shapes: dict[object, set[int]] = field(init=False, repr=False)
+    _postings: dict[object, set[int]] = field(init=False, repr=False)
+    _cache: dict[object, tuple[int, ...]] = field(
+        init=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        self._shapes = {}
+        self._postings = {}
+        self._cache = {}
+        for ordinal, token in enumerate(self.tokens):
+            self._shapes.setdefault(_label_resolution_shape(token), set()).add(ordinal)
+            for path, leaf in _flatten_label_token(token):
+                for key in _label_leaf_index_keys(leaf, condition_nan=True):
+                    self._postings.setdefault((path, key), set()).add(ordinal)
+
+    def candidate_ordinals(
+        self,
+        query: _LabelToken,
+        *,
+        condition_nan: bool = False,
+    ) -> tuple[int, ...]:
+        shape = _label_resolution_shape(query)
+        flattened = _flatten_label_token(query)
+        cache_key = (
+            shape,
+            tuple(
+                (
+                    path,
+                    _label_leaf_index_keys(
+                        leaf,
+                        condition_nan=condition_nan,
+                    ),
+                )
+                for path, leaf in flattened
+            ),
+            condition_nan,
+        )
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        shape_candidates = self._shapes.get(shape)
+        if not shape_candidates:
+            self._cache[cache_key] = ()
+            return ()
+        posting_restrictions: list[tuple[set[int], ...]] = []
+        posting_weights: list[int] = []
+        for path, leaf in flattened:
+            postings = tuple(
+                posting
+                for key in _label_leaf_index_keys(
+                    leaf,
+                    condition_nan=condition_nan,
+                )
+                if (posting := self._postings.get((path, key))) is not None
+            )
+            if not postings:
+                self._cache[cache_key] = ()
+                return ()
+            posting_restrictions.append(postings)
+            posting_weights.append(sum(len(posting) for posting in postings))
+        seed_ordinal = (
+            min(range(len(posting_restrictions)), key=posting_weights.__getitem__)
+            if posting_restrictions
+            else None
+        )
+        if seed_ordinal is not None and posting_weights[seed_ordinal] <= len(shape_candidates):
+            candidates: set[int] = set()
+            for posting in posting_restrictions[seed_ordinal]:
+                candidates.update(posting)
+        else:
+            candidates = set(shape_candidates)
+        validation_restrictions = tuple(
+            restriction
+            for _weight, restriction in sorted(
+                zip(posting_weights, posting_restrictions, strict=True),
+                key=lambda item: item[0],
+            )
+        )
+        candidates = {
+            ordinal
+            for ordinal in candidates
+            if ordinal in shape_candidates
+            and all(
+                any(ordinal in posting for posting in restriction)
+                for restriction in validation_restrictions
+            )
+        }
+        resolved = tuple(sorted(candidates))
+        self._cache[cache_key] = resolved
+        return resolved
+
+    def matching(
+        self,
+        query: _LabelToken,
+        *,
+        condition_nan: bool = False,
+    ) -> tuple[tuple[int, _LabelToken], ...]:
+        matcher = _condition_label_tokens_match if condition_nan else _label_tokens_match
+        return tuple(
+            (ordinal, self.tokens[ordinal])
+            for ordinal in self.candidate_ordinals(
+                query,
+                condition_nan=condition_nan,
+            )
+            if matcher(query, self.tokens[ordinal])
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +469,7 @@ def compile_normalization_plan(
     )
     _reject_ambiguous_opaque_tuple_tokens(final_label_tokens)
     hints = _tokenize_mapping(plan.thaw_type_hint_items())
+    hints.validate_targets(source_label_tokens)
     enabled_stages = tuple(
         stage
         for stage in ("whitespace", "numbers", "dates", "missing", "type_coercion")
@@ -305,6 +493,7 @@ def compile_normalization_plan(
         )
     )
     rules: list[ColumnNormalization] = []
+    input_fields: list[pa.Field] = []
     fields: list[pa.Field] = []
     for ordinal, (schema_field, values, source_name, source_name_text, final_name) in enumerate(
         zip(
@@ -318,6 +507,9 @@ def compile_normalization_plan(
     ):
         hint_value = hints.get(source_label_tokens[ordinal])
         explicit_hint = _validated_hint(hint_value)
+        input_type = schema_field.type
+        if plan.normalize and explicit_hint is not None and pa.types.is_null(input_type):
+            input_type = pa.string()
         decision = _compile_column_decision(
             schema_field.type,
             values,
@@ -330,11 +522,18 @@ def compile_normalization_plan(
             thousands_separator=thousands_separator,
             detect_mixed_locale=detect_mixed_locale,
         )
+        input_fields.append(
+            pa.field(
+                str(ordinal),
+                input_type,
+                nullable=schema_field.nullable,
+            )
+        )
         fields.append(pa.field(str(ordinal), decision.output_type))
         rules.append(
             ColumnNormalization(
                 ordinal=ordinal,
-                input_type=schema_field.type,
+                input_type=input_type,
                 output_type=decision.output_type,
                 source_display_name=source_name,
                 final_display_name=final_name,
@@ -358,7 +557,7 @@ def compile_normalization_plan(
         re.compile(plan.drop_regex) if plan.normalize and plan.drop_regex is not None else None
     )
     return NormalizationPlan(
-        input_schema=sample.schema,
+        input_schema=pa.schema(input_fields),
         schema=sample.schema if not plan.normalize else pa.schema(fields),
         source_display_names=source_names,
         final_display_names=final_names,
@@ -402,6 +601,7 @@ def _compile_final_names(
         if plan.sanitize_column_names
         else source_label_tokens
     )
+    renames.validate_targets(name_tokens)
     renamed = tuple(
         renames.get(token, name) for name, token in zip(names, name_tokens, strict=True)
     )
@@ -417,18 +617,29 @@ def _compile_conditions(
     plan: ParsePlan,
 ) -> tuple[RowCondition, ...]:
     conditions: list[RowCondition] = []
-    ordinals_by_token: dict[_LabelToken, list[int]] = {}
-    for ordinal, token in enumerate(final_label_tokens):
-        ordinals_by_token.setdefault(token, []).append(ordinal)
+    label_index = _LabelResolutionIndex(final_label_tokens)
     for raw_label, raw_value in plan.thaw_drop_conditions():
         value = _snapshot_condition_value(raw_value)
         label_token = _display_label_token(raw_label)
         _reject_opaque_tuple_configuration_token(label_token)
-        ordinals = () if raw_label is None else tuple(ordinals_by_token.get(label_token, ()))
+        matched_ordinals, matching_tokens = _resolve_condition_label(
+            label_token,
+            final_label_tokens,
+            label_index,
+        )
+        _reject_ambiguous_temporal_resolution(label_token, matching_tokens)
+        ordinals = () if raw_label is None else matched_ordinals
         if not ordinals:
             mode = ConditionMode.IGNORE
         elif len(ordinals) == 1:
             mode = ConditionMode.DROP_ROWS
+        elif (
+            len(ordinals) == len(final_label_tokens)
+            and label_token.kind == "tuple"
+            and _token_contains_float_nan(label_token)
+        ):
+            mode = ConditionMode.IGNORE
+            ordinals = ()
         elif len(ordinals) == len(final_label_tokens):
             mode = ConditionMode.MASK_ALL_DUPLICATES
         else:
@@ -438,6 +649,48 @@ def _compile_conditions(
         )
         conditions.append(RowCondition(mode=mode, ordinals=ordinals, operands=operands))
     return tuple(conditions)
+
+
+def _resolve_condition_label(
+    label_token: _LabelToken,
+    final_label_tokens: tuple[_LabelToken, ...],
+    label_index: _LabelResolutionIndex,
+) -> tuple[tuple[int, ...], tuple[_LabelToken, ...]]:
+    """Resolve one condition column with operation-specific NaN membership."""
+    if label_token.kind == "tuple" and _token_contains_float_nan(label_token):
+        return _resolve_float_nan_tuple_condition(
+            label_token,
+            final_label_tokens,
+            label_index,
+        )
+    matches = label_index.matching(
+        label_token,
+        condition_nan=_token_contains_float_nan(label_token),
+    )
+    return (
+        tuple(ordinal for ordinal, _token in matches),
+        tuple(token for _ordinal, token in matches),
+    )
+
+
+def _resolve_float_nan_tuple_condition(
+    label_token: _LabelToken,
+    final_label_tokens: tuple[_LabelToken, ...],
+    label_index: _LabelResolutionIndex,
+) -> tuple[tuple[int, ...], tuple[_LabelToken, ...]]:
+    """Prefer exact nested-NaN identity, then allow one pandas-equivalent label."""
+    exact_matches = label_index.matching(label_token)
+    exact_ordinals = tuple(ordinal for ordinal, _token in exact_matches)
+    if exact_ordinals:
+        return (
+            exact_ordinals,
+            tuple(final_label_tokens[ordinal] for ordinal in exact_ordinals),
+        )
+    canonical_matches = label_index.matching(label_token, condition_nan=True)
+    if len(canonical_matches) != 1:
+        return (), ()
+    ordinal, token = canonical_matches[0]
+    return (ordinal,), (token,)
 
 
 def _compile_condition_operand(
@@ -453,6 +706,21 @@ def _compile_condition_operand(
         return None
     if not _condition_value_matches_type(value, logical_type):
         return None
+    try:
+        temporal = pandas_temporal_payload(value)
+    except UnsupportedPhysicalValueError:
+        temporal = None
+    if temporal is not None and (
+        pa.types.is_timestamp(logical_type) or pa.types.is_duration(logical_type)
+    ):
+        try:
+            return arrow_temporal_array(
+                [temporal],
+                logical_type,
+                require_timezone_match=False,
+            )[0]
+        except (OverflowError, TypeError, ValueError):
+            return None
     scalar_value = _coerce_condition_value(value, logical_type)
     try:
         return pa.scalar(scalar_value, type=logical_type)
@@ -506,10 +774,78 @@ def _condition_value_matches_type(  # noqa: C901
     if pa.types.is_date(output_type):
         return value_type is date
     if pa.types.is_timestamp(output_type):
-        return value_type is datetime
+        if value_type is not datetime and value_type is not pd.Timestamp:
+            return False
+        temporal = pandas_temporal_payload(value)
+        timezone_value = (
+            temporal.timezone if temporal is not None else cast("datetime", value).tzinfo
+        )
+        return (timezone_value is None) == (
+            output_type.tz is None
+        ) and _temporal_condition_fits_unit(value, output_type.unit)
     if pa.types.is_time(output_type):
-        return value_type is time
+        if value_type is not time:
+            return False
+        projection = _time_label_projection(cast("time", value))
+        return (
+            projection.trusted
+            and not projection.aware
+            and _temporal_condition_fits_unit(value, output_type.unit)
+        )
+    if pa.types.is_duration(output_type):
+        return (
+            value_type is timedelta or value_type is pd.Timedelta
+        ) and _temporal_condition_fits_unit(value, output_type.unit)
     return False
+
+
+def _temporal_condition_fits_unit(value: object, unit: str) -> bool:
+    """Reject Arrow temporal scalar coercions that would silently truncate."""
+    nanoseconds_per_unit = {
+        "s": 1_000_000_000,
+        "ms": 1_000_000,
+        "us": 1_000,
+        "ns": 1,
+    }[unit]
+    value_type = type(value)
+    try:
+        temporal = pandas_temporal_payload(value)
+    except UnsupportedPhysicalValueError:
+        temporal = None
+    if temporal is not None:
+        return convert_temporal_raw(temporal.raw, temporal.unit, unit) is not None
+    if value_type is pd.Timedelta:
+        nanoseconds: int = int(cast("pd.Timedelta", value).value)
+    elif value_type is timedelta:
+        duration = cast("timedelta", value)
+        nanoseconds = (
+            duration.days * _MICROSECONDS_PER_DAY
+            + duration.seconds * 1_000_000
+            + duration.microseconds
+        ) * _NANOSECONDS_PER_MICROSECOND
+    elif value_type is time:
+        time_value = cast("time", value)
+        nanoseconds = (
+            ((time_value.hour * 60 + time_value.minute) * 60 + time_value.second) * 1_000_000
+            + time_value.microsecond
+        ) * _NANOSECONDS_PER_MICROSECOND
+    else:
+        family = "pandas" if value_type is pd.Timestamp else "stdlib"
+        projection = _datetime_label_projection(
+            cast("datetime | pd.Timestamp", value),
+            family=family,
+        )
+        if not projection.trusted:
+            return False
+        projected_nanoseconds = (
+            projection.local_nanoseconds
+            if projection.timezone_identity is None
+            else projection.utc_nanoseconds
+        )
+        if projected_nanoseconds is None:
+            return False
+        nanoseconds = projected_nanoseconds
+    return nanoseconds % nanoseconds_per_unit == 0
 
 
 def _coerce_condition_value(value: object, output_type: pa.DataType) -> object:
@@ -1041,14 +1377,34 @@ def _date_format(strings: tuple[str, ...], name_suggests_date: bool) -> str | No
     return "mixed" if int(parsed.notna().sum()) == len(strings) else None
 
 
-def _tokenize_mapping(items: list[tuple[object, object]]) -> dict[_LabelToken, object]:
-    """Index label-keyed configuration once while preserving its first match."""
-    tokenized: dict[_LabelToken, object] = {}
+def _tokenize_mapping(items: list[tuple[object, object]]) -> _TokenizedMapping:
+    """Project label-keyed configuration for safe pairwise temporal matching."""
+    tokenized: list[tuple[_LabelToken, object]] = []
     for candidate, value in items:
         candidate_token = _display_label_token(candidate)
         _reject_opaque_tuple_configuration_token(candidate_token)
-        tokenized.setdefault(candidate_token, value)
-    return tokenized
+        tokenized.append((candidate_token, value))
+    frozen_items = tuple(tokenized)
+    return _TokenizedMapping(
+        frozen_items,
+        _LabelResolutionIndex(tuple(token for token, _value in frozen_items)),
+    )
+
+
+def _token_requires_pairwise(token: _LabelToken) -> bool:
+    if token.kind in {
+        "datetime",
+        "time",
+        "float_nan",
+        "decimal_nan",
+        "complex_nan",
+    }:
+        return True
+    if token.kind != "tuple":
+        return False
+    return any(
+        _token_requires_pairwise(member) for member in cast("tuple[_LabelToken, ...]", token.value)
+    )
 
 
 def _reject_ambiguous_opaque_tuple_tokens(
@@ -1084,19 +1440,13 @@ def _tuple_token_contains_opaque_member(token: _LabelToken) -> bool:
 
 
 def _temporal_token_has_unsafe_timezone(token: _LabelToken) -> bool:
-    if token.kind not in {"datetime", "time"}:
-        return False
-    temporal_parts = cast("tuple[object, ...]", token.value)
-    timezone_token = cast("tuple[object, ...]", temporal_parts[-1])
-    if timezone_token[:1] == ("untrusted_timezone",):
-        return True
-    if timezone_token[:1] != ("timezone",):
-        return False
-    offset_token = timezone_token[1]
-    name_token = timezone_token[2]
-    return (type(offset_token) is tuple and offset_token[:1] == ("unsafe_offset",)) or (
-        type(name_token) is tuple and name_token[:1] == ("unsafe_name",)
-    )
+    if token.kind == "datetime":
+        datetime_projection = cast("_DatetimeLabelProjection", token.value)
+        return not datetime_projection.trusted
+    if token.kind == "time":
+        time_projection = cast("_TimeLabelProjection", token.value)
+        return time_projection.aware and not time_projection.trusted
+    return False
 
 
 def _snapshot_display_name(
@@ -1108,15 +1458,27 @@ def _snapshot_display_name(
     budget = _consume_label_budget(_depth, _budget)
     value_type = type(value)
     if (
-        value is None
+        value is pd.NaT
+        or value is None
         or value_type is str
         or value_type is int
         or value_type is float
+        or value_type is complex
         or value_type is bool
         or value_type is bytes
+        or value_type is Decimal
         or value_type is date
+        or value_type is timedelta
     ):
         return value
+    if value_type is pd.Timedelta:
+        return value
+    if value_type is pd.Timestamp:
+        timestamp = cast("pd.Timestamp", value)
+        if _timezone_label_projection(timestamp.tzinfo)[1]:
+            return value
+        module, qualname = _safe_type_description(value_type)
+        return f"<{module}.{qualname}>"
     if value_type is tuple:
         tuple_value = cast("tuple[object, ...]", value)
         return tuple(
@@ -1136,7 +1498,8 @@ def _snapshot_display_name(
 def _snapshot_condition_value(value: object) -> object:
     value_type = type(value)
     if (
-        value is None
+        value is pd.NaT
+        or value is None
         or value_type is str
         or value_type is int
         or value_type is float
@@ -1146,6 +1509,9 @@ def _snapshot_condition_value(value: object) -> object:
         or value_type is date
         or value_type is datetime
         or value_type is time
+        or value_type is timedelta
+        or value_type is pd.Timestamp
+        or value_type is pd.Timedelta
     ):
         return value
     module, qualname = _safe_type_description(value_type)
@@ -1155,15 +1521,21 @@ def _snapshot_condition_value(value: object) -> object:
 def _is_sanitizable_display_name(value: object) -> bool:
     value_type = type(value)
     if (
-        value is None
+        value is pd.NaT
+        or value is None
         or value_type is str
         or value_type is int
         or value_type is float
+        or value_type is complex
         or value_type is bool
         or value_type is bytes
         or value_type is date
+        or value_type is timedelta
+        or value_type is pd.Timedelta
     ):
         return True
+    if value_type is pd.Timestamp:
+        return _timezone_label_projection(cast("pd.Timestamp", value).tzinfo)[1]
     if value_type is datetime or value_type is time:
         temporal = cast("datetime | time", value)
         return _timezone_label_projection(temporal.tzinfo)[1]
@@ -1181,6 +1553,28 @@ def _display_label_token(  # noqa: C901
     value_type = type(value)
     if value is None:
         return _LabelToken("none", None)
+    if value is pd.NaT:
+        return _LabelToken("nat", None)
+    try:
+        temporal = pandas_temporal_payload(value)
+    except UnsupportedPhysicalValueError:
+        temporal = None
+    if temporal is not None:
+        if temporal.family == "duration":
+            return _LabelToken(
+                "timedelta",
+                temporal.raw
+                * {
+                    "s": 1_000_000_000,
+                    "ms": 1_000_000,
+                    "us": 1_000,
+                    "ns": 1,
+                }[temporal.unit],
+            )
+        return _LabelToken(
+            "datetime",
+            _pandas_datetime_label_projection(temporal),
+        )
     if value_type is str:
         return _LabelToken("str", value)
     if value_type is bytes:
@@ -1192,8 +1586,36 @@ def _display_label_token(  # noqa: C901
     if value_type is float:
         float_value = cast("float", value)
         if math.isnan(float_value):
-            return _LabelToken("float", "nan")
+            return _LabelToken("float_nan", float_value.hex(), id(float_value))
         return _LabelToken("float", float_value.hex())
+    if value_type is complex:
+        complex_value = cast("complex", value)
+        real = complex_value.real
+        imaginary = complex_value.imag
+        components = (real.hex(), imaginary.hex())
+        if math.isnan(real) or math.isnan(imaginary):
+            return _LabelToken("complex_nan", components, id(complex_value))
+        return _LabelToken("complex", components)
+    if value_type is Decimal:
+        decimal_value = cast("Decimal", value)
+        if Decimal.is_nan(decimal_value):
+            return _LabelToken(
+                "decimal_nan",
+                Decimal.__str__(decimal_value),
+                id(decimal_value),
+            )
+        return _LabelToken("decimal", decimal_value)
+    if value_type is timedelta:
+        duration = cast("timedelta", value)
+        return _LabelToken(
+            "timedelta",
+            (
+                duration.days * _MICROSECONDS_PER_DAY
+                + duration.seconds * 1_000_000
+                + duration.microseconds
+            )
+            * _NANOSECONDS_PER_MICROSECOND,
+        )
     if value_type is tuple:
         tuple_value = cast("tuple[object, ...]", value)
         return _LabelToken(
@@ -1204,36 +1626,25 @@ def _display_label_token(  # noqa: C901
             ),
         )
     if value_type is datetime:
-        datetime_value = cast("datetime", value)
         return _LabelToken(
             "datetime",
-            (
-                datetime_value.year,
-                datetime_value.month,
-                datetime_value.day,
-                datetime_value.hour,
-                datetime_value.minute,
-                datetime_value.second,
-                datetime_value.microsecond,
-                datetime_value.fold,
-                _timezone_label_token(datetime_value.tzinfo),
+            _datetime_label_projection(cast("datetime", value), family="stdlib"),
+        )
+    if value_type is pd.Timestamp:
+        return _LabelToken(
+            "datetime",
+            _datetime_label_projection(
+                cast("pd.Timestamp", value),
+                family="pandas",
             ),
         )
     if value_type is date:
         date_value = cast("date", value)
         return _LabelToken("date", (date_value.year, date_value.month, date_value.day))
     if value_type is time:
-        time_value = cast("time", value)
         return _LabelToken(
             "time",
-            (
-                time_value.hour,
-                time_value.minute,
-                time_value.second,
-                time_value.microsecond,
-                time_value.fold,
-                _timezone_label_token(time_value.tzinfo),
-            ),
+            _time_label_projection(cast("time", value)),
         )
     module, qualname = _safe_type_description(value_type)
     return _LabelToken("unsupported", (module, qualname))
@@ -1241,6 +1652,510 @@ def _display_label_token(  # noqa: C901
 
 def _timezone_label_token(value: object) -> object:
     return _timezone_label_projection(value)[0]
+
+
+def _datetime_label_projection(
+    value: datetime | pd.Timestamp,
+    *,
+    family: str,
+) -> _DatetimeLabelProjection:
+    if family == "pandas":
+        try:
+            payload = pandas_temporal_payload(value)
+        except UnsupportedPhysicalValueError:
+            payload = None
+        if payload is not None and payload.family == "timestamp":
+            return _pandas_datetime_label_projection(payload)
+        timestamp = cast("pd.Timestamp", value)
+        timezone_value = datetime.tzinfo.__get__(timestamp, datetime)
+        timezone_descriptor, trusted = _timezone_label_projection(timezone_value)
+        return _DatetimeLabelProjection(
+            family="pandas",
+            local_nanoseconds=_local_datetime_nanoseconds(
+                timestamp,
+                nanosecond=timestamp.nanosecond,
+            ),
+            utc_nanoseconds=None,
+            fold=timestamp.fold,
+            fold_sensitive=timezone_value is not None,
+            timezone_identity=(id(timezone_value) if timezone_value is not None else None),
+            timezone_descriptor=timezone_descriptor,
+            trusted=trusted and timezone_value is None,
+        )
+    nanosecond = 0
+    local_nanoseconds = _local_datetime_nanoseconds(value, nanosecond=nanosecond)
+    timezone_value = value.tzinfo
+    timezone_descriptor, trusted = _timezone_label_projection(timezone_value)
+    if timezone_value is None:
+        return _DatetimeLabelProjection(
+            family=family,
+            local_nanoseconds=local_nanoseconds,
+            utc_nanoseconds=None,
+            fold=value.fold,
+            fold_sensitive=False,
+            timezone_identity=None,
+            timezone_descriptor=timezone_descriptor,
+            trusted=True,
+        )
+    if not trusted:
+        return _DatetimeLabelProjection(
+            family=family,
+            local_nanoseconds=local_nanoseconds,
+            utc_nanoseconds=None,
+            fold=value.fold,
+            fold_sensitive=True,
+            timezone_identity=id(timezone_value),
+            timezone_descriptor=timezone_descriptor,
+            trusted=False,
+        )
+    if type(timezone_value) is timezone:
+        offset_nanoseconds = _fixed_timezone_offset_microseconds(timezone_descriptor) * 1_000
+        return _DatetimeLabelProjection(
+            family=family,
+            local_nanoseconds=local_nanoseconds,
+            utc_nanoseconds=local_nanoseconds - offset_nanoseconds,
+            fold=value.fold,
+            fold_sensitive=False,
+            timezone_identity=id(timezone_value),
+            timezone_descriptor=timezone_descriptor,
+            trusted=True,
+        )
+    zone = cast("ZoneInfo", timezone_value)
+    offset_zero = _zoneinfo_offset_microseconds(value, zone, fold=0)
+    offset_one = _zoneinfo_offset_microseconds(value, zone, fold=1)
+    actual_offset = offset_one if value.fold else offset_zero
+    return _DatetimeLabelProjection(
+        family=family,
+        local_nanoseconds=local_nanoseconds,
+        utc_nanoseconds=local_nanoseconds - actual_offset * 1_000,
+        fold=value.fold,
+        fold_sensitive=offset_zero != offset_one,
+        timezone_identity=id(timezone_value),
+        timezone_descriptor=timezone_descriptor,
+        trusted=True,
+    )
+
+
+def _pandas_datetime_label_projection(
+    payload: PandasTemporalPayload,
+) -> _DatetimeLabelProjection:
+    factor = {
+        "s": 1_000_000_000,
+        "ms": 1_000_000,
+        "us": 1_000,
+        "ns": 1,
+    }[payload.unit]
+    raw_nanoseconds = payload.raw * factor
+    timezone_value = payload.timezone
+    timezone_descriptor, trusted = _timezone_label_projection(timezone_value)
+    if timezone_value is None:
+        return _DatetimeLabelProjection(
+            family="pandas",
+            local_nanoseconds=raw_nanoseconds,
+            utc_nanoseconds=None,
+            fold=payload.fold,
+            fold_sensitive=False,
+            timezone_identity=None,
+            timezone_descriptor=timezone_descriptor,
+            trusted=True,
+        )
+    if not trusted:
+        return _DatetimeLabelProjection(
+            family="pandas",
+            local_nanoseconds=None,
+            utc_nanoseconds=raw_nanoseconds,
+            fold=payload.fold,
+            fold_sensitive=True,
+            timezone_identity=id(timezone_value),
+            timezone_descriptor=timezone_descriptor,
+            trusted=False,
+        )
+    if type(timezone_value) is timezone:
+        offset_nanoseconds = _fixed_timezone_offset_microseconds(timezone_descriptor) * 1_000
+        return _DatetimeLabelProjection(
+            family="pandas",
+            local_nanoseconds=raw_nanoseconds + offset_nanoseconds,
+            utc_nanoseconds=raw_nanoseconds,
+            fold=payload.fold,
+            fold_sensitive=False,
+            timezone_identity=id(timezone_value),
+            timezone_descriptor=timezone_descriptor,
+            trusted=True,
+        )
+    local_nanoseconds = raw_nanoseconds + payload.utc_offset_nanoseconds
+    year, _month, _day = civil_from_proleptic_days(local_nanoseconds // 86_400_000_000_000)
+    if not 1 <= year <= 9_999:
+        return _DatetimeLabelProjection(
+            family="pandas",
+            local_nanoseconds=None,
+            utc_nanoseconds=raw_nanoseconds,
+            fold=payload.fold,
+            fold_sensitive=True,
+            timezone_identity=id(timezone_value),
+            timezone_descriptor=timezone_descriptor,
+            trusted=True,
+        )
+    timestamp = pd.Timestamp(
+        payload.raw,
+        unit=payload.unit,
+        tz=timezone_value,
+    )
+    zone = cast("ZoneInfo", timezone_value)
+    offset_zero = _zoneinfo_offset_microseconds(timestamp, zone, fold=0)
+    offset_one = _zoneinfo_offset_microseconds(timestamp, zone, fold=1)
+    return _DatetimeLabelProjection(
+        family="pandas",
+        local_nanoseconds=local_nanoseconds,
+        utc_nanoseconds=raw_nanoseconds,
+        fold=payload.fold,
+        fold_sensitive=offset_zero != offset_one,
+        timezone_identity=id(timezone_value),
+        timezone_descriptor=timezone_descriptor,
+        trusted=True,
+    )
+
+
+def _time_label_projection(value: time) -> _TimeLabelProjection:
+    local_microseconds = (
+        (value.hour * 60 + value.minute) * 60 + value.second
+    ) * 1_000_000 + value.microsecond
+    timezone_value = value.tzinfo
+    timezone_descriptor, safe = _timezone_label_projection(timezone_value)
+    if timezone_value is None:
+        return _TimeLabelProjection(
+            local_microseconds=local_microseconds,
+            utc_microseconds=None,
+            aware=False,
+            fold=value.fold,
+            timezone_identity=None,
+            timezone_descriptor=timezone_descriptor,
+            trusted=True,
+        )
+    if type(timezone_value) is timezone and safe:
+        offset_microseconds = _fixed_timezone_offset_microseconds(timezone_descriptor)
+        return _TimeLabelProjection(
+            local_microseconds=local_microseconds,
+            utc_microseconds=local_microseconds - offset_microseconds,
+            aware=True,
+            fold=value.fold,
+            timezone_identity=id(timezone_value),
+            timezone_descriptor=timezone_descriptor,
+            trusted=True,
+        )
+    if type(timezone_value) is ZoneInfo and safe:
+        zone = cast("ZoneInfo", timezone_value)
+        offset = ZoneInfo.utcoffset(zone, None)
+        if offset is None:
+            return _TimeLabelProjection(
+                local_microseconds=local_microseconds,
+                utc_microseconds=None,
+                aware=False,
+                fold=value.fold,
+                timezone_identity=None,
+                timezone_descriptor=timezone_descriptor,
+                trusted=True,
+            )
+        if type(offset) is timedelta:
+            offset_microseconds = (
+                offset.days * _MICROSECONDS_PER_DAY
+                + offset.seconds * 1_000_000
+                + offset.microseconds
+            )
+            return _TimeLabelProjection(
+                local_microseconds=local_microseconds,
+                utc_microseconds=local_microseconds - offset_microseconds,
+                aware=True,
+                fold=value.fold,
+                timezone_identity=id(timezone_value),
+                timezone_descriptor=timezone_descriptor,
+                trusted=True,
+            )
+    return _TimeLabelProjection(
+        local_microseconds=local_microseconds,
+        utc_microseconds=None,
+        aware=True,
+        fold=value.fold,
+        timezone_identity=id(timezone_value),
+        timezone_descriptor=timezone_descriptor,
+        trusted=False,
+    )
+
+
+def _local_datetime_nanoseconds(
+    value: datetime | pd.Timestamp,
+    *,
+    nanosecond: int,
+) -> int:
+    days = _proleptic_days_from_civil(value.year, value.month, value.day)
+    local_microseconds = (
+        days * _MICROSECONDS_PER_DAY
+        + ((value.hour * 60 + value.minute) * 60 + value.second) * 1_000_000
+        + value.microsecond
+    )
+    return local_microseconds * _NANOSECONDS_PER_MICROSECOND + nanosecond
+
+
+def _fixed_timezone_offset_microseconds(descriptor: object) -> int:
+    descriptor_tuple = cast("tuple[object, ...]", descriptor)
+    offset = cast("tuple[object, ...]", descriptor_tuple[1])
+    return (
+        cast("int", offset[1]) * _MICROSECONDS_PER_DAY
+        + cast("int", offset[2]) * 1_000_000
+        + cast("int", offset[3])
+    )
+
+
+def _zoneinfo_offset_microseconds(
+    value: datetime | pd.Timestamp,
+    zone: ZoneInfo,
+    *,
+    fold: int,
+) -> int:
+    probe = datetime(
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+        tzinfo=zone,
+        fold=fold,
+    )
+    offset = ZoneInfo.utcoffset(zone, probe)
+    if type(offset) is not timedelta:
+        raise ValueError("ZoneInfo label offset must be a timedelta")
+    return offset.days * _MICROSECONDS_PER_DAY + offset.seconds * 1_000_000 + offset.microseconds
+
+
+def _label_resolution_shape(token: _LabelToken) -> object:
+    """Describe tuple structure while allowing Python numeric aliases."""
+    if token.kind == "tuple":
+        return (
+            "tuple",
+            tuple(
+                _label_resolution_shape(member)
+                for member in cast("tuple[_LabelToken, ...]", token.value)
+            ),
+        )
+    if _numeric_label_value(token) is not None:
+        return ("number",)
+    if token.kind in {"float_nan", "decimal_nan"}:
+        return (token.kind,)
+    return (token.kind,)
+
+
+def _flatten_label_token(
+    token: _LabelToken,
+    path: tuple[int, ...] = (),
+) -> tuple[tuple[tuple[int, ...], _LabelToken], ...]:
+    if token.kind != "tuple":
+        return ((path, token),)
+    flattened: list[tuple[tuple[int, ...], _LabelToken]] = []
+    for ordinal, member in enumerate(cast("tuple[_LabelToken, ...]", token.value)):
+        flattened.extend(_flatten_label_token(member, (*path, ordinal)))
+    return tuple(flattened)
+
+
+def _numeric_label_value(token: _LabelToken) -> object | None:
+    """Recover an exact built-in numeric for Python hash/equality aliases."""
+    if token.kind in {"bool", "int", "decimal"}:
+        return token.value
+    if token.kind == "float":
+        return float.fromhex(cast("str", token.value))
+    if token.kind == "complex":
+        real, imaginary = cast("tuple[str, str]", token.value)
+        return complex(float.fromhex(real), float.fromhex(imaginary))
+    return None
+
+
+def _label_leaf_index_keys(  # noqa: C901
+    token: _LabelToken,
+    *,
+    condition_nan: bool,
+) -> tuple[object, ...]:
+    numeric = _numeric_label_value(token)
+    if numeric is not None:
+        return (("number", numeric),)
+    if token.kind in {"float_nan", "decimal_nan", "complex_nan"}:
+        keys: list[object] = [
+            (token.kind, token.non_reflexive_identity),
+        ]
+        if condition_nan and token.kind == "float_nan":
+            keys.append(("float_nan_any",))
+        return tuple(keys)
+    if token.kind == "datetime":
+        datetime_projection = cast("_DatetimeLabelProjection", token.value)
+        if datetime_projection.timezone_identity is None:
+            return (("datetime_naive", datetime_projection.local_nanoseconds),)
+        temporal_keys: list[object] = []
+        if datetime_projection.local_nanoseconds is not None:
+            temporal_keys.append(
+                (
+                    "datetime_zone_local",
+                    datetime_projection.timezone_identity,
+                    datetime_projection.local_nanoseconds,
+                )
+            )
+        if datetime_projection.family == "pandas":
+            temporal_keys.append(("datetime_pandas_utc", datetime_projection.utc_nanoseconds))
+        if datetime_projection.trusted and not datetime_projection.fold_sensitive:
+            temporal_keys.append(("datetime_nonfold_utc", datetime_projection.utc_nanoseconds))
+        return tuple(temporal_keys)
+    if token.kind == "time":
+        time_projection = cast("_TimeLabelProjection", token.value)
+        if not time_projection.aware:
+            return (("time_naive", time_projection.local_microseconds),)
+        return (("time_aware", time_projection.utc_microseconds),)
+    return (("exact", token.kind, token.value),)
+
+
+def _label_tokens_match(left: _LabelToken, right: _LabelToken) -> bool:
+    """Match exact inert tokens plus characterized temporal equality."""
+    left_numeric = _numeric_label_value(left)
+    right_numeric = _numeric_label_value(right)
+    if left_numeric is not None or right_numeric is not None:
+        return (
+            left_numeric is not None
+            and right_numeric is not None
+            and bool(left_numeric == right_numeric)
+        )
+    if left.kind != right.kind:
+        return False
+    if left.kind in {"float_nan", "decimal_nan", "complex_nan"}:
+        return (
+            left.non_reflexive_identity is not None
+            and left.non_reflexive_identity == right.non_reflexive_identity
+        )
+    if left.kind == "datetime":
+        return _datetime_label_projections_match(
+            cast("_DatetimeLabelProjection", left.value),
+            cast("_DatetimeLabelProjection", right.value),
+        )
+    if left.kind == "time":
+        return _time_label_projections_match(
+            cast("_TimeLabelProjection", left.value),
+            cast("_TimeLabelProjection", right.value),
+        )
+    if left.kind == "tuple":
+        left_members = cast("tuple[_LabelToken, ...]", left.value)
+        right_members = cast("tuple[_LabelToken, ...]", right.value)
+        return len(left_members) == len(right_members) and all(
+            _label_tokens_match(left_member, right_member)
+            for left_member, right_member in zip(
+                left_members,
+                right_members,
+                strict=True,
+            )
+        )
+    return left == right
+
+
+def _condition_token_requires_pairwise(token: _LabelToken) -> bool:
+    """Use pandas-index NaN equivalence only for drop-condition labels."""
+    return _token_requires_pairwise(token) or _token_contains_float_nan(token)
+
+
+def _token_contains_float_nan(token: _LabelToken) -> bool:
+    if token.kind == "float_nan":
+        return True
+    if token.kind != "tuple":
+        return False
+    return any(
+        _token_contains_float_nan(member) for member in cast("tuple[_LabelToken, ...]", token.value)
+    )
+
+
+def _condition_label_tokens_match(
+    left: _LabelToken,
+    right: _LabelToken,
+) -> bool:
+    """Reproduce pandas Index float-NaN membership without changing mappings."""
+    if left.kind == right.kind == "float_nan":
+        return True
+    left_numeric = _numeric_label_value(left)
+    right_numeric = _numeric_label_value(right)
+    if left_numeric is not None or right_numeric is not None:
+        return (
+            left_numeric is not None
+            and right_numeric is not None
+            and bool(left_numeric == right_numeric)
+        )
+    if left.kind != right.kind:
+        return False
+    if left.kind != "tuple":
+        return _label_tokens_match(left, right)
+    left_members = cast("tuple[_LabelToken, ...]", left.value)
+    right_members = cast("tuple[_LabelToken, ...]", right.value)
+    return len(left_members) == len(right_members) and all(
+        _condition_label_tokens_match(left_member, right_member)
+        for left_member, right_member in zip(
+            left_members,
+            right_members,
+            strict=True,
+        )
+    )
+
+
+def _datetime_label_projections_match(
+    left: _DatetimeLabelProjection,
+    right: _DatetimeLabelProjection,
+) -> bool:
+    left_aware = left.timezone_identity is not None
+    right_aware = right.timezone_identity is not None
+    if left_aware != right_aware:
+        return False
+    if not left_aware:
+        return left.local_nanoseconds == right.local_nanoseconds
+    if not left.trusted or not right.trusted:
+        return False
+    if left.family == "pandas" and right.family == "pandas":
+        return left.utc_nanoseconds == right.utc_nanoseconds
+    if left.timezone_identity == right.timezone_identity:
+        return (
+            left.local_nanoseconds is not None
+            and right.local_nanoseconds is not None
+            and left.local_nanoseconds == right.local_nanoseconds
+        )
+    if left.fold_sensitive or right.fold_sensitive:
+        return False
+    return left.utc_nanoseconds == right.utc_nanoseconds
+
+
+def _time_label_projections_match(
+    left: _TimeLabelProjection,
+    right: _TimeLabelProjection,
+) -> bool:
+    if left.aware != right.aware:
+        return False
+    if not left.aware:
+        return left.local_microseconds == right.local_microseconds
+    if not left.trusted or not right.trusted:
+        return False
+    return left.utc_microseconds == right.utc_microseconds
+
+
+def _reject_ambiguous_temporal_resolution(
+    candidate: _LabelToken,
+    matches: tuple[_LabelToken, ...],
+) -> None:
+    if len(set(matches)) < 2:
+        return
+    if _token_has_fold_sensitive_datetime(candidate) or any(
+        _token_has_fold_sensitive_datetime(match) for match in matches
+    ):
+        raise ValueError("ambiguous temporal label configuration")
+
+
+def _token_has_fold_sensitive_datetime(token: _LabelToken) -> bool:
+    if token.kind == "datetime":
+        return cast("_DatetimeLabelProjection", token.value).fold_sensitive
+    if token.kind != "tuple":
+        return False
+    return any(
+        _token_has_fold_sensitive_datetime(member)
+        for member in cast("tuple[_LabelToken, ...]", token.value)
+    )
 
 
 def _timezone_label_projection(value: object) -> tuple[object, bool]:
@@ -1274,6 +2189,12 @@ def _timezone_label_projection(value: object) -> tuple[object, bool]:
             ("timezone", offset_token, name_token),
             offset_is_safe and name_is_safe,
         )
+    if value_type is ZoneInfo:
+        key = ZoneInfo.__dict__["key"].__get__(cast("ZoneInfo", value), ZoneInfo)
+        if type(key) is str:
+            return ("zoneinfo", key), True
+        key_module, key_qualname = _safe_type_description(type(key))
+        return ("unsafe_zoneinfo", key_module, key_qualname), False
     module, qualname = _safe_type_description(value_type)
     return ("untrusted_timezone", module, qualname), False
 
@@ -1300,6 +2221,10 @@ def _consume_label_budget(depth: int, budget: list[int] | None) -> list[int]:
 
 def _safe_name_text(value: object) -> str:  # noqa: C901
     value_type = type(value)
+    if value is pd.NaT:
+        return "NaT"
+    if value is None:
+        return "None"
     if value_type is str:
         return cast("str", value)
     if value_type is bytes:
@@ -1310,6 +2235,19 @@ def _safe_name_text(value: object) -> str:  # noqa: C901
         return int.__str__(cast("int", value))
     if value_type is float:
         return float.__str__(cast("float", value))
+    if value_type is complex:
+        return complex.__str__(cast("complex", value))
+    if value_type is Decimal:
+        return Decimal.__str__(cast("Decimal", value))
+    if value_type is timedelta:
+        return timedelta.__str__(cast("timedelta", value))
+    if value_type is pd.Timedelta:
+        return pd.Timedelta.__str__(cast("pd.Timedelta", value))
+    if value_type is pd.Timestamp:
+        timestamp = cast("pd.Timestamp", value)
+        if not _timezone_label_projection(timestamp.tzinfo)[1]:
+            return ""
+        return pandas_timestamp_label_text(timestamp)
     if value_type is date:
         return date.__str__(cast("date", value))
     if value_type is datetime:
@@ -1336,6 +2274,8 @@ def _safe_name_repr(  # noqa: C901
 ) -> str | None:
     budget = _consume_label_budget(_depth, _budget)
     value_type = type(value)
+    if value is pd.NaT:
+        return "NaT"
     if value is None:
         return "None"
     if value_type is str:
@@ -1348,6 +2288,20 @@ def _safe_name_repr(  # noqa: C901
         return int.__repr__(cast("int", value))
     if value_type is float:
         return float.__repr__(cast("float", value))
+    if value_type is complex:
+        return complex.__repr__(cast("complex", value))
+    if value_type is Decimal:
+        return Decimal.__repr__(cast("Decimal", value))
+    if value_type is timedelta:
+        return timedelta.__repr__(cast("timedelta", value))
+    if value_type is pd.Timedelta:
+        return pd.Timedelta.__repr__(cast("pd.Timedelta", value))
+    if value_type is pd.Timestamp:
+        timestamp = cast("pd.Timestamp", value)
+        if not _timezone_label_projection(timestamp.tzinfo)[1]:
+            return None
+        text = pandas_timestamp_label_text(timestamp)
+        return f"Timestamp({str.__repr__(text)})"
     if value_type is date:
         return date.__repr__(cast("date", value))
     if value_type is datetime:

@@ -20,7 +20,8 @@ from messy_xlsx._fallback_signals import (
 )
 
 T = TypeVar("T")
-_Cleanup = tuple[str, Callable[[], None]]
+_OwnerT = TypeVar("_OwnerT")
+_Cleanup = tuple[str, Callable[[], object]]
 
 __all__ = ["BatchStream", "DataFrameChunkStream", "SheetStream"]
 
@@ -82,18 +83,18 @@ def _run_cleanups(
     return cleanup_failed
 
 
-def _close_if_present(owner: object) -> None:
+def _close_if_present(owner: _OwnerT) -> _OwnerT | None:
+    """Close an owner and return typed ``None`` without a trace-event gap."""
     close = getattr(owner, "close", None)
-    if callable(close):
-        close()
+    return (close(), None)[1] if callable(close) else None
 
 
 class _ResultStream(Generic[T], Iterator[T]):
     """One-shot result iterator with deterministic non-masking cleanup."""
 
-    def __init__(self, source: Iterator[T], close_callback: Callable[[], None]) -> None:
+    def __init__(self, source: Iterator[T], close_callback: Callable[[], object]) -> None:
         self._source: Iterator[T] | None = source
-        self._close_callback: Callable[[], None] | None = close_callback
+        self._close_callback: Callable[[], object] | None = close_callback
         self._closed = False
         self._owner_invalidated = False
 
@@ -124,27 +125,49 @@ class _ResultStream(Generic[T], Iterator[T]):
         primary_error: BaseException | None = None,
         primary_traceback: TracebackType | None = None,
     ) -> None:
-        if self._closed:
+        if self._closed and self._source is None and self._close_callback is None:
             return
         self._closed = True
-        source = self._source
-        close_callback = self._close_callback
-        self._source = None
-        self._close_callback = None
 
         cleanups: list[_Cleanup] = []
-        if source is not None:
-            cleanups.append(("stream source cleanup", lambda: _close_if_present(source)))
-        if close_callback is not None:
-            cleanups.append(("stream release callback", close_callback))
+        if self._source is not None:
+            cleanups.append(("stream source cleanup", self._close_source))
+        if self._close_callback is not None:
+            cleanups.append(("stream release callback", self._release_stream))
         _run_cleanups(
             cleanups,
             primary_error=primary_error,
             primary_traceback=primary_traceback,
         )
 
+    def _close_source(self) -> None:
+        source = self._source
+        if source is None:
+            return
+        defer_retry = getattr(source, "_defer_process_retry_to_owner", None)
+        if callable(defer_retry) and defer_retry():
+            return
+        try:
+            self._source = _close_if_present(source)
+        except BaseException as error:
+            if not _contains_process_failure(error):
+                self._source = None
+            raise
+
+    def _release_stream(self) -> None:
+        close_callback = self._close_callback
+        if close_callback is None:
+            return
+        try:
+            self._close_callback = close_callback if close_callback() is False else None
+        except BaseException as error:
+            if not _contains_process_failure(error):
+                self._close_callback = None
+            raise
+
     def invalidate_from_owner(self) -> None:
         try:
+            self._owner_invalidated = True
             self.close()
         finally:
             self._owner_invalidated = True
@@ -172,10 +195,11 @@ class BatchStream(_ResultStream[pa.RecordBatch]):
         self,
         source: Iterator[pa.RecordBatch],
         schema: pa.Schema,
-        close_callback: Callable[[], None],
+        close_callback: Callable[[], object],
     ) -> None:
         super().__init__(source, close_callback)
         self._schema = schema
+        self._display_names: tuple[object, ...] = tuple(schema.names)
 
     @property
     def schema(self) -> pa.Schema:

@@ -7,6 +7,7 @@ projections consumed by the existing parsing and normalization layers.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, is_dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -17,6 +18,9 @@ from itertools import pairwise
 from types import MethodDescriptorType, WrapperDescriptorType
 from typing import Any, Final, TypeVar, cast
 from uuid import UUID
+from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 from messy_xlsx._fallback_signals import (
     _FallbackBlockReason,
@@ -32,6 +36,11 @@ from messy_xlsx.exceptions import StructureError
 from messy_xlsx.models import SheetConfig, StructureInfo
 from messy_xlsx.parsing.base_handler import ParseOptions
 from messy_xlsx.parsing.contracts import OutputMode
+from messy_xlsx.parsing.physical_values import (
+    PandasTemporalPayload,
+    UnsupportedPhysicalValueError,
+    pandas_temporal_payload,
+)
 
 _STRUCTURE_FORMATS: Final = frozenset({"xlsx", "xlsm", "xltx", "xltm"})
 _TEXT_FORMATS: Final = frozenset({"csv", "tsv", "txt"})
@@ -130,17 +139,43 @@ class _FrozenMemoryview:
 @dataclass(frozen=True, slots=True)
 class _FrozenFloat:
     hexadecimal: str
+    identity: int | None = None
+    reference: float | None = field(
+        default=None,
+        compare=False,
+        hash=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class _FrozenComplex:
     real: _FrozenFloat
     imaginary: _FrozenFloat
+    identity: int | None = None
+    reference: complex | None = field(
+        default=None,
+        compare=False,
+        hash=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class _FrozenDecimal:
     text: str
+    identity: int | None = None
+    reference: Decimal | None = field(
+        default=None,
+        compare=False,
+        hash=False,
+        repr=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenPandasNaT:
+    """Exact singleton marker for pandas' immutable temporal missing value."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +199,13 @@ class _FrozenTimezone:
 
 
 @dataclass(frozen=True, slots=True)
+class _FrozenZoneInfo:
+    key: str
+    identity: int
+    reference: ZoneInfo = field(compare=False, hash=False, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class _FrozenDatetime:
     year: int
     month: int
@@ -172,7 +214,7 @@ class _FrozenDatetime:
     minute: int
     second: int
     microsecond: int
-    timezone: _FrozenTimezone | None
+    timezone: _FrozenTimezone | _FrozenZoneInfo | None
     fold: int
 
 
@@ -182,8 +224,26 @@ class _FrozenTime:
     minute: int
     second: int
     microsecond: int
-    timezone: _FrozenTimezone | None
+    timezone: _FrozenTimezone | _FrozenZoneInfo | None
     fold: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenPandasTimestamp:
+    raw: int = field(compare=False, hash=False)
+    unit: str = field(compare=False, hash=False)
+    identity_raw: int
+    identity_unit: str
+    timezone: _FrozenTimezone | _FrozenZoneInfo | None
+    fold: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenPandasTimedelta:
+    raw: int = field(compare=False, hash=False)
+    unit: str = field(compare=False, hash=False)
+    identity_raw: int
+    identity_unit: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,14 +746,61 @@ def _freeze(  # noqa: C901
     ):
         return value
     if value_type is float:
+        if value != value:
+            return _FrozenFloat(value.hex(), id(value), value)
         return _FrozenFloat(value.hex())
     if value_type is complex:
+        real = value.real
+        imaginary = value.imag
+        if math.isnan(real) or math.isnan(imaginary):
+            return _FrozenComplex(
+                _FrozenFloat(real.hex()),
+                _FrozenFloat(imaginary.hex()),
+                id(value),
+                value,
+            )
         return _FrozenComplex(
-            _FrozenFloat(value.real.hex()),
-            _FrozenFloat(value.imag.hex()),
+            _FrozenFloat(real.hex()),
+            _FrozenFloat(imaginary.hex()),
         )
     if value_type is Decimal:
-        return _FrozenDecimal(str(value))
+        decimal_value = cast("Decimal", value)
+        if Decimal.is_nan(decimal_value):
+            return _FrozenDecimal(
+                Decimal.__str__(decimal_value),
+                id(decimal_value),
+                decimal_value,
+            )
+        return _FrozenDecimal(Decimal.__str__(decimal_value))
+    if value is pd.NaT:
+        return _FrozenPandasNaT()
+    try:
+        temporal = pandas_temporal_payload(value)
+    except UnsupportedPhysicalValueError:
+        if value_type is pd.Timestamp or value_type is pd.Timedelta:
+            raise TypeError(
+                f"unsupported mutable configuration value: {value_type.__name__}"
+            ) from None
+        temporal = None
+    if temporal is not None and temporal.family == "timestamp":
+        identity_raw, identity_unit = _canonical_temporal_identity(temporal)
+        frozen_timezone = _freeze_stdlib_timezone(temporal.timezone, "Timestamp")
+        return _FrozenPandasTimestamp(
+            temporal.raw,
+            temporal.unit,
+            identity_raw,
+            identity_unit,
+            frozen_timezone,
+            temporal.fold,
+        )
+    if temporal is not None:
+        identity_raw, identity_unit = _canonical_temporal_identity(temporal)
+        return _FrozenPandasTimedelta(
+            temporal.raw,
+            temporal.unit,
+            identity_raw,
+            identity_unit,
+        )
     if value_type is datetime:
         frozen_timezone = _freeze_stdlib_timezone(value.tzinfo, "datetime")
         return _FrozenDatetime(
@@ -921,25 +1028,35 @@ def _freeze_memoryview(value: memoryview) -> _FrozenMemoryview:
 def _freeze_stdlib_timezone(
     value: object,
     scalar_name: str,
-) -> _FrozenTimezone | None:
-    """Snapshot only the immutable stdlib fixed-offset timezone type."""
+) -> _FrozenTimezone | _FrozenZoneInfo | None:
+    """Snapshot only trusted immutable stdlib timezone implementations."""
     if value is None:
         return None
-    if type(value) is not timezone:
-        raise TypeError(f"unsupported mutable configuration value: {scalar_name}")
-    offset = timezone.utcoffset(value, None)
-    name = timezone.tzname(value, None)
-    if type(offset) is not timedelta or type(name) is not str:
-        raise TypeError(f"unsupported mutable configuration value: {scalar_name}")
-    return _FrozenTimezone(
-        _FrozenTimedelta(offset.days, offset.seconds, offset.microseconds),
-        name,
-    )
+    if type(value) is timezone:
+        timezone_value = cast("timezone", value)
+        offset = timezone.utcoffset(timezone_value, None)
+        name = timezone.tzname(timezone_value, None)
+        if type(offset) is not timedelta or type(name) is not str:
+            raise TypeError(f"unsupported mutable configuration value: {scalar_name}")
+        return _FrozenTimezone(
+            _FrozenTimedelta(offset.days, offset.seconds, offset.microseconds),
+            name,
+        )
+    if type(value) is ZoneInfo:
+        key = ZoneInfo.__dict__["key"].__get__(cast("ZoneInfo", value), ZoneInfo)
+        if type(key) is not str:
+            raise TypeError(f"unsupported mutable configuration value: {scalar_name}")
+        return _FrozenZoneInfo(key, id(value), cast("ZoneInfo", value))
+    raise TypeError(f"unsupported mutable configuration value: {scalar_name}")
 
 
-def _thaw_stdlib_timezone(value: _FrozenTimezone | None) -> timezone | None:
+def _thaw_stdlib_timezone(
+    value: _FrozenTimezone | _FrozenZoneInfo | None,
+) -> timezone | ZoneInfo | None:
     if value is None:
         return None
+    if isinstance(value, _FrozenZoneInfo):
+        return value.reference
     offset = value.offset
     return timezone(
         timedelta(offset.days, offset.seconds, offset.microseconds),
@@ -982,11 +1099,27 @@ def _thaw(value: Any) -> Any:  # noqa: C901
     if isinstance(value, _FrozenMemoryview):
         return _thaw_memoryview(value)
     if isinstance(value, _FrozenFloat):
+        if value.reference is not None:
+            return value.reference
         return float.fromhex(value.hexadecimal)
     if isinstance(value, _FrozenComplex):
+        if value.reference is not None:
+            return value.reference
         return complex(_thaw(value.real), _thaw(value.imaginary))
     if isinstance(value, _FrozenDecimal):
+        if value.reference is not None:
+            return value.reference
         return Decimal(value.text)
+    if isinstance(value, _FrozenPandasNaT):
+        return pd.NaT
+    if isinstance(value, _FrozenPandasTimestamp):
+        return pd.Timestamp(
+            value.raw,
+            unit=value.unit,
+            tz=_thaw_stdlib_timezone(value.timezone),
+        )
+    if isinstance(value, _FrozenPandasTimedelta):
+        return pd.Timedelta(value.raw, unit=value.unit)
     if isinstance(value, _FrozenDate):
         return date(value.year, value.month, value.day)
     if isinstance(value, _FrozenTimedelta):
@@ -1043,11 +1176,27 @@ def _order_mapping_items(items: list[tuple[Any, Any]]) -> tuple[tuple[Any, Any],
 
 def _order_set_items(items: tuple[Any, ...]) -> tuple[Any, ...]:
     """Order frozen set entries and reject ambiguous structural values."""
-    keyed_items = sorted((_stable_token(item), item) for item in items)
+    keyed_items = sorted(
+        ((_stable_token(item), item) for item in items),
+        key=lambda item: item[0],
+    )
     for previous, current in pairwise(keyed_items):
         if previous[0] == current[0]:
             raise TypeError("configuration set values cannot be ordered deterministically")
     return tuple(item for _, item in keyed_items)
+
+
+def _canonical_temporal_identity(
+    payload: PandasTemporalPayload,
+) -> tuple[int, str]:
+    """Use the coarsest exact unit for stable equal-value plan identity."""
+    units = ("ns", "us", "ms", "s")
+    raw = payload.raw
+    unit_index = units.index(payload.unit)
+    while unit_index < len(units) - 1 and raw % 1_000 == 0:
+        raw //= 1_000
+        unit_index += 1
+    return raw, units[unit_index]
 
 
 def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
@@ -1071,21 +1220,27 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
         return ("complex", _stable_token(value.real), _stable_token(value.imaginary))
     if isinstance(value, _FrozenDecimal):
         return ("decimal", value.text)
+    if isinstance(value, _FrozenPandasNaT):
+        return ("pandas_nat",)
+    if isinstance(value, _FrozenPandasTimestamp):
+        return (
+            "pandas_timestamp",
+            value.identity_raw,
+            value.identity_unit,
+            _stable_timezone_token(value.timezone),
+            value.fold,
+        )
+    if isinstance(value, _FrozenPandasTimedelta):
+        return (
+            "pandas_timedelta",
+            value.identity_raw,
+            value.identity_unit,
+        )
     if isinstance(value, _FrozenDate):
         return ("date", value.year, value.month, value.day)
     if isinstance(value, _FrozenTimedelta):
         return ("timedelta", value.days, value.seconds, value.microseconds)
     if isinstance(value, _FrozenDatetime):
-        frozen_timezone = value.timezone
-        timezone_token: tuple[Any, ...]
-        if frozen_timezone is None:
-            timezone_token = ("naive",)
-        else:
-            timezone_token = (
-                "timezone",
-                _stable_token(frozen_timezone.offset),
-                frozen_timezone.name,
-            )
         return (
             "datetime",
             value.year,
@@ -1095,27 +1250,17 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
             value.minute,
             value.second,
             value.microsecond,
-            timezone_token,
+            _stable_timezone_token(value.timezone),
             value.fold,
         )
     if isinstance(value, _FrozenTime):
-        frozen_timezone = value.timezone
-        timezone_token = (
-            ("naive",)
-            if frozen_timezone is None
-            else (
-                "timezone",
-                _stable_token(frozen_timezone.offset),
-                frozen_timezone.name,
-            )
-        )
         return (
             "time",
             value.hour,
             value.minute,
             value.second,
             value.microsecond,
-            timezone_token,
+            _stable_timezone_token(value.timezone),
             value.fold,
         )
     if isinstance(value, _FrozenUUID):
@@ -1182,6 +1327,20 @@ def _stable_token(value: Any) -> tuple[Any, ...]:  # noqa: C901
         return ("symbol", value.__module__, value.__qualname__)
     raise TypeError(
         f"configuration value cannot be ordered deterministically: {type(value).__name__}"
+    )
+
+
+def _stable_timezone_token(
+    value: _FrozenTimezone | _FrozenZoneInfo | None,
+) -> tuple[Any, ...]:
+    if value is None:
+        return ("naive",)
+    if isinstance(value, _FrozenZoneInfo):
+        return ("zoneinfo", value.key, value.identity)
+    return (
+        "timezone",
+        _stable_token(value.offset),
+        value.name,
     )
 
 

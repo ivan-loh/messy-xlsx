@@ -26,25 +26,22 @@ def unique_physical_buffer_bytes(
     max_parent_nodes: int = MAX_BUFFER_PARENT_NODES,
 ) -> int:
     """Return deduplicated root-buffer bytes after bounded structural preflight."""
-    type_budget = [max_nodes]
-    buffer_entry_budget = [max_buffer_entries]
     for array in arrays:
         _preflight_physical_type(
             array.type,
             0,
-            type_budget,
-            buffer_entry_budget,
+            [max_nodes],
+            [max_buffer_entries],
             max_depth,
         )
 
     seen_buffers: set[tuple[int, int]] = set()
-    array_budget = [max_nodes]
     return sum(
         _unique_array_buffer_bytes(
             array,
             seen_buffers,
             0,
-            array_budget,
+            [max_nodes],
             max_depth,
             max_parent_nodes,
         )

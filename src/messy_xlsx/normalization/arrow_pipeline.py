@@ -327,17 +327,25 @@ class NormalizedStreamingReader:
         primary_traceback: TracebackType | None = None,
         cleanup_overrides: bool = False,
     ) -> None:
-        if self._closed:
+        if self._closed and self._reader is None:
             return
         self._closed = True
         self._terminal = True
-        reader = self._reader
-        self._reader = None
         self._operation = None
+
+        def close_reader() -> None:
+            reader = self._reader
+            if reader is None:
+                return
+            try:
+                self._reader = _close_owned_reader(reader)
+            except BaseException as error:
+                if not _contains_process_failure(error):
+                    self._reader = None
+                raise
+
         cleanups = (
-            []
-            if reader is None
-            else [("normalized reader source cleanup", lambda: _close_owned_reader(reader))]
+            [] if self._reader is None else [("normalized reader source cleanup", close_reader)]
         )
         cleanup_primary = None if cleanup_overrides else primary_error
         cleanup_traceback = None if cleanup_primary is None else primary_traceback
@@ -418,12 +426,14 @@ def _decode_encoded_strings(array: pa.Array) -> pa.Array:
     return array
 
 
-def _close_owned_reader(reader: object) -> None:
-    """Close the required source-reader capability without optional semantics."""
+def _close_owned_reader(
+    reader: StreamingBatchReader,
+) -> StreamingBatchReader | None:
+    """Close a required reader and clear its owner only after success."""
     close = getattr(reader, "close", None)
     if not callable(close):
         raise TypeError("owned streaming reader must provide a callable close")
-    close()
+    return (close(), None)[1]
 
 
 def _normalize_arrow_passthrough(
@@ -745,7 +755,7 @@ def _drop_all_null_rows(batch: pa.RecordBatch) -> pa.RecordBatch:
     if batch.num_rows == 0:
         return batch
     if batch.num_columns == 0:
-        return _record_batch([], batch.schema, 0)
+        return _record_batch([], batch.schema, batch.num_rows)
     if any(_has_no_logical_nulls(column) for column in batch.columns):
         return batch
     keep = _logical_validity(batch.column(0))
@@ -758,7 +768,7 @@ def _drop_all_null_rows(batch: pa.RecordBatch) -> pa.RecordBatch:
 
 def _has_no_logical_nulls(array: pa.Array) -> bool:
     if isinstance(array, (pa.RunEndEncodedArray, pa.DictionaryArray)):
-        return encoded_has_no_logical_nulls(array)
+        return bool(encoded_has_no_logical_nulls(array))
     return bool(array.null_count == 0)
 
 

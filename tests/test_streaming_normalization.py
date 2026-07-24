@@ -7,11 +7,14 @@ import inspect
 import math
 import re
 import weakref
+from collections.abc import Iterator
 from dataclasses import FrozenInstanceError, dataclass
-from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
+import pandas as pd
 import pyarrow as pa
 import pytest
 
@@ -329,6 +332,23 @@ def test_safe_non_string_labels_participate_in_legacy_name_inference(
     assert compiled.source_label_tokens == (normalization_plan._display_label_token(label),)
 
 
+def test_safe_name_text_recursively_formats_complex_and_extended_timestamp_labels() -> None:
+    zone = ZoneInfo.no_cache("UTC")
+    negative = pd.Timestamp(-62_198_755_200, unit="s", tz=zone)
+    future = pd.Timestamp(253_402_300_800, unit="s", tz=zone)
+    label = (
+        negative,
+        (1 + 2j, future),
+        complex(float("nan"), float("inf")),
+    )
+
+    assert normalization_plan._safe_name_text(label) == (
+        "(Timestamp('-001-01-01 00:00:00+00:00'), "
+        "((1+2j), Timestamp('10000-01-01 00:00:00+00:00')), "
+        "(nan+infj))"
+    )
+
+
 def test_type_distinct_safe_name_projections_keep_distinct_label_tokens() -> None:
     values = pa.array(["Jan 1 2024", "Jan 2 2024"])
     labels = (b"event_date", "event_date", (b"event_date",))
@@ -644,7 +664,7 @@ def test_unicode_whitespace_and_blank_detection_match_legacy_behavior(
     assert result.column(1).to_pylist() == ["first", "second"]
 
 
-def test_zero_column_normalized_batch_drops_every_empty_row() -> None:
+def test_zero_column_normalized_batch_preserves_structural_rows() -> None:
     sample = _sample(
         (),
         (),
@@ -655,7 +675,7 @@ def test_zero_column_normalized_batch_drops_every_empty_row() -> None:
     result = ArrowNormalizationOperation(compiled).normalize(_zero_column_batch(2))
 
     assert result.num_columns == 0
-    assert result.num_rows == 0
+    assert result.num_rows == 2
     assert result.schema.equals(compiled.schema, check_metadata=True)
 
 
@@ -2730,8 +2750,14 @@ def test_context_body_error_wins_over_ordinary_cleanup_failure() -> None:
     assert captured.value.backend_context["cleanup_failure"] == {"type": "OSError"}
 
 
-@pytest.mark.parametrize("cleanup", [OSError("close"), MemoryError("close")])
-def test_hostile_close_descriptor_failure_surfaces_once(cleanup: BaseException) -> None:
+@pytest.mark.parametrize(
+    ("cleanup", "expected_close_accesses"),
+    [(OSError("close"), 1), (MemoryError("close"), 2)],
+)
+def test_hostile_close_descriptor_failure_obeys_retry_policy(
+    cleanup: BaseException,
+    expected_close_accesses: int,
+) -> None:
     class DescriptorReader:
         schema = pa.schema([("0", pa.string())])
 
@@ -2744,7 +2770,9 @@ def test_hostile_close_descriptor_failure_surfaces_once(cleanup: BaseException) 
         @property
         def close(self) -> object:
             self.close_accesses += 1
-            raise cleanup
+            if self.close_accesses == 1:
+                raise cleanup
+            return lambda: None
 
     compiled = compile_normalization_plan(
         _sample((pa.array(["x"]),), ("note",)),
@@ -2758,7 +2786,8 @@ def test_hostile_close_descriptor_failure_surfaces_once(cleanup: BaseException) 
 
     assert captured.value is cleanup
     reader.close()
-    assert raw.close_accesses == 1
+    reader.close()
+    assert raw.close_accesses == expected_close_accesses
 
 
 def test_arrow_fast_paths_avoid_scalar_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4887,3 +4916,862 @@ def test_known_invalid_numeric_date_sample_stays_numeric() -> None:
 
     assert compiled.schema.types == [pa.int64()]
     assert result.column(0)[-1].as_py() == 60_001
+
+
+def test_decimal_label_tokens_keep_selective_rename_identity() -> None:
+    renamed = Decimal("1.25")
+    untouched = Decimal("2.50")
+
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]), pa.array(["2"])), (renamed, untouched)),
+        _parse_plan(column_renames={renamed: "renamed"}),
+    )
+
+    assert compiled.source_label_tokens[0] != compiled.source_label_tokens[1]
+    assert compiled.final_display_names == ("renamed", untouched)
+
+
+# Task 12 temporal follow-up: label matching mirrors characterized pandas
+# temporal equality without collapsing nanoseconds or ambiguous folds.
+
+
+def test_aware_temporal_label_matches_same_instant_across_trusted_timezones() -> None:
+    source = pd.Timestamp(
+        datetime(
+            2024,
+            1,
+            2,
+            8,
+            tzinfo=timezone(timedelta(hours=8), "MALAYSIA"),
+        )
+    )
+    equivalent = datetime(2024, 1, 2, tzinfo=ZoneInfo("UTC"))
+
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]),), (source,)),
+        _parse_plan(column_renames={equivalent: "when"}),
+    )
+
+    assert compiled.final_display_names == ("when",)
+
+
+def test_aware_temporal_labels_resolve_type_hints_and_drop_conditions() -> None:
+    hinted_label = pd.Timestamp(
+        datetime(2024, 1, 2, 8, tzinfo=timezone(timedelta(hours=8))),
+    )
+    conditioned_label = pd.Timestamp(
+        datetime(2024, 1, 3, 8, tzinfo=timezone(timedelta(hours=8))),
+    )
+    values = (pa.array(["1", "2"]), pa.array(["drop", "keep"]))
+    compiled = compile_normalization_plan(
+        _sample(values, (hinted_label, conditioned_label)),
+        _parse_plan(
+            type_hints={
+                datetime(2024, 1, 2, tzinfo=ZoneInfo("UTC")): "INTEGER",
+            },
+            drop_conditions=[
+                {
+                    "column": datetime(2024, 1, 3, tzinfo=ZoneInfo("UTC")),
+                    "value": "drop",
+                }
+            ],
+        ),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch(list(values), schema=compiled.input_schema)
+    )
+
+    assert compiled.schema.types == [pa.int64(), pa.string()]
+    assert result.column(0).to_pylist() == [2]
+    assert result.column(1).to_pylist() == ["keep"]
+
+
+def test_temporal_label_matching_preserves_distinct_nanoseconds_and_durations() -> None:
+    first_timestamp = pd.Timestamp("2024-01-02 03:04:05.000000001")
+    second_timestamp = pd.Timestamp("2024-01-02 03:04:05.000000002")
+    first_duration = pd.Timedelta(days=1, nanoseconds=1)
+    second_duration = pd.Timedelta(days=1, nanoseconds=2)
+
+    compiled = compile_normalization_plan(
+        _sample(
+            tuple(pa.array(["1"]) for _ in range(4)),
+            (first_timestamp, second_timestamp, first_duration, second_duration),
+        ),
+        _parse_plan(
+            column_renames={
+                first_timestamp: "first_timestamp",
+                first_duration: "first_duration",
+            }
+        ),
+    )
+
+    assert compiled.final_display_names == (
+        "first_timestamp",
+        second_timestamp,
+        "first_duration",
+        second_duration,
+    )
+
+
+def test_pandas_ambiguous_fold_labels_match_by_exact_instant() -> None:
+    zone = ZoneInfo.no_cache("America/New_York")
+    fold_zero = pd.Timestamp(datetime(2024, 11, 3, 1, 30, tzinfo=zone, fold=0))
+    fold_one = pd.Timestamp(datetime(2024, 11, 3, 1, 30, tzinfo=zone, fold=1))
+
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]), pa.array(["2"])), (fold_zero, fold_one)),
+        _parse_plan(column_renames={fold_zero: "first_fold"}),
+    )
+
+    assert compiled.final_display_names == ("first_fold", fold_one)
+    assert compiled.final_display_names[1].fold == 1
+
+
+def test_stdlib_key_cannot_ambiguously_target_both_pandas_dst_folds() -> None:
+    zone = ZoneInfo.no_cache("America/New_York")
+    fold_zero = pd.Timestamp(datetime(2024, 11, 3, 1, 30, tzinfo=zone, fold=0))
+    fold_one = pd.Timestamp(datetime(2024, 11, 3, 1, 30, tzinfo=zone, fold=1))
+    stdlib_key = datetime(2024, 11, 3, 1, 30, tzinfo=zone, fold=0)
+
+    with pytest.raises(ValueError, match="ambiguous temporal label"):
+        compile_normalization_plan(
+            _sample((pa.array(["1"]), pa.array(["2"])), (fold_zero, fold_one)),
+            _parse_plan(column_renames={stdlib_key: "ambiguous"}),
+        )
+
+
+def test_nested_stdlib_key_cannot_ambiguously_target_both_pandas_dst_folds() -> None:
+    zone = ZoneInfo.no_cache("America/New_York")
+    fold_zero = pd.Timestamp(datetime(2024, 11, 3, 1, 30, tzinfo=zone, fold=0))
+    fold_one = pd.Timestamp(datetime(2024, 11, 3, 1, 30, tzinfo=zone, fold=1))
+    stdlib_key = datetime(2024, 11, 3, 1, 30, tzinfo=zone, fold=0)
+
+    with pytest.raises(ValueError, match="ambiguous temporal label"):
+        compile_normalization_plan(
+            _sample(
+                (pa.array(["1"]), pa.array(["2"])),
+                ((fold_zero,), (fold_one,)),
+            ),
+            _parse_plan(column_renames={(stdlib_key,): "ambiguous"}),
+        )
+
+
+@pytest.mark.parametrize(
+    "operand",
+    [
+        time(1, 2, 3, tzinfo=UTC),
+        time(9, 2, 3, tzinfo=timezone(timedelta(hours=8))),
+    ],
+)
+def test_aware_time_condition_never_matches_naive_arrow_time(operand: time) -> None:
+    values = pa.array([time(1, 2, 3), time(4, 5, 6)], type=pa.time64("us"))
+    compiled = compile_normalization_plan(
+        _sample((values,), ("clock",)),
+        _parse_plan(drop_conditions=[{"column": "clock", "value": operand}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.drop_conditions[0].operands == (None,)
+    assert result.column(0).to_pylist() == values.to_pylist()
+
+
+@pytest.mark.parametrize(
+    ("values", "operand"),
+    [
+        (
+            pa.array([datetime(2024, 1, 1)], type=pa.timestamp("us")),
+            datetime(2024, 1, 1, tzinfo=UTC),
+        ),
+        (
+            pa.array(
+                [datetime(2024, 1, 1, tzinfo=UTC)],
+                type=pa.timestamp("us", tz="UTC"),
+            ),
+            datetime(2024, 1, 1),
+        ),
+    ],
+)
+def test_timestamp_condition_requires_matching_awareness(
+    values: pa.Array,
+    operand: datetime,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((values,), ("moment",)),
+        _parse_plan(drop_conditions=[{"column": "moment", "value": operand}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.drop_conditions[0].operands == (None,)
+    assert result.column(0).to_pylist() == values.to_pylist()
+
+
+def test_aware_timestamp_condition_matches_equivalent_instant() -> None:
+    values = pa.array(
+        [
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 2, tzinfo=UTC),
+        ],
+        type=pa.timestamp("us", tz="UTC"),
+    )
+    operand = pd.Timestamp(
+        datetime(2024, 1, 1, 8, tzinfo=timezone(timedelta(hours=8))),
+    )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("moment",)),
+        _parse_plan(drop_conditions=[{"column": "moment", "value": operand}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == [
+        datetime(2024, 1, 2, tzinfo=UTC),
+    ]
+
+
+@pytest.mark.parametrize(
+    "operand",
+    [
+        timedelta(days=1, microseconds=2),
+        pd.Timedelta(days=1, microseconds=2),
+    ],
+)
+def test_duration_condition_preserves_legacy_equality(operand: object) -> None:
+    values = pa.array(
+        [timedelta(days=1, microseconds=2), timedelta(days=2)],
+        type=pa.duration("us"),
+    )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("elapsed",)),
+        _parse_plan(drop_conditions=[{"column": "elapsed", "value": operand}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert result.column(0).to_pylist() == [timedelta(days=2)]
+
+
+@pytest.mark.parametrize(
+    ("values", "operand"),
+    [
+        (
+            pa.array(
+                [datetime(2024, 1, 1), datetime(2024, 1, 1, 0, 0, 0, 1)],
+                type=pa.timestamp("us"),
+            ),
+            pd.Timestamp("2024-01-01 00:00:00.000000001"),
+        ),
+        (
+            pa.array(
+                [timedelta(0), timedelta(microseconds=1)],
+                type=pa.duration("us"),
+            ),
+            pd.Timedelta(nanoseconds=1),
+        ),
+        (
+            pa.array(
+                [time(1, 2, 3), time(1, 2, 4)],
+                type=pa.time32("s"),
+            ),
+            time(1, 2, 3, 1),
+        ),
+    ],
+)
+def test_subunit_temporal_condition_is_a_harmless_non_match(
+    values: pa.Array,
+    operand: object,
+) -> None:
+    compiled = compile_normalization_plan(
+        _sample((values,), ("temporal",)),
+        _parse_plan(drop_conditions=[{"column": "temporal", "value": operand}]),
+    )
+
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.drop_conditions[0].operands == (None,)
+    assert result.column(0).to_pylist() == values.to_pylist()
+
+
+# Task 12 final acceptance: exact ZoneInfo time semantics, pandas NaT, and
+# operation-specific non-reflexive label matching.
+
+
+def test_zoneinfo_time_none_offset_matches_naive_labels_in_all_config_roles() -> None:
+    zone = ZoneInfo.no_cache("America/New_York")
+    hinted = time(1, 0, tzinfo=zone)
+    renamed = time(2, 0)
+    nested = (time(3, 0, tzinfo=zone), "nested")
+    conditioned = time(4, 0, tzinfo=zone)
+    values = (
+        pa.array(["1", "2"]),
+        pa.array(["left", "right"]),
+        pa.array(["3", "4"]),
+        pa.array(["drop", "keep"]),
+    )
+    compiled = compile_normalization_plan(
+        _sample(values, (hinted, renamed, nested, conditioned)),
+        _parse_plan(
+            type_hints={
+                time(1, 0): "INTEGER",
+                (time(3, 0), "nested"): "INTEGER",
+            },
+            column_renames={time(2, 0, tzinfo=zone): "renamed"},
+            drop_conditions=[{"column": time(4, 0), "value": "drop"}],
+        ),
+    )
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch(list(values), schema=compiled.input_schema)
+    )
+
+    assert compiled.schema.types[0] == pa.int64()
+    assert compiled.schema.types[2] == pa.int64()
+    assert compiled.final_display_names[1] == "renamed"
+    assert compiled.drop_conditions[0].ordinals == (3,)
+    assert result.to_pylist() == [
+        {
+            "0": 2,
+            "1": "right",
+            "2": 4,
+            "3": "keep",
+        }
+    ]
+
+
+def test_zoneinfo_time_fixed_offset_matches_equivalent_aware_key() -> None:
+    zone = ZoneInfo("UTC")
+    source = time(1, 2, 3, tzinfo=zone)
+    key = time(1, 2, 3, tzinfo=UTC)
+    assert ZoneInfo.utcoffset(zone, None) == timedelta(0)
+
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]),), (source,)),
+        _parse_plan(column_renames={key: "clock"}),
+    )
+
+    assert compiled.final_display_names == ("clock",)
+
+
+def test_nat_labels_and_nested_nat_resolve_without_temporal_coercion() -> None:
+    nested = (pd.NaT, "nested")
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]), pa.array(["2"])), (pd.NaT, nested)),
+        _parse_plan(
+            type_hints={pd.NaT: "INTEGER", nested: "INTEGER"},
+            column_renames={pd.NaT: "nat", nested: "nested_nat"},
+        ),
+    )
+
+    assert compiled.schema.types == [pa.int64(), pa.int64()]
+    assert compiled.final_display_names == ("nat", "nested_nat")
+
+
+@pytest.mark.parametrize("kind", ["float", "decimal"])
+def test_non_reflexive_hint_and_rename_keys_match_only_same_object(
+    kind: str,
+) -> None:
+    first = float("nan") if kind == "float" else Decimal("NaN")
+    second = float("nan") if kind == "float" else Decimal("NaN")
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["1"]), pa.array(["two"])), (first, second)),
+        _parse_plan(
+            type_hints={first: "INTEGER"},
+            column_renames={first: "first"},
+        ),
+    )
+
+    assert compiled.schema.types[0] == pa.int64()
+    assert pa.types.is_string(compiled.schema.types[1])
+    assert compiled.final_display_names[0] == "first"
+    assert compiled.final_display_names[1] is second
+
+
+def test_float_nan_drop_column_matches_pandas_equivalent_duplicate_labels() -> None:
+    first = float("nan")
+    second = float("nan")
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["x"]), pa.array(["y"])), (first, second)),
+        _parse_plan(
+            drop_conditions=[{"column": float("nan"), "value": "x"}],
+        ),
+    )
+
+    assert compiled.drop_conditions[0].mode is normalization_plan.ConditionMode.MASK_ALL_DUPLICATES
+    assert compiled.drop_conditions[0].ordinals == (0, 1)
+
+
+def test_float_nan_inside_unique_tuple_drop_column_matches_pandas_index() -> None:
+    source_nan = float("nan")
+    label = (source_nan, "nested")
+    compiled = compile_normalization_plan(
+        _sample((pa.array(["drop", "keep"]),), (label,)),
+        _parse_plan(
+            drop_conditions=[
+                {
+                    "column": (float("nan"), "nested"),
+                    "value": "drop",
+                }
+            ],
+        ),
+    )
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch(
+            [pa.array(["drop", "keep"])],
+            schema=compiled.input_schema,
+        )
+    )
+
+    assert compiled.drop_conditions[0].ordinals == (0,)
+    assert result.column(0).to_pylist() == ["keep"]
+
+
+# Task 12 final semantic/performance remediation: resolution semantics are
+# distinct from the typed structural tokens retained in plan identity.
+
+
+def test_python_numeric_label_aliases_resolve_in_every_configuration_role() -> None:
+    labels = (
+        True,
+        1,
+        1.0,
+        Decimal(1),
+        False,
+        0,
+        -0.0,
+        Decimal("-0"),
+        float("inf"),
+        Decimal("Infinity"),
+        (True, "nested"),
+        (Decimal(1), "nested"),
+        Decimal("0.1"),
+        0.1,
+    )
+    arrays = tuple(pa.array(["drop", "keep"]) for _ in labels)
+
+    hinted = compile_normalization_plan(
+        _sample(arrays, labels),
+        _parse_plan(type_hints={Decimal(1): "TEXT"}),
+    )
+    renamed = compile_normalization_plan(
+        _sample(arrays, labels),
+        _parse_plan(
+            column_renames={
+                -0.0: "zero",
+                Decimal("Infinity"): "infinity",
+                (1.0, "nested"): "nested-one",
+                Decimal("0.1"): "decimal-tenth",
+            }
+        ),
+    )
+    conditioned = compile_normalization_plan(
+        _sample(arrays, labels),
+        _parse_plan(drop_conditions=[{"column": 1.0, "value": "drop"}]),
+    )
+
+    assert tuple(rule.explicit_hint for rule in hinted.columns[:4]) == ("TEXT",) * 4
+    assert tuple(rule.explicit_hint for rule in hinted.columns[4:]) == (None,) * (len(labels) - 4)
+    assert renamed.final_display_names[4:8] == ("zero",) * 4
+    assert renamed.final_display_names[8:10] == ("infinity",) * 2
+    assert renamed.final_display_names[10:12] == ("nested-one",) * 2
+    assert renamed.final_display_names[12:] == ("decimal-tenth", 0.1)
+    assert conditioned.drop_conditions[0].ordinals == (0, 1, 2, 3)
+
+
+def test_exact_complex_labels_are_selective_in_every_configuration_role() -> None:
+    labels = (1 + 2j, 3 + 4j, 1 + 0j)
+    compiled = compile_normalization_plan(
+        _sample(
+            (
+                pa.array(["1", "2"]),
+                pa.array(["drop", "keep"]),
+                pa.array(["7", "8"]),
+            ),
+            labels,
+        ),
+        _parse_plan(
+            type_hints={1 + 2j: "INTEGER", 1: "TEXT"},
+            column_renames={1 + 2j: "selected"},
+            drop_conditions=[{"column": 3 + 4j, "value": "drop"}],
+        ),
+    )
+
+    assert tuple(rule.explicit_hint for rule in compiled.columns) == (
+        "INTEGER",
+        None,
+        "TEXT",
+    )
+    assert compiled.final_display_names == ("selected", 3 + 4j, 1 + 0j)
+    assert len(set(compiled.source_label_tokens)) == len(labels)
+    assert compiled.drop_conditions[0].ordinals == (1,)
+
+
+def test_exact_complex_zero_and_infinity_follow_python_numeric_aliases() -> None:
+    labels = (
+        0j,
+        complex(-0.0, -0.0),
+        0,
+        1 + 0j,
+        Decimal(1),
+        complex(float("inf"), 0.0),
+        Decimal("Infinity"),
+        complex(0.0, float("inf")),
+    )
+    compiled = compile_normalization_plan(
+        _sample(tuple(pa.array(["1"]) for _ in labels), labels),
+        _parse_plan(
+            type_hints={
+                False: "TEXT",
+                True: "INTEGER",
+                float("inf"): "TEXT",
+                complex(0.0, float("inf")): "INTEGER",
+            },
+        ),
+    )
+
+    assert tuple(rule.explicit_hint for rule in compiled.columns) == (
+        "TEXT",
+        "TEXT",
+        "TEXT",
+        "INTEGER",
+        "INTEGER",
+        "TEXT",
+        "TEXT",
+        "INTEGER",
+    )
+    assert compiled.source_label_tokens[0] != compiled.source_label_tokens[1]
+
+
+def test_non_reflexive_complex_keys_match_only_the_same_label_object() -> None:
+    first_real_nan = complex(float("nan"), -0.0)
+    second_real_nan = complex(float("nan"), -0.0)
+    first_imaginary_nan = complex(0.0, float("nan"))
+    second_imaginary_nan = complex(0.0, float("nan"))
+    labels = (
+        first_real_nan,
+        second_real_nan,
+        first_imaginary_nan,
+        second_imaginary_nan,
+    )
+
+    compiled = compile_normalization_plan(
+        _sample(tuple(pa.array(["1"]) for _ in labels), labels),
+        _parse_plan(
+            type_hints={
+                first_real_nan: "INTEGER",
+                first_imaginary_nan: "TEXT",
+            },
+            column_renames={
+                first_real_nan: "real-nan",
+                first_imaginary_nan: "imaginary-nan",
+            },
+        ),
+    )
+    conditioned = compile_normalization_plan(
+        _sample(tuple(pa.array(["drop", "keep"]) for _ in labels), labels),
+        _parse_plan(
+            drop_conditions=[
+                {
+                    "column": first_real_nan,
+                    "value": "drop",
+                }
+            ],
+        ),
+    )
+
+    assert tuple(rule.explicit_hint for rule in compiled.columns) == (
+        "INTEGER",
+        None,
+        "TEXT",
+        None,
+    )
+    assert compiled.final_display_names[0] == "real-nan"
+    assert compiled.final_display_names[1] is second_real_nan
+    assert compiled.final_display_names[2] == "imaginary-nan"
+    assert compiled.final_display_names[3] is second_imaginary_nan
+    assert conditioned.drop_conditions[0].ordinals == (0,)
+
+
+def test_complex_subclass_labels_do_not_execute_hooks_or_alias_builtin_keys() -> None:
+    callbacks: list[str] = []
+
+    class ArmedComplex(complex):
+        armed = False
+
+        def __hash__(self) -> int:
+            if self.armed:
+                callbacks.append("hash")
+                raise AssertionError("complex subclass hash executed")
+            return complex.__hash__(self)
+
+        def __eq__(self, other: object) -> bool:
+            if self.armed:
+                callbacks.append("eq")
+                raise AssertionError("complex subclass equality executed")
+            return complex.__eq__(self, other)
+
+        @property
+        def real(self) -> float:
+            if self.armed:
+                callbacks.append("real")
+                raise AssertionError("complex subclass component hook executed")
+            return complex.real.__get__(self, complex)
+
+        def __str__(self) -> str:
+            if self.armed:
+                callbacks.append("str")
+                raise AssertionError("complex subclass text executed")
+            return complex.__str__(self)
+
+    label = ArmedComplex(1 + 2j)
+    sample = _sample((pa.array(["1"]),), (label,))
+    ArmedComplex.armed = True
+
+    compiled = compile_normalization_plan(
+        sample,
+        _parse_plan(
+            type_hints={1 + 2j: "INTEGER"},
+            column_renames={1 + 2j: "renamed"},
+        ),
+    )
+
+    assert compiled.columns[0].explicit_hint is None
+    assert compiled.final_display_names[0] != "renamed"
+    assert callbacks == []
+
+
+def test_exact_complex_label_resolution_index_is_near_linear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    width = 200
+    labels = tuple(complex(ordinal, ordinal + 1) for ordinal in range(width))
+    tokens = tuple(normalization_plan._display_label_token(label) for label in labels)
+    index = normalization_plan._LabelResolutionIndex(tokens)
+    calls = 0
+    real_match = normalization_plan._label_tokens_match
+
+    def count_match(left: object, right: object) -> bool:
+        nonlocal calls
+        calls += 1
+        return real_match(left, right)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(normalization_plan, "_label_tokens_match", count_match)
+
+    assert tuple(
+        tuple(ordinal for ordinal, _token in index.matching(token)) for token in tokens
+    ) == tuple((ordinal,) for ordinal in range(width))
+    assert calls <= width * 2
+
+
+def test_numeric_subclass_labels_do_not_execute_hooks_or_alias_builtin_keys() -> None:
+    callbacks: list[str] = []
+
+    class ArmedInt(int):
+        armed = False
+
+        def __hash__(self) -> int:
+            if self.armed:
+                callbacks.append("hash")
+                raise AssertionError("numeric subclass hash executed")
+            return int.__hash__(self)
+
+        def __eq__(self, other: object) -> bool:
+            if self.armed:
+                callbacks.append("eq")
+                raise AssertionError("numeric subclass equality executed")
+            return int.__eq__(self, other)
+
+        def __str__(self) -> str:
+            if self.armed:
+                callbacks.append("str")
+                raise AssertionError("numeric subclass text executed")
+            return int.__str__(self)
+
+    label = ArmedInt(1)
+    sample = _sample((pa.array(["1"]),), (label,))
+    ArmedInt.armed = True
+
+    compiled = compile_normalization_plan(
+        sample,
+        _parse_plan(type_hints={1: "INTEGER"}, column_renames={1: "renamed"}),
+    )
+
+    assert compiled.columns[0].explicit_hint is None
+    assert compiled.final_display_names[0] != "renamed"
+    assert callbacks == []
+
+
+@pytest.mark.parametrize("tuple_wrapped", [False, True])
+def test_temporal_label_resolution_index_is_near_linear(
+    monkeypatch: pytest.MonkeyPatch,
+    tuple_wrapped: bool,
+) -> None:
+    width = 200
+    source_datetimes = tuple(
+        pd.Timestamp("2024-01-01", tz="UTC") + pd.Timedelta(minutes=ordinal)
+        for ordinal in range(width)
+    )
+    source_labels: tuple[object, ...]
+    config_labels: tuple[object, ...]
+    if tuple_wrapped:
+        source_labels = tuple(
+            (value, f"id-{ordinal}") for ordinal, value in enumerate(source_datetimes)
+        )
+        config_labels = tuple(
+            (
+                value.to_pydatetime(),
+                f"id-{ordinal}",
+            )
+            for ordinal, value in enumerate(source_datetimes)
+        )
+    else:
+        source_labels = source_datetimes
+        config_labels = tuple(value.to_pydatetime() for value in source_datetimes)
+    arrays = tuple(pa.array(["1"]) for _ in range(width))
+    calls = 0
+    real_match = normalization_plan._label_tokens_match
+
+    def count_match(left: object, right: object) -> bool:
+        nonlocal calls
+        calls += 1
+        return real_match(left, right)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(normalization_plan, "_label_tokens_match", count_match)
+    compiled = compile_normalization_plan(
+        _sample(arrays, source_labels),
+        _parse_plan(
+            type_hints=dict.fromkeys(config_labels, "INTEGER"),
+            column_renames={
+                label: f"renamed-{ordinal}" for ordinal, label in enumerate(config_labels)
+            },
+            drop_conditions=[{"column": label, "value": "never"} for label in config_labels],
+        ),
+    )
+
+    assert all(rule.explicit_hint == "INTEGER" for rule in compiled.columns)
+    assert compiled.final_display_names == tuple(f"renamed-{ordinal}" for ordinal in range(width))
+    assert calls < width * 20
+
+
+@pytest.mark.parametrize("label_kind", ["ordinary", "temporal"])
+def test_label_resolution_candidates_do_not_copy_the_full_shape_per_query(
+    label_kind: str,
+) -> None:
+    width = 128
+    raw_labels: tuple[object, ...]
+    if label_kind == "ordinary":
+        raw_labels = tuple(f"column-{ordinal}" for ordinal in range(width))
+    else:
+        origin = pd.Timestamp("2024-01-01", tz="UTC")
+        raw_labels = tuple(origin + pd.Timedelta(minutes=ordinal) for ordinal in range(width))
+    tokens = tuple(normalization_plan._display_label_token(label) for label in raw_labels)
+    index = normalization_plan._LabelResolutionIndex(tokens)
+    restriction_iterations = 0
+
+    class MeasuredOrdinals:
+        def __init__(self, values: set[int]) -> None:
+            self._values = frozenset(values)
+
+        def __iter__(self) -> Iterator[int]:
+            nonlocal restriction_iterations
+            for ordinal in self._values:
+                restriction_iterations += 1
+                yield ordinal
+
+        def __len__(self) -> int:
+            return len(self._values)
+
+        def __contains__(self, ordinal: object) -> bool:
+            return ordinal in self._values
+
+    index._shapes = {  # type: ignore[assignment]
+        key: MeasuredOrdinals(ordinals) for key, ordinals in index._shapes.items()
+    }
+    index._postings = {  # type: ignore[assignment]
+        key: MeasuredOrdinals(ordinals) for key, ordinals in index._postings.items()
+    }
+
+    assert tuple(index.candidate_ordinals(token) for token in tokens) == tuple(
+        (ordinal,) for ordinal in range(width)
+    )
+    assert restriction_iterations <= width * 8
+
+
+def test_pseudo_naive_zoneinfo_time_operand_matches_naive_arrow_time_without_hooks() -> None:
+    values = pa.array([time(9, 30), time(10, 0)], type=pa.time64("us"))
+    pseudo_naive = time(
+        9,
+        30,
+        tzinfo=ZoneInfo.no_cache("America/New_York"),
+    )
+    compiled = compile_normalization_plan(
+        _sample((values,), ("clock",)),
+        _parse_plan(
+            drop_conditions=[{"column": "clock", "value": pseudo_naive}],
+        ),
+    )
+    result = ArrowNormalizationOperation(compiled).normalize(
+        pa.record_batch([values], schema=compiled.input_schema)
+    )
+
+    assert compiled.drop_conditions[0].operands[0] is not None
+    assert result.column(0).to_pylist() == [time(10, 0)]
+
+    fixed_aware = compile_normalization_plan(
+        _sample((values,), ("clock",)),
+        _parse_plan(
+            drop_conditions=[{"column": "clock", "value": time(9, 30, tzinfo=ZoneInfo("UTC"))}],
+        ),
+    )
+    assert fixed_aware.drop_conditions[0].operands == (None,)
+
+
+# Task 12 final range/budget acceptance: structural traversal limits apply to
+# each independent top-level column, while retained bytes remain workbook-wide.
+
+
+@pytest.mark.parametrize(
+    "arrays",
+    [
+        pytest.param(
+            tuple(pa.array(["value"]) for _ in range(342)),
+            id="342-string-columns",
+        ),
+        pytest.param(
+            tuple(pa.array([1], type=pa.int64()) for _ in range(513)),
+            id="513-int-columns",
+        ),
+        pytest.param(
+            tuple(pa.nulls(1) for _ in range(1_025)),
+            id="1025-null-columns",
+        ),
+    ],
+)
+def test_physical_structural_budgets_reset_for_each_top_level_column(
+    arrays: tuple[pa.Array, ...],
+) -> None:
+    expected = sum(array.nbytes for array in arrays)
+
+    assert physical_buffers.unique_physical_buffer_bytes(arrays) >= expected
+
+
+def test_proleptic_day_projection_covers_pandas_extended_years() -> None:
+    assert normalization_plan._proleptic_days_from_civil(1, 1, 1) == (
+        date(1, 1, 1).toordinal() - date(1970, 1, 1).toordinal()
+    )
+    assert normalization_plan._proleptic_days_from_civil(1970, 1, 1) == 0
+    assert normalization_plan._proleptic_days_from_civil(9999, 12, 31) == (
+        date(9999, 12, 31).toordinal() - date(1970, 1, 1).toordinal()
+    )
+    assert normalization_plan._proleptic_days_from_civil(-1, 1, 1) == -719_893
+    assert normalization_plan._proleptic_days_from_civil(10_000, 1, 1) == 2_932_897

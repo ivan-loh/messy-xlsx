@@ -130,7 +130,7 @@ class StreamingTypeError(NormalizationError):
     _MAX_CONTEXT_TEXT = 160
     _MESSAGE = "streamed value is incompatible with the fixed schema"
     _STRUCTURAL_TEXT = re.compile(
-        r"^(?:str|bytes)(?: label)?\(length=\d+\)$|^(?:int|float|bool|date|datetime|time|unsupported value|non-string label)$"
+        r"^(?:str|bytes)(?: label)?\(length=\d+\)$|^(?:(?:int|float|bool) label|int|float|bool|date|datetime|time|timedelta|unsupported value|non-string label)$"
     )
 
     def __init__(

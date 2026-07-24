@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import atexit
 import io
 import os
 import tempfile
-from collections.abc import Iterator
+import weakref
+from collections import deque
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import TracebackType
@@ -25,6 +28,96 @@ from messy_xlsx._fallback_signals import (
 
 DEFAULT_MEMORY_LIMIT = 8 * 1024 * 1024
 COPY_CHUNK_SIZE = 1024 * 1024
+_MAX_ORPHAN_STORAGE_OWNERS = 64
+
+
+class _ReplayStorageOwner:
+    """Independent cleanup state that never retains its public spool."""
+
+    __slots__ = ("closed", "memory", "path")
+
+    def __init__(self, memory: bytes | None, path: Path | None) -> None:
+        self.memory = memory
+        self.path = path
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        path = self.path
+        if path is not None:
+            path.unlink(missing_ok=True)
+        self.path = None
+        self.memory = None
+        self.closed = True
+
+
+_ORPHAN_STORAGE_OWNERS: deque[_ReplayStorageOwner] = deque()
+
+
+def _queue_orphan_storage(owner: _ReplayStorageOwner) -> None:
+    """Retain a failed finalizer for one bounded retry on a later safe point."""
+    if owner.closed or any(candidate is owner for candidate in _ORPHAN_STORAGE_OWNERS):
+        return
+    if len(_ORPHAN_STORAGE_OWNERS) >= _MAX_ORPHAN_STORAGE_OWNERS:
+        _drain_orphan_storages()
+    if len(_ORPHAN_STORAGE_OWNERS) < _MAX_ORPHAN_STORAGE_OWNERS:
+        _ORPHAN_STORAGE_OWNERS.append(owner)
+
+
+def _drain_orphan_storages() -> None:
+    """Attempt every currently queued owner once; never retry in a loop."""
+    pending = tuple(_ORPHAN_STORAGE_OWNERS)
+    _ORPHAN_STORAGE_OWNERS.clear()
+    for owner in pending:
+        try:
+            owner.close()
+        except BaseException:
+            if len(_ORPHAN_STORAGE_OWNERS) < _MAX_ORPHAN_STORAGE_OWNERS:
+                _ORPHAN_STORAGE_OWNERS.append(owner)
+
+
+def _finalize_replay_storage(owner: _ReplayStorageOwner) -> None:
+    try:
+        owner.close()
+    except BaseException:
+        _queue_orphan_storage(owner)
+
+
+atexit.register(_drain_orphan_storages)
+
+
+def _adopter_owns(
+    adopter: Callable[[ReplaySpool], None] | None,
+    spool: ReplaySpool,
+) -> bool:
+    """Confirm an internal adoption without consulting the spool itself."""
+    owns = getattr(adopter, "owns", None)
+    return bool(owns(spool)) if callable(owns) else False
+
+
+def _register_adopter_cursor_restore(
+    adopter: Callable[[ReplaySpool], None] | None,
+    stream: BinaryIO,
+    entry: int,
+) -> bool:
+    """Transfer a cursor obligation to an adopter before moving the stream."""
+    register = getattr(adopter, "register_cursor_restore", None)
+    if not callable(register):
+        return False
+    register(stream, entry)
+    return True
+
+
+def _confirm_adopter_cursor_restore(
+    adopter: Callable[[ReplaySpool], None] | None,
+    stream: BinaryIO,
+    entry: int,
+) -> None:
+    """Tell an adopter that the transferred cursor obligation completed."""
+    confirm = getattr(adopter, "confirm_cursor_restore", None)
+    if callable(confirm):
+        confirm(stream, entry)
 
 
 class _SpoolStorageError(OSError):
@@ -58,7 +151,7 @@ def _cleanup_takes_precedence(
     primary_error: BaseException,
 ) -> bool:
     """Return whether source teardown must replace an operation failure."""
-    return _contains_process_failure(error, exclude=primary_error)
+    return bool(_contains_process_failure(error, exclude=primary_error))
 
 
 _CleanupWinner = tuple[BaseException, TracebackType | None]
@@ -162,22 +255,23 @@ def _cleanup_pending_spill(
 
 
 def _create_spill() -> tuple[Path, BinaryIO]:
+    descriptor_owner: int | None = None
+    raw_path: str | None = None
+    opened: BinaryIO | None = None
     try:
-        raw_descriptor, raw_path = tempfile.mkstemp(
+        descriptor_owner, raw_path = tempfile.mkstemp(
             prefix="messy-xlsx-",
             suffix=".spool",
         )
-    except OSError as error:
-        raise _storage_error(error) from error
-
-    descriptor_owner: int | None = raw_descriptor
-    opened: BinaryIO | None = None
-    try:
         os.chmod(raw_path, 0o600)
-        opened = cast(BinaryIO, os.fdopen(raw_descriptor, "wb"))
+        opened = cast(BinaryIO, os.fdopen(descriptor_owner, "wb"))
         descriptor_owner = None
         return Path(raw_path), opened
     except BaseException as error:
+        if raw_path is None:
+            if isinstance(error, OSError):
+                raise _storage_error(error) from error
+            raise
         if isinstance(error, OSError):
             storage_error = _storage_error(error)
             _cleanup_pending_spill(descriptor_owner, opened, raw_path, storage_error)
@@ -235,7 +329,7 @@ def _restore_position(
     entry: int,
     primary_error: BaseException | None,
     completed: ReplaySpool | None,
-) -> None:
+) -> bool:
     try:
         stream.seek(entry)
     except BaseException as restore_error:
@@ -260,7 +354,7 @@ def _restore_position(
                 primary_error,
                 f"cursor restoration also failed: {_type_name(restore_error)}",
             )
-            return
+            return False
         _mark_fallback_blocked(
             restore_error,
             _FallbackBlockReason.SOURCE_OWNERSHIP,
@@ -286,21 +380,40 @@ def _restore_position(
                     f"temporary spool cleanup also failed: {_type_name(cleanup_error)}",
                 )
         raise
+    return True
 
 
 class ReplaySpool:
     """Replay a complete source from bounded memory or a private temp path."""
 
     def __init__(self, memory: bytes | None, path: Path | None) -> None:
-        self._memory = memory
-        self._path = path
-        self._closed = False
+        _drain_orphan_storages()
+        self._storage = _ReplayStorageOwner(memory, path)
+        self._storage_finalizer = weakref.finalize(
+            self,
+            _finalize_replay_storage,
+            self._storage,
+        )
+
+    @property
+    def _memory(self) -> bytes | None:
+        return self._storage.memory
+
+    @property
+    def _path(self) -> Path | None:
+        return self._storage.path
+
+    @property
+    def _closed(self) -> bool:
+        return self._storage.closed
 
     @classmethod
     def from_stream(
         cls,
         stream: BinaryIO,
         memory_limit: int = DEFAULT_MEMORY_LIMIT,
+        *,
+        _adopter: Callable[[ReplaySpool], None] | None = None,
     ) -> ReplaySpool:
         """Copy *stream* once, restoring seekable caller cursor state."""
         try:
@@ -311,14 +424,58 @@ class ReplaySpool:
                 _FallbackBlockReason.SOURCE_OWNERSHIP,
             )
             raise
+        completed: ReplaySpool | None = None
+        adopted = False
+        restore_registered = False
+        primary_error: BaseException | None = None
+        try:
+            if seekable:
+                restore_registered = _register_adopter_cursor_restore(
+                    _adopter,
+                    stream,
+                    entry,
+                )
+                stream.seek(0)
+            completed = cls._copy_and_adopt(stream, memory_limit, _adopter)
+            adopted = _adopter_owns(_adopter, completed)
+        except BaseException as error:
+            primary_error = error
+            _mark_fallback_blocked(
+                error,
+                _FallbackBlockReason.SOURCE_OWNERSHIP,
+            )
+            if completed is not None:
+                adopted = _adopter_owns(_adopter, completed)
+                if not adopted:
+                    _cleanup_spill(None, completed._path, error)
+            raise
+        finally:
+            if seekable:
+                restored = _restore_position(
+                    stream,
+                    entry,
+                    primary_error,
+                    None if adopted else completed,
+                )
+                if restored and restore_registered:
+                    _confirm_adopter_cursor_restore(_adopter, stream, entry)
+
+        assert completed is not None
+        return completed
+
+    @classmethod
+    def _copy_and_adopt(
+        cls,
+        stream: BinaryIO,
+        memory_limit: int,
+        adopter: Callable[[ReplaySpool], None] | None,
+    ) -> ReplaySpool:
+        """Build a complete spool and transfer it before crossing a return gap."""
         buffer = bytearray()
         path: Path | None = None
         opened: BinaryIO | None = None
         completed: ReplaySpool | None = None
-        primary_error: BaseException | None = None
         try:
-            if seekable:
-                stream.seek(0)
             while True:
                 chunk = _coerce_bytes(stream.read(COPY_CHUNK_SIZE))
                 if not chunk:
@@ -336,20 +493,15 @@ class ReplaySpool:
                 _close_spill(opened)
                 opened = None
             completed = cls(bytes(buffer) if path is None else None, path)
+            if adopter is not None:
+                adopter(completed)
+                if not _adopter_owns(adopter, completed):
+                    raise RuntimeError("replay spool adopter did not confirm ownership")
+            return completed
         except BaseException as error:
-            primary_error = error
-            _mark_fallback_blocked(
-                error,
-                _FallbackBlockReason.SOURCE_OWNERSHIP,
-            )
-            _cleanup_spill(opened, path, error)
+            if completed is None or not _adopter_owns(adopter, completed):
+                _cleanup_spill(opened, path, error)
             raise
-        finally:
-            if seekable:
-                _restore_position(stream, entry, primary_error, completed)
-
-        assert completed is not None
-        return completed
 
     @contextmanager
     def open_binary(self) -> Iterator[BinaryIO]:
@@ -370,13 +522,9 @@ class ReplaySpool:
 
     def close(self) -> None:
         """Release memory and remove any spill path; repeated calls are safe."""
-        if self._closed:
-            return
-        if self._path is not None:
-            self._path.unlink(missing_ok=True)
-            self._path = None
-        self._memory = None
-        self._closed = True
+        _drain_orphan_storages()
+        self._storage.close()
+        self._storage_finalizer.detach()
 
     def _ensure_open(self) -> None:
         if self._closed:

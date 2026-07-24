@@ -21,6 +21,7 @@ from messy_xlsx.ooxml.models import (
     SheetManifest,
 )
 from messy_xlsx.parsing.parse_plan import ParsePlan
+from messy_xlsx.parsing.physical_values import decode_physical_value
 
 _MAX_EXCEL_ROW = 1_048_576
 _MAX_EXCEL_COLUMN = 16_384
@@ -84,6 +85,21 @@ class CoordinateBatch:
         return CoordinateBatch(
             batch=self.batch.slice(offset, length),
             row_numbers=self.row_numbers.slice(offset, length),
+            column_numbers=self.column_numbers,
+            column_identities=self.column_identities,
+        )
+
+    def detached(self) -> CoordinateBatch:
+        """Copy logical slices so retained batches do not pin larger parents."""
+        arrays = [pa.concat_arrays([array]) for array in self.batch.columns]
+        row_numbers = pa.concat_arrays([self.row_numbers])
+        return CoordinateBatch(
+            batch=_record_batch_preserving_rows(
+                arrays,
+                self.batch.schema.names,
+                self.batch.num_rows,
+            ),
+            row_numbers=row_numbers,
             column_numbers=self.column_numbers,
             column_identities=self.column_identities,
         )
@@ -158,6 +174,9 @@ class CoordinateTransform:
         self,
         plan: ParsePlan,
         prepared_schema: PreparedCoordinateSchema | None = None,
+        *,
+        execution_plan: ParsePlan | None = None,
+        projection_stop_row: int | None = None,
     ) -> CoordinateOperation:
         """Open fresh mutable state for one parse operation."""
         merge_output_types: dict[int, pa.DataType] | None = None
@@ -172,9 +191,10 @@ class CoordinateTransform:
                 raise CoordinateCompatibilityError("prepared coordinate schema is inconsistent")
         return CoordinateOperation(
             self,
-            plan,
+            execution_plan or plan,
             prepared_schema=prepared_schema,
             merge_output_types=merge_output_types,
+            projection_stop_row=projection_stop_row,
         )
 
 
@@ -378,6 +398,7 @@ class CoordinateOperation:
         "_next_range_row",
         "_plan",
         "_projection",
+        "_projection_stop_row",
         "_range_types",
         "_remaining_skip",
         "_template",
@@ -391,12 +412,18 @@ class CoordinateOperation:
         *,
         prepared_schema: PreparedCoordinateSchema | None = None,
         merge_output_types: dict[int, pa.DataType] | None = None,
+        projection_stop_row: int | None = None,
     ) -> None:
         self._transform = transform
         self._plan = plan
         self._merge_strategy = MergeStrategy(plan.merge_strategy)
         self._active_anchors: dict[MergeRange, pa.Scalar] = {}
         self._projection = self._parse_projection(plan.cell_range)
+        self._projection_stop_row = (
+            None
+            if self._projection is None
+            else (self._projection.max_row if projection_stop_row is None else projection_stop_row)
+        )
         self._merge_ranges = tuple(
             sorted(
                 (
@@ -419,7 +446,13 @@ class CoordinateOperation:
         self._merge_cursor = 0
         self._merge_output_types = dict(merge_output_types or {})
         self._active_merge_ranges: list[MergeRange] = []
-        self._next_range_row = self._projection.min_row if self._projection is not None else None
+        self._next_range_row = (
+            self._projection.min_row
+            if self._projection is not None
+            and self._projection_stop_row is not None
+            and self._projection_stop_row >= self._projection.min_row
+            else None
+        )
         self._range_types = (
             tuple(prepared_schema.output_schema.types)
             if prepared_schema is not None and self._projection is not None
@@ -593,16 +626,28 @@ class CoordinateOperation:
         self._finished = True
         return tuple(emitted)
 
+    def identity_snapshot(self) -> tuple[ColumnIdentity, ...]:
+        """Return identities known from bounded state without terminalizing it."""
+        if self._identities is not None:
+            return self._identities
+        if self._plan.header_rows == 0:
+            return self._generic_identities()
+        if self._buffered_rows < self._plan.header_rows:
+            return ()
+        return self._header_identities(self._peek_prefix(self._plan.header_rows))
+
     def _finish_projection(self) -> tuple[CoordinateBatch, ...]:
         if self._projection is None or self._next_range_row is None:
             return ()
-        if self._next_range_row > self._projection.max_row:
+        projection_stop_row = self._projection_stop_row
+        assert projection_stop_row is not None
+        if self._next_range_row > projection_stop_row:
             return ()
         result = self._null_range_batch(
             self._next_range_row,
-            self._projection.max_row,
+            projection_stop_row,
         )
-        self._next_range_row = self._projection.max_row + 1
+        self._next_range_row = projection_stop_row + 1
         return (result,)
 
     @classmethod
@@ -1143,6 +1188,8 @@ class CoordinateOperation:
         next_row = self._next_range_row
         assert projection is not None
         assert next_row is not None
+        projection_stop_row = self._projection_stop_row
+        assert projection_stop_row is not None
 
         requested_columns = projection.column_numbers
         position_by_column = {
@@ -1164,7 +1211,7 @@ class CoordinateOperation:
                 side="left",
             )
         )
-        stop = int(np.searchsorted(rows, projection.max_row, side="right"))
+        stop = int(np.searchsorted(rows, projection_stop_row, side="right"))
         if start >= stop:
             return ()
 
@@ -1291,20 +1338,22 @@ class CoordinateOperation:
         self._buffered_rows -= count
         return tuple(taken)
 
+    def _peek_prefix(self, count: int) -> tuple[CoordinateBatch, ...]:
+        peeked: list[CoordinateBatch] = []
+        remaining = count
+        for batch in self._buffer:
+            if remaining == 0:
+                break
+            take = min(remaining, batch.batch.num_rows)
+            peeked.append(batch.slice_rows(0, take))
+            remaining -= take
+        if remaining:
+            raise RuntimeError("coordinate identity snapshot exceeds buffered rows")
+        return tuple(peeked)
+
     @staticmethod
     def _detach_batch(batch: CoordinateBatch) -> CoordinateBatch:
-        arrays = [pa.concat_arrays([array]) for array in batch.batch.columns]
-        row_numbers = pa.concat_arrays([batch.row_numbers])
-        return CoordinateBatch(
-            batch=_record_batch_preserving_rows(
-                arrays,
-                batch.batch.schema.names,
-                batch.batch.num_rows,
-            ),
-            row_numbers=row_numbers,
-            column_numbers=batch.column_numbers,
-            column_identities=batch.column_identities,
-        )
+        return batch.detached()
 
     def _drop_tail(self, count: int) -> None:
         remaining = count
@@ -1335,7 +1384,7 @@ class CoordinateOperation:
         assert template is not None
         values_by_column = tuple(
             tuple(
-                batch.batch.column(column)[row].as_py()
+                decode_physical_value(batch.batch.column(column)[row].as_py())
                 for batch in header
                 for row in range(batch.batch.num_rows)
             )

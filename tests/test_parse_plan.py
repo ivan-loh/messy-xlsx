@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import openpyxl
 import pandas as pd
@@ -2404,3 +2405,302 @@ def test_every_sheet_config_field_has_an_explicit_parse_plan_disposition() -> No
 
     categorized = projected_or_consumed | compiler_controls | detection_only_or_deferred
     assert {field.name for field in fields(SheetConfig)} == categorized
+
+
+# Task 12 temporal follow-up: v0.10 accepted exact pandas temporals and exact
+# ZoneInfo-bearing stdlib temporals in label-keyed configuration.
+
+
+def test_parse_plan_freezes_and_thaws_pandas_temporals_and_zoneinfo() -> None:
+    zone = ZoneInfo.no_cache("America/New_York")
+    stdlib_datetime = datetime(2024, 11, 3, 1, 30, 0, 123456, tzinfo=zone, fold=1)
+    stdlib_time = time(1, 30, 0, 123456, tzinfo=zone, fold=1)
+    pandas_timestamp = pd.Timestamp(stdlib_datetime) + pd.Timedelta(nanoseconds=7)
+    pandas_duration = pd.Timedelta(days=2, microseconds=3, nanoseconds=5)
+    config = SheetConfig(
+        auto_detect=False,
+        type_hints={
+            pandas_timestamp: "TIMESTAMP",
+            pandas_duration: "TEXT",
+            stdlib_datetime: "TIMESTAMP",
+            stdlib_time: "TEXT",
+        },
+        column_renames={
+            pandas_timestamp: pandas_duration,
+            stdlib_datetime: stdlib_time,
+        },
+        drop_conditions=[
+            {"column": pandas_duration, "value": pandas_timestamp},
+            {"column": stdlib_time, "value": stdlib_datetime},
+        ],
+    )
+
+    plan = compile_parse_plan(config, None, "xlsx")
+
+    thawed_hints = plan.thaw_type_hint_items()
+    thawed_renames = plan.thaw_column_rename_items()
+    thawed_conditions = plan.thaw_drop_conditions()
+    thawed_timestamp = next(key for key, _value in thawed_hints if type(key) is pd.Timestamp)
+    thawed_duration = next(key for key, _value in thawed_hints if type(key) is pd.Timedelta)
+    thawed_datetime = next(key for key, _value in thawed_hints if type(key) is datetime)
+    thawed_time = next(key for key, _value in thawed_hints if type(key) is time)
+
+    assert thawed_timestamp == pandas_timestamp
+    assert thawed_timestamp.nanosecond == 7
+    assert thawed_timestamp.fold == 1
+    assert type(thawed_timestamp.tzinfo) is ZoneInfo
+    assert ZoneInfo.__dict__["key"].__get__(thawed_timestamp.tzinfo, ZoneInfo) == (
+        "America/New_York"
+    )
+    assert thawed_duration == pandas_duration
+    assert thawed_duration.nanoseconds == 5
+    assert thawed_datetime.replace(tzinfo=None) == stdlib_datetime.replace(tzinfo=None)
+    assert thawed_datetime.fold == 1
+    assert type(thawed_datetime.tzinfo) is ZoneInfo
+    assert thawed_time.replace(tzinfo=None) == stdlib_time.replace(tzinfo=None)
+    assert thawed_time.fold == 1
+    assert type(thawed_time.tzinfo) is ZoneInfo
+    assert {type(key) for key, _value in thawed_renames} == {
+        pd.Timestamp,
+        datetime,
+    }
+    assert {type(value) for _key, value in thawed_renames} == {
+        pd.Timedelta,
+        time,
+    }
+    assert [type(column) for column, _value in thawed_conditions] == [
+        pd.Timedelta,
+        time,
+    ]
+    assert [type(value) for _column, value in thawed_conditions] == [
+        pd.Timestamp,
+        datetime,
+    ]
+
+
+def test_parse_plan_round_trips_out_of_stdlib_range_pandas_temporals() -> None:
+    negative = pd.Timestamp(-62_198_755_200, unit="s")
+    future = pd.Timestamp(253_402_300_800, unit="s", tz=ZoneInfo("UTC"))
+    duration = pd.Timedelta(1, unit="ns")
+    config = SheetConfig(
+        auto_detect=False,
+        type_hints={negative: "TIMESTAMP", future: "TIMESTAMP"},
+        column_renames={negative: duration},
+        drop_conditions=[{"column": future, "value": duration}],
+    )
+
+    plan = compile_parse_plan(config, None, "xlsx")
+    thawed_hints = plan.thaw_type_hint_items()
+    thawed_renames = plan.thaw_column_rename_items()
+    thawed_conditions = plan.thaw_drop_conditions()
+
+    restored = [value for value, _hint in thawed_hints]
+    assert [(value.unit, int(value.asm8.view("i8"))) for value in restored] == [
+        ("s", -62_198_755_200),
+        ("s", 253_402_300_800),
+    ]
+    assert thawed_renames[0][1].unit == "ns"
+    assert int(thawed_renames[0][1].asm8.view("i8")) == 1
+    assert thawed_conditions[0][0].tzinfo == ZoneInfo("UTC")
+    assert int(thawed_conditions[0][0].asm8.view("i8")) == 253_402_300_800
+
+
+def test_parse_plan_identity_is_stable_across_exact_pandas_temporal_units() -> None:
+    timestamp_ns = pd.Timestamp(1_000_000_000, unit="ns")
+    timestamp_s = timestamp_ns.as_unit("s")
+    duration_ns = pd.Timedelta(1_000_000_000, unit="ns")
+    duration_s = duration_ns.as_unit("s")
+
+    first = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            column_renames={timestamp_ns: duration_ns},
+        ),
+        None,
+        "xlsx",
+    )
+    second = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            column_renames={timestamp_s: duration_s},
+        ),
+        None,
+        "xlsx",
+    )
+
+    assert first == second
+    assert hash(first) == hash(second)
+
+
+def test_parse_plan_rejects_hostile_pandas_timestamp_timezone_without_hooks() -> None:
+    callbacks: list[str] = []
+
+    class HostileTimezone(tzinfo):
+        armed = False
+
+        def _record(self, name: str) -> None:
+            if self.armed:
+                callbacks.append(name)
+                raise AssertionError("custom timezone hook executed")
+
+        def utcoffset(self, _value: datetime | None) -> timedelta | None:
+            self._record("utcoffset")
+            return timedelta(hours=8)
+
+        def dst(self, _value: datetime | None) -> timedelta | None:
+            self._record("dst")
+            return timedelta(0)
+
+        def tzname(self, _value: datetime | None) -> str | None:
+            self._record("tzname")
+            return "HOSTILE"
+
+    hostile_timezone = HostileTimezone()
+    timestamp = pd.Timestamp(datetime(2024, 1, 2, tzinfo=hostile_timezone))
+    config = SheetConfig(auto_detect=False, type_hints={timestamp: "TIMESTAMP"})
+    callbacks.clear()
+    hostile_timezone.armed = True
+
+    with pytest.raises(TypeError, match="unsupported mutable configuration value"):
+        compile_parse_plan(config, None, "xlsx")
+
+    assert callbacks == []
+
+
+def test_parse_plan_rejects_exact_timezone_with_hostile_payload_without_hooks() -> None:
+    callbacks: list[str] = []
+
+    class HostileDelta(timedelta):
+        armed = False
+
+        def __str__(self) -> str:
+            if self.armed:
+                callbacks.append("str")
+                raise AssertionError("offset text hook executed")
+            return timedelta.__str__(self)
+
+        def total_seconds(self) -> float:
+            if self.armed:
+                callbacks.append("total_seconds")
+                raise AssertionError("offset arithmetic hook executed")
+            return timedelta.total_seconds(self)
+
+    offset = HostileDelta(hours=8)
+    timestamp = pd.Timestamp(
+        datetime(2024, 1, 2, tzinfo=timezone(offset, "HOSTILE")),
+    )
+    config = SheetConfig(auto_detect=False, column_renames={timestamp: "when"})
+    callbacks.clear()
+    HostileDelta.armed = True
+
+    with pytest.raises(TypeError, match="unsupported mutable configuration value"):
+        compile_parse_plan(config, None, "xlsx")
+
+    assert callbacks == []
+
+
+def test_zoneinfo_identity_that_changes_dst_equality_changes_plan_identity() -> None:
+    left_zone = ZoneInfo.no_cache("America/New_York")
+    right_zone = ZoneInfo.no_cache("America/New_York")
+    left_key = datetime(2024, 11, 3, 1, 30, tzinfo=left_zone, fold=0)
+    right_key = datetime(2024, 11, 3, 1, 30, tzinfo=right_zone, fold=0)
+
+    left = compile_parse_plan(
+        SheetConfig(auto_detect=False, column_renames={left_key: "when"}),
+        None,
+        "xlsx",
+    )
+    right = compile_parse_plan(
+        SheetConfig(auto_detect=False, column_renames={right_key: "when"}),
+        None,
+        "xlsx",
+    )
+
+    assert left != right
+    assert hash(left) != hash(right)
+
+
+# Task 12 final acceptance: inert temporal sentinels and non-reflexive
+# configuration keys retain the exact v0.10 identity/equality contract.
+
+
+def test_zoneinfo_time_with_none_offset_thaws_with_pseudo_naive_semantics() -> None:
+    zone = ZoneInfo.no_cache("America/New_York")
+    pseudo_naive = time(9, 30, tzinfo=zone)
+    naive = time(9, 30)
+
+    assert ZoneInfo.utcoffset(zone, None) is None
+    pseudo_plan = compile_parse_plan(
+        SheetConfig(auto_detect=False, type_hints={pseudo_naive: "TEXT"}),
+        None,
+        "xlsx",
+    )
+    thawed, _hint = pseudo_plan.thaw_type_hint_items()[0]
+    assert type(thawed) is time
+    assert thawed == naive
+    assert type(thawed.tzinfo) is ZoneInfo
+    assert ZoneInfo.utcoffset(thawed.tzinfo, None) is None
+
+
+def test_parse_plan_preserves_nat_and_nested_nat_singleton() -> None:
+    nested = (pd.NaT, "nested")
+    plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={pd.NaT: "TEXT", nested: "INTEGER"},
+            column_renames={pd.NaT: nested},
+            drop_conditions=[{"column": nested, "value": pd.NaT}],
+        ),
+        None,
+        "xlsx",
+    )
+
+    thawed_hints = plan.thaw_type_hint_items()
+    thawed_renames = plan.thaw_column_rename_items()
+    thawed_conditions = plan.thaw_drop_conditions()
+
+    assert thawed_hints[0][0] is pd.NaT
+    assert thawed_hints[1][0][0] is pd.NaT
+    assert thawed_renames[0][0] is pd.NaT
+    assert thawed_renames[0][1][0] is pd.NaT
+    assert thawed_conditions[0][0][0] is pd.NaT
+    assert thawed_conditions[0][1] is pd.NaT
+
+
+@pytest.mark.parametrize("kind", ["float", "decimal", "complex"])
+def test_non_reflexive_config_keys_preserve_same_object_identity(
+    kind: str,
+) -> None:
+    if kind == "float":
+        first: object = float("nan")
+        second: object = float("nan")
+    elif kind == "decimal":
+        first = Decimal("NaN")
+        second = Decimal("NaN")
+    else:
+        first = complex(float("nan"), -0.0)
+        second = complex(float("nan"), -0.0)
+    first_plan = compile_parse_plan(
+        SheetConfig(
+            auto_detect=False,
+            type_hints={first: "TEXT"},
+            column_renames={first: "renamed"},
+            drop_conditions=[{"column": first, "value": first}],
+        ),
+        None,
+        "xlsx",
+    )
+    second_plan = compile_parse_plan(
+        SheetConfig(auto_detect=False, type_hints={second: "TEXT"}),
+        None,
+        "xlsx",
+    )
+
+    thawed_hint = first_plan.thaw_type_hint_items()[0][0]
+    thawed_rename = first_plan.thaw_column_rename_items()[0][0]
+    thawed_column, thawed_value = first_plan.thaw_drop_conditions()[0]
+    assert thawed_hint is first
+    assert thawed_rename is first
+    assert thawed_column is first
+    assert thawed_value is first
+    assert first_plan != second_plan
