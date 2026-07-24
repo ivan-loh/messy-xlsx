@@ -99,7 +99,7 @@
 | 10 | Openpyxl bounded-row OOXML reader | 8, 9 | [x] |
 | 11 | Streaming normalization and schema enforcement | 9, 10 | [x] |
 | 12 | Public Arrow, batch, and pandas-chunk APIs | 7, 9, 11 | [x] |
-| 13 | Unified multi-sheet planning and `SheetStream` | 5, 7, 12 | [ ] |
+| 13 | Unified multi-sheet planning and `SheetStream` | 5, 7, 12 | [x] |
 | 14 | CSV/TXT direct-stream and batch optimization | 3, 9, 11 | [ ] |
 | 15 | XLS streaming and custom registry compatibility | 6, 9, 12 | [ ] |
 | 16 | Legacy normalization copy reduction | 1, 7 | [ ] |
@@ -2750,7 +2750,7 @@ git commit -m "feat: expose Arrow and batch parsing APIs"
 - Produces: `SheetPlanner` shared by `to_dataframes()`, `iter_sheets()`, `MultiSheetParser`, `read_all_sheets()`, and `analyze_excel()`.
 - Produces: `MessyWorkbook.iter_sheets(config=None) -> SheetStream` in workbook order.
 
-- [ ] **Step 1: Write failing one-manifest, one-materialization, and error tests**
+- [x] **Step 1: Write failing one-manifest, one-materialization, and error tests**
 
 ```python
 # tests/test_multi_sheet_streaming.py
@@ -2805,7 +2805,7 @@ Run: `.venv/bin/pytest tests/test_multi_sheet_streaming.py -q`
 
 Expected: failures because `iter_sheets()` and multi-sheet metrics are incomplete.
 
-- [ ] **Step 2: Verify the frozen result invariant at the stream boundary**
+- [x] **Step 2: Verify the frozen result invariant at the stream boundary**
 
 ```python
 def _success(name: str, dataframe: pd.DataFrame) -> SheetResult:
@@ -2824,7 +2824,7 @@ def _failure(name: str, error: BaseException) -> SheetResult:
     )
 ```
 
-- [ ] **Step 3: Implement one shared sheet-planning pass**
+- [x] **Step 3: Implement one shared sheet-planning pass**
 
 `SheetPlanner` consumes one `ManifestReader`, bounded structure samples, `SheetConfig`, and optional `MultiSheetOptions`. It returns immutable per-sheet plans in workbook order. Apply explicit sheet lists and `sheet_filter` before full value reads. Preserve legacy pivot/empty/minimum-size decisions in `MultiSheetParser` characterization tests.
 
@@ -2851,17 +2851,17 @@ class SheetPlanner:
         return tuple(planned)
 ```
 
-- [ ] **Step 4: Implement `SheetStream` and warning-safe legacy adapters**
+- [x] **Step 4: Implement `SheetStream` and warning-safe legacy adapters**
 
 Close each sheet-local parser before yielding its materialized DataFrame. Convert ordinary per-sheet `Exception` failures into `SheetError`; close and propagate `MemoryError`, `KeyboardInterrupt`, and `SystemExit`. Make `read_all_sheets()` call the private shared plan and materialization methods so it emits one warning and performs no raw-then-final duplicate parse.
 
-- [ ] **Step 5: Run all multi-sheet and compatibility tests**
+- [x] **Step 5: Run all multi-sheet and compatibility tests**
 
 Run: `.venv/bin/pytest tests/test_multi_sheet_streaming.py tests/test_parsing/test_multi_sheet.py tests/test_parsing/test_multi_sheet_robustness.py tests/compatibility/test_legacy_warnings.py tests/compatibility/test_v010_contract.py -q`
 
 Expected: all tests pass; one manifest and one successful full materialization are recorded per selected sheet.
 
-- [ ] **Step 6: Commit unified multi-sheet planning**
+- [x] **Step 6: Commit unified multi-sheet planning**
 
 ```bash
 git add src/messy_xlsx/models.py src/messy_xlsx/workbook.py src/messy_xlsx/multi_sheet.py src/messy_xlsx/parsing/sheet_planner.py tests/test_multi_sheet_streaming.py tests/test_parsing/test_multi_sheet.py tests/test_parsing/test_multi_sheet_robustness.py
