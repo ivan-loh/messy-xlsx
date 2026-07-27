@@ -568,6 +568,11 @@ rows that might all be removed by later stages. `COMPLETE` pins the legacy
 empty, blank-only, header-only, duplicate/unnamed-header, all-bad, and
 all-footer schema or error behavior.
 
+When `skip_footer > 0`, reaching `target_data_rows` is not sufficient for
+`SAMPLE_FULL`: the evidence scanner continues to physical EOF or a hard budget
+so it can identify the true footer. Only `COMPLETE` is native-eligible in that
+mode.
+
 The full row pass starts from a fresh borrow on first iteration. Evidence
 never shares partially consumed tokenizer state with output.
 
@@ -1048,8 +1053,8 @@ The current uncommitted Task 14 work is classified as follows:
 4. Implement C-mode compatibility for headers, implicit indexes, short rows,
    NULs, quote junk, excess fields, warnings, and malformed fuzz cases.
 5. Implement Python-mode parsing order, physical-line skipping, quote errors,
-   footer retention, multi-header post-processing, accepted-row limits, and
-   deterministic memory counters.
+   footer retention, accepted-row limits, deterministic memory counters, and
+   the exact materialized routing decision for generated multi-headers.
 6. Add the pandas physical-value adapter and integrate native batches with the
    existing Arrow/normalization pipeline.
 7. Pass semantic, lifecycle, safety, bound, and performance gates while default
