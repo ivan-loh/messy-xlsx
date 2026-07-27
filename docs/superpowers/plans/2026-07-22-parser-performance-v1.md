@@ -2904,11 +2904,12 @@ git commit -m "refactor: unify multi-sheet planning"
   the internal native tokenizer only after all routing gates pass.
 - Produces: `NativeCSVTokenizer`, an internal Cython component with an exact
   API/version handshake and bounded evidence/full-pass contracts.
-- Produces: explicit `CSV_NATIVE` and `CSV_MATERIALIZED_FALLBACK` backend
-  metrics.
-- Preserves: exact `CSVHandler` behavior under `pandas==3.0.5`, using C-engine
-  semantics without a footer and Python-engine semantics with a footer, except
-  for the approved late path-decode streaming exception.
+- Produces: typed per-operation CSV execution decisions and reason counters for
+  native, built-in materialized fallback, and custom SPI execution.
+- Preserves: schema-compatible `CSVHandler` behavior under `pandas==3.0.5`,
+  using C-engine semantics without a footer and Python-engine semantics with a
+  footer, subject to the approved bounded stable-schema and late path-decode
+  streaming exceptions.
 - Preserves: materialized custom-registry authority and caller-stream
   ownership.
 
@@ -2943,23 +2944,31 @@ lifecycle for `skip_footer == 0`.
 - [ ] **Stage 4: Implement Python/footer semantic mode**
 
 Implement physical-line skipping, Python quote-error behavior, footer
-retention, multi-header post-processing, row limits, and deterministic
-`batch_size + skip_footer` counters.
+retention, row limits, and deterministic `batch_size + skip_footer` counters.
+Generated multi-header processing selects materialized fallback in v1.0.0 to
+preserve its whole-column pandas type-rendering contract.
 
-- [ ] **Stage 5: Integrate and gate production routing**
+- [ ] **Stage 5: Integrate with production routing disabled**
 
 Connect native physical values to the existing Arrow and normalization
-pipeline. Enable routing only after semantic, lifecycle, memory, safety, and
-performance gates pass.
+pipeline. Pass semantic, lifecycle, memory, safety, and performance gates while
+default production routing remains disabled.
 
-- [ ] **Stage 6: Build and verify release artifacts**
+- [ ] **Stage 6: Build and verify disabled candidate artifacts**
 
 Switch to the approved setuptools dual build modes. Build all native and
 universal wheels from one sdist, execute the complete platform/runtime matrix,
-audit artifacts, verify resolver/runtime selection, and merge the verified
-release set.
+audit artifacts, and verify the internal native adapter, ABI3 runtimes, and
+resolver/runtime selection while production routing remains disabled.
 
-- [ ] **Stage 7: Commit Task 14**
+- [ ] **Stage 7: Enable routing and rebuild final artifacts**
+
+Enable exact built-in native routing only after the candidate matrix passes.
+Build a new final sdist and all final wheels from that exact revision and rerun
+the complete artifact, public-routing, kill-switch, resolver, and runtime
+matrix. Only this second set is releasable.
+
+- [ ] **Stage 8: Commit Task 14**
 
 Commit only after independent compatibility, native-safety, packaging,
 performance, and whole-repository reviews are clean. Update the SDD ledger and

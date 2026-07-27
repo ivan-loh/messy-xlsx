@@ -21,21 +21,24 @@ thousands of short records before returning a one-row chunk. A Python
 `csv.reader` validator stays bounded but differs from pandas C behavior for
 malformed quotes, NUL bytes, CR-only input, and first-row implicit indexes.
 
-The selected solution is a focused Cython tokenizer that reproduces the exact
-`CSVHandler` contract under pandas 3.0.5 while enforcing literal streaming
-bounds. That contract is engine-dependent: it uses pandas C semantics when
-`skip_footer == 0` and pandas Python semantics when `skip_footer > 0`. Python
-continues to own source management, schema compilation, pandas-compatible
-physical value conversion, Arrow conversion, and public lifecycle behavior.
-Official platform wheels contain the native extension. If native execution is
-ineligible or unavailable before the full row pass begins, the operation uses
-the exact materialized pandas fallback.
+The selected solution is a focused Cython tokenizer that reproduces the
+`CSVHandler` structural parsing contract under pandas 3.0.5 while enforcing
+literal streaming bounds. That contract is engine-dependent: it uses pandas C
+semantics when `skip_footer == 0` and pandas Python semantics when
+`skip_footer > 0`. Python continues to own source management, schema
+compilation, pandas-compatible physical value conversion, Arrow conversion,
+and public lifecycle behavior. Official platform wheels contain the native
+extension. If native execution is ineligible or unavailable before the full
+row pass begins, the operation uses the exact materialized pandas fallback.
+The already-approved bounded stable-schema rule and the late path-decoding
+rule are the only native-streaming compatibility exceptions.
 
 ## Goals
 
 1. Preserve the existing public API and the materialized `CSVHandler` values,
-   physical scalar types, columns, warnings, and error classes, except for the
-   explicitly documented late path-decoding exception.
+   physical scalar types, columns, warnings, and error classes for
+   schema-compatible streams, subject only to the explicitly documented
+   bounded stable-schema and late path-decoding exceptions.
 2. Produce stable Arrow schemas before a public stream is returned.
 3. Yield at most `batch_size` accepted rows per public batch.
 4. Retain at most `batch_size + skip_footer` completed logical records, plus
@@ -61,8 +64,9 @@ the exact materialized pandas fallback.
 3. It will not expose a new public tokenizer API.
 4. It will not replace spreadsheet parsing, normalization, or source
    management.
-5. It will not switch from native to materialized parsing after consuming
-   source bytes or emitting output.
+5. It will not switch from native to materialized parsing after the full-pass
+   borrow begins or after emitting output. A restored bounded-evidence borrow
+   may select materialized fallback.
 6. It will not support free-threaded `cp313t` or `cp314t` builds in v1.0.0.
 7. It will not attempt to make arbitrarily large logical records consume
    constant bytes; one current record and retained footer records are inherent
@@ -80,8 +84,9 @@ the exact materialized pandas fallback.
 - Native build backend: `setuptools.build_meta`.
 - Native wheel builder: cibuildwheel.
 - No pandas, NumPy, or PyArrow headers in the extension.
-- No complete source `bytes`, decoded `str`, `StringIO`, or DataFrame copy in
-  the native streaming route.
+- No unbounded complete-source `bytes`, decoded `str`, `StringIO`, or DataFrame
+  copy in the native full pass. Bounded evidence may equal an entire small
+  source only while remaining inside every hard evidence budget.
 - No unbounded `read()` request against caller-owned streams.
 - A bounded evidence pass may select materialized fallback after restoring its
   borrow. No native-to-fallback transition is allowed after the full-pass
@@ -117,8 +122,10 @@ interpreter.
 SourceHandle
   ├─ capability selection
   ├─ bounded evidence borrow
-  │    ├─ COMPLETE or SAMPLE_FULL → compile stable schemas
-  │    └─ BUDGET_EXHAUSTED → restore borrow → materialized fallback
+  │    ├─ COMPLETE → compile stable schemas
+  │    ├─ eligible no-footer SAMPLE_FULL → compile stable schemas
+  │    └─ incomplete footer, any generated multi-header, unsupported evidence,
+  │         or BUDGET_EXHAUSTED → restore borrow → materialized fallback
   │
   └─ first public batch request
        └─ open full-pass borrow → bind NativeCSVTokenizer
@@ -206,7 +213,10 @@ class NativeEvidenceStatus(Enum):
 @dataclass(frozen=True, slots=True)
 class NativeEvidence:
     status: NativeEvidenceStatus
-    rows: tuple[tuple[str | None, ...], ...]
+    pandas_replay: NativeEvidenceReplay
+    raw_data_rows: tuple[tuple[str | None, ...], ...]
+    typed_data_rows: tuple[tuple[object, ...], ...]
+    column_names: tuple[Hashable, ...]
     physical_lines: tuple[int, ...]
     leading_index_fields: int
     parser_diagnostics: tuple["NativeCSVWarning", ...]
@@ -223,15 +233,37 @@ class ResolvedNativeCSVConfig:
     expected_fields: int
     leading_index_fields: int
     operation_max_rows: int | None
-    physical_types: tuple[PandasPhysicalType, ...]
+    value_converters: tuple[PandasValueConverter, ...]
     column_names: tuple[Hashable, ...]
     bad_line_policy: Literal["warn", "error"]
 ```
 
-`PandasPhysicalType` is an internal immutable descriptor whose `kind` is one
-of `"int64"`, `"uint64"`, `"float64"`, `"bool"`, `"str"`, or `"object"`,
-with a separate missing-value flag. It is derived from the pandas evidence
-DataFrame, not re-inferred by the native layer.
+`PandasValueConverter` is an internal immutable descriptor. Its value kind is
+one of `INT64`, `UINT64`, `FLOAT64`, `BOOL`, `TEXT`, `OBJECT_INTEGER`,
+`OBJECT_BOOLEAN`, or `OBJECT_TEXT`; its missing representation is one of
+`FLOAT_NAN`, `PANDAS_NA`, or `NONE`. Object columns whose nonmissing evidence
+contains heterogeneous scalar families are not assigned a lossy generic
+converter: they select materialized fallback before a public stream exists.
+Arbitrary-precision Python integers use `OBJECT_INTEGER`; boolean-with-missing
+uses `OBJECT_BOOLEAN`; object-backed text uses `OBJECT_TEXT`.
+
+The Python evidence adapter—not the native tokenizer—is the scalar authority.
+It gives pandas 3.0.5 a bounded replay of the exact original header, accepted
+sample records, and any retained footer records chosen by the native evidence
+scanner, then invokes the corresponding `CSVHandler` parsing/value kwargs
+while capturing warnings. The replay preserves original field bytes, quoting,
+and record terminators; it is not a reserialization of decoded field strings.
+For no-footer input this bounded pandas frame defines the approved stable
+streaming schema. Footer input requires the native scanner to reach EOF inside
+the work budgets so it can choose the true retained footer, but the replay
+still omits discarded middle records. Generated multi-header input always
+selects materialized fallback in v1.0.0 because its rendered names may depend
+on whole-column pandas inference. The adapter records both native raw lexemes
+and pandas-typed scalar rows, classifies each pandas `Series` and its nonmissing
+Python scalar families, and compiles exact converters. Unsupported pandas
+extension dtypes or heterogeneous object evidence also select materialized
+fallback. This removes any circular requirement to convert text before the
+authoritative typed sample exists.
 
 `requested_data_rows` is the existing normalization sample-row ceiling after
 applying the public `max_rows` limit. It may be zero. Once the named data width
@@ -241,12 +273,13 @@ hard work/retention budgets, not alternate sample targets. Construction
 rejects negative targets or limits.
 
 `scan_evidence(source, framing, limits)` returns a `NativeEvidenceStatus`,
-parsed evidence rows, physical-line metadata, parser outcomes, inferred-index
-evidence, and exact budget consumption. `SAMPLE_FULL` means the requested
-resolved `target_data_rows` accepted data sample was obtained without EOF after
-all header, row, malformed-record, and footer stages and after the column
-schema is fixed. `COMPLETE` means EOF was observed, even when it supplies fewer
-than `target_data_rows`.
+raw and pandas-typed data rows, final column names, physical-line metadata,
+parser outcomes, inferred-index evidence, and exact budget consumption.
+`SAMPLE_FULL` means the requested resolved
+`target_data_rows` accepted data sample was obtained without EOF after all
+header, row, malformed-record, and footer stages and after the column schema is
+fixed. `COMPLETE` means EOF was observed, even when it supplies fewer than
+`target_data_rows`.
 `BUDGET_EXHAUSTED` is not EOF and routes to materialized fallback after the
 evidence borrow is restored.
 
@@ -256,16 +289,29 @@ malformed, and footer rows may require more logical records; if exact evidence
 cannot be obtained inside all three budgets, the status is
 `BUDGET_EXHAUSTED`.
 
+`NativeEvidenceReplay` is an internal immutable sequence of original byte
+fragments plus stage metadata sufficient to present the selected header,
+sample, and footer records to pandas without changing their quoting or line
+endings. Its retained bytes count inside `max_payload_bytes`.
+
 `NativeEvidence` owns immutable Python copies independent of native buffers.
 `eof` is true only with `status == COMPLETE`; `SAMPLE_FULL` and
-`BUDGET_EXHAUSTED` are never presented as EOF. All counters are nonnegative
-and must not exceed the corresponding limit except that the single record
-which crosses a limit may be reported but is not returned as evidence.
+`BUDGET_EXHAUSTED` are never presented as EOF. Budget checks are incremental:
+before consuming the next decoded byte, creating the next cell, or retaining
+the next completed record, the scanner verifies the corresponding limit. It
+may return `BUDGET_EXHAUSTED` with an incomplete current record and need not
+find that record's terminator. Partial-record state is discarded; retained
+bytes, cells, and records never exceed their limits. Fixed-buffer prefetched
+but unread bytes are excluded from `payload_bytes_examined` and are neither
+decoded nor parsed. If `requested_data_rows > 0` but one complete data row
+cannot fit after width resolution, the result is `BUDGET_EXHAUSTED`, not a
+zero-row `SAMPLE_FULL`.
 
 Python constructs `CSVHeaderPlan` from `ParseOptions` and resolved metadata
-skipping before evidence. It then combines evidence with that plan to compile
-column names, sampled physical types, and `ResolvedNativeCSVConfig`. The
-tokenizer does not invent a simpler protected-record model.
+skipping before evidence. The Python evidence adapter then combines native
+structural evidence, its exact pandas frame, and that plan to compile column
+names, value converters, and `ResolvedNativeCSVConfig`. The tokenizer does not
+invent a simpler protected-record model.
 
 ### Native tokenizer
 
@@ -275,6 +321,12 @@ The internal interface is equivalent to:
 class NativeCSVTokenizer:
     def __init__(self, config: ResolvedNativeCSVConfig) -> None: ...
     def bind(self, source: BinaryIO) -> None: ...
+    @property
+    def debug_state(self) -> NativeDebugState: ...
+    def _set_debug_observer_for_tests(
+        self,
+        observer: Callable[[str, NativeDebugState], None] | None,
+    ) -> None: ...
     def read_batch(
         self,
         requested_rows: int,
@@ -286,30 +338,54 @@ class NativeCSVTokenizer:
 Preparation opens no full-pass borrow and never calls `bind()`. The first
 `read_batch()` enters the long-lived `SourceHandle` borrow, binds once, and
 begins reading. `requested_rows` must be positive. A call returns one through
-`requested_rows` rows, or zero rows only with `eof=True`. The separate
+`requested_rows` rows, or zero rows only with `done=True`. The separate
 `operation_max_rows` limit counts accepted rows over the complete operation.
+`operation_max_rows == 0` returns an already-complete reader and never opens or
+binds a full-pass borrow.
 
 `NativeCSVRead` contains independently owned column-major `list[str | None]`
-values, its row count, EOF state, and an immutable `NativeDebugState`. `None`
-means a structurally missing/padded field. Empty fields remain `""` until the
-Python value adapter applies pandas rules.
+values, its row count, `done`, `source_eof`, and an immutable
+`NativeDebugState`. `done` means the operation is complete because source EOF
+was observed or `operation_max_rows` was reached. `source_eof` reports only
+physical EOF. A final nonempty batch carries `done=True` when the operation
+limit is reached; without lookahead, a batch ending exactly at physical EOF may
+carry `done=False` until the next call observes EOF. `None` means a structurally
+missing/padded field. Empty fields remain `""` until the Python value adapter
+applies pandas rules.
 
 `NativeCSVWarning` is immutable and contains a kind (`"field_count"` or
 `"parser_error"`), one-based physical line, one-based logical record, optional
 expected/actual field counts, and the exact pandas-compatible warning message.
 `NativeDebugState` contains output rows, retained footer rows, current-record
 activity, unread buffer bytes, retained field-tokenized successor rows, and
-allocation bytes.
+logical payload-byte counters and allocation bytes. The read-only
+`debug_state` property is explicitly safe while `READING`, including when
+called reentrantly from a test source's `read()` method or the warning
+callback; all mutating/re-entrant methods remain forbidden. This provides a
+snapshot from inside every source-read and warning callback. The internal
+test-only observer receives immutable snapshots immediately before and after
+each Python callback and immediately before a public return. It defaults to
+`None`, is never used by production routing, and does not recursively observe
+its own invocation. An observer failure follows the ordinary callback-failure
+terminal path.
 
 The source protocol is exact: native code calls only `source.read(size)` with
 `1 <= size <= READ_BUFFER_CAPACITY`; accepts `bytes`, `bytearray`, or
-`memoryview`; accepts partial reads; treats a zero-length result as EOF; and
-never calls `seek`, `tell`, or `close`. Returned values own their Python
-objects independently of native buffers.
+one-dimensional C-contiguous byte-format `memoryview`; accepts partial reads;
+treats a zero-length result as EOF; rejects a result longer than `size` before
+copying; and never calls `seek`, `tell`, or `close`. Mutable or exported inputs
+are copied into owned fixed storage while the GIL is held before another
+callback or any `nogil` loop. Non-contiguous, multidimensional, or non-byte
+memoryviews raise a contextual source `TypeError`. Returned values own their
+Python objects independently of native buffers.
 
 `on_warning` is synchronous. This avoids an unbounded warning queue when many
 malformed records precede the next accepted row. A callback exception makes
-the tokenizer terminal and releases its native state during close.
+the tokenizer terminal and releases its native state during close. The adapter
+translates an ordinary warning-emission failure, including a `ParserWarning`
+promoted to an exception by the caller's warning filter, through the same
+contextual `FormatError` boundary as materialized `CSVHandler`; process
+failures propagate unchanged.
 
 ### Python native adapter
 
@@ -329,18 +405,24 @@ before the `SourceHandle` borrow restores the caller's entry cursor.
 
 ### Pandas-compatible value adapter
 
-`csv_value_adapter.py` receives the sampled pandas physical type for every
+`csv_value_adapter.py` receives the compiled `PandasValueConverter` for every
 named column. It first maps the union of pandas 3.0.5 default NA strings and
-configured `na_values` to missing values using exact string comparisons, then
-converts compatible lexemes to the sampled pandas scalar representation.
+configured `na_values` to the converter's missing representation using exact
+string comparisons, then converts compatible lexemes to the sampled pandas
+scalar representation.
 
 - Quoted and unquoted empty fields follow the pandas oracle.
 - Surrounding whitespace prevents a match unless the configured parsing
   behavior removes that whitespace.
 - Structurally missing short-row fields are already `None`.
-- Signed/unsigned integers, floats, booleans, strings/objects, and
-  missing-promoted numeric columns match pandas 3.0.5 physical scalars.
-- Header cells and discarded implicit-index fields bypass data conversion.
+- Signed/unsigned and arbitrary-precision integers, floats, booleans,
+  strings/object text, boolean-with-missing, and missing-promoted numeric
+  columns match the supported pandas 3.0.5 physical scalar families.
+- Actual named CSV header cells and discarded implicit-index fields bypass
+  data conversion.
+- Generated multi-header rows are ordinary pandas data rows before
+  `_generate_column_names`; they receive authoritative pandas physical
+  conversion before name rendering.
 - A later non-null lexeme incompatible with the fixed sampled type raises
   contextual `StreamingTypeError` at its absolute accepted-row offset.
 
@@ -348,6 +430,12 @@ Date inference, public normalization, all-null preservation, sanitization,
 Arrow encoding, and display-name decisions remain in the existing
 normalization pipeline. `normalize=False` receives the pandas-compatible
 physical scalars produced here.
+
+Bounded evidence deliberately fixes the physical schema before the stream is
+returned. A later incompatible lexeme raises `StreamingTypeError`; native
+streaming does not reproduce pandas whole-file late dtype widening or its
+associated `DtypeWarning`. This is the already-approved stable-schema
+compatibility exception from the parent parser-performance design.
 
 ## Tokenization contract
 
@@ -384,11 +472,14 @@ Mode-specific rules are normative:
   field-width validation follow the oracle order.
 - In Python mode, `pandas_skiprows` counts physical input lines and may bisect
   a multiline quoted record, exactly as pandas 3.0.5 does.
+- Implicit-index width is established by the first pandas-eligible data row
+  before `post_parse_skip_rows` and generated-header consumption, even when a
+  later stage removes that row.
 - In multi-header mode, footer and pandas row limits run before
   `post_parse_skip_rows` and `generated_header_rows`.
 - With `pandas_header_mode == "none"`, the first surviving row establishes
-  data width and remains output; header-based implicit-index inference is
-  disabled.
+  data width and remains in the data sequence; footer or row-limit stages may
+  still remove it. Header-based implicit-index inference is disabled.
 
 Critical oracle cases include:
 
@@ -432,6 +523,12 @@ At every native callback and public return:
 - the source cursor may be ahead only by unread bytes already fetched into the
   fixed buffer, and those bytes have caused no decoding or parser callback.
 
+`NativeDebugState` exposes exact logical ownership counters for
+`current_record_payload_bytes`, `footer_payload_bytes`,
+`output_payload_bytes`, and `undecoded_buffer_bytes`. Their sum is the native
+retained payload at that observation point. Returned output objects transfer
+ownership out of tokenizer state before the next observation.
+
 Byte memory is:
 
 ```text
@@ -446,16 +543,22 @@ O(
 It is independent of total source size. Records larger than the schema sample
 budget are valid in the full pass. A future plan may spool individual
 oversized records, but v1.0.0 retains the current record because the output
-must eventually represent its payload.
+must eventually represent its payload. `native_allocation_bytes` and measured
+process/Python peaks are report-only because Python object and allocator
+overhead is platform-dependent; acceptance asserts the exact logical
+row/buffer/payload ownership bounds rather than a fictitious cross-platform
+total-allocation formula.
 
 ## Sampling and stable schema
 
 Public streams still compile configuration and stable schemas before return.
 Native bounded evidence uses the same semantic-engine, header-plan, footer,
 blank, malformed, implicit-index, and physical-value rules as the full pass.
-It runs inside `NativeEvidenceLimits(max_records, max_payload_bytes,
+It runs inside
+`NativeEvidenceLimits(requested_data_rows, max_records, max_payload_bytes,
 max_cells)`. Footer lookahead bytes count toward every applicable budget. It
-does not create a complete source copy and never converts budget exhaustion
+does not create an unbounded source copy; a complete small-source replay is
+permitted only within every hard budget. It never converts budget exhaustion
 into synthetic EOF.
 
 If exact footer/header evidence cannot complete within all limits,
@@ -487,14 +590,20 @@ For `header_rows > 1`:
 
 - the pandas-equivalent pass uses `header=0` and `skiprows=0`;
 - pandas footer and row-limit behavior occurs first;
+- implicit-index inference occurs on the first pandas-eligible data row before
+  messy-xlsx post-processing;
 - only then does messy-xlsx apply `post_parse_skip_rows == options.skip_rows`;
-- the next `generated_header_rows == header_rows` accepted DataFrame rows are
-  consumed to generate names;
+- the next `generated_header_rows == header_rows` accepted, pandas-typed
+  DataFrame rows are consumed to generate names;
 - too few surviving rows preserves the current materialized exception instead
   of manufacturing an empty schema.
 
 The tokenizer and adapter keep these phases distinct. They do not convert
-generated multi-header rows into protected raw records.
+generated multi-header rows into protected raw records. Because pandas renders
+their values using physical types inferred from the whole column,
+`generated_header_rows > 0` selects materialized fallback in v1.0.0 rather than
+guessing column names. The engine-specific multi-header behavior remains in
+the differential oracle so a future bounded solution cannot weaken it.
 
 ## Row limits and footer order
 
@@ -523,7 +632,10 @@ When bounded path evidence selects the legacy Latin-1 fallback, the resolved
 configuration also selects the legacy fallback bad-line policy. The existing
 fallback reader omits `on_bad_lines="warn"`, so its default error behavior is
 part of the oracle rather than being silently normalized to the ordinary
-warning route.
+warning route. If that native full pass encounters a parser failure, the
+adapter raises the legacy terminal `FormatError("Cannot read CSV with any
+encoding")` with the established `attempted_formats` context and the native
+failure chained as its cause.
 
 The tokenizer may use Python incremental codecs internally for uncommon
 encodings. Common UTF-8, Latin-1, and UTF-16 paths may receive specialized
@@ -564,7 +676,7 @@ Failure translation is:
 | Evidence parser/decoder/I/O failure | Eager contextual `FormatError` before public return |
 | Full-pass parser/decoder/I/O failure | Lazy contextual `FormatError`, terminal |
 | Native warning event | Exact message via `pandas.errors.ParserWarning`, `stacklevel=3` |
-| Warning callback failure | Propagate callback exception, terminal |
+| Ordinary warning-emission callback failure | Contextual `FormatError` with the callback failure as cause, terminal |
 | Downstream physical incompatibility | Preserve contextual `StreamingTypeError` |
 | `MemoryError`, `KeyboardInterrupt`, `SystemExit`, or chained process failure | Propagate unchanged |
 | Cleanup failure during another failure | Preserve the active primary/process failure |
@@ -575,11 +687,58 @@ Merely prefetched, undecoded bytes cause no error or callback.
 `close()` is idempotent and releases native allocations on success, ordinary
 failure, process failure, downstream normalization failure, early close, and
 exhaustion. The tokenizer closes before the source borrow. A cursor-restoration
-failure prevents a batch from being returned, including an EOF-marked final
+failure prevents a batch from being returned, including a `done` final
 nonempty batch. The existing Task 13 weak ownership, finalizer, return-gap
 cleanup, and one-active-operation behavior remains authoritative.
 
+Task 13 cleanup precedence remains exact: a process-level cleanup failure
+replaces an ordinary primary failure; an ordinary cleanup failure never
+replaces an active primary; and an already-active process failure remains
+authoritative.
+
 ## Native selection and fallback
+
+Backend observation uses a typed decision separate from the existing
+format-level `ReaderDecision`:
+
+```python
+class CSVExecutionKind(Enum):
+    NATIVE = "csv_native"
+    MATERIALIZED_FALLBACK = "csv_materialized_fallback"
+    CUSTOM_SPI = "custom_dataframe"
+
+
+class CSVExecutionReason(Enum):
+    NATIVE_SELECTED = "native_selected"
+    CUSTOM_SPI = "custom_spi"
+    PRODUCTION_GATE_DISABLED = "production_gate_disabled"
+    KILL_SWITCH = "kill_switch"
+    UNSUPPORTED_RUNTIME = "unsupported_runtime"
+    IMPORT_OR_LOAD_FAILURE = "import_or_load_failure"
+    HANDSHAKE_MISMATCH = "handshake_mismatch"
+    EVIDENCE_BUDGET = "evidence_budget"
+    MULTI_HEADER_EXACTNESS = "multi_header_exactness"
+    UNSUPPORTED_EVIDENCE_TYPE = "unsupported_evidence_type"
+
+
+@dataclass(frozen=True, slots=True)
+class CSVExecutionDecision:
+    operation_id: int
+    kind: CSVExecutionKind
+    reason: CSVExecutionReason
+```
+
+Exactly one decision is recorded after capability routing and, when applicable,
+evidence routing, before a successful reader is returned. The reader retains
+its immutable decision.
+`ParseMetrics.last_csv_execution` is replaced on each successful CSV operation,
+and per-kind/per-reason counters are incremented, so sequential operations do
+not leave an ambiguous untyped string. A failed evidence parse increments the
+existing failure metric but returns no reader and records no execution
+decision. Custom registry execution preserves
+`ReaderDecision.backend == CUSTOM_DATAFRAME` and separately records
+`CSVExecutionKind.CUSTOM_SPI`; it never mislabels a custom handler as the
+built-in pandas fallback.
 
 Native eligibility is resolved in this order:
 
@@ -587,7 +746,9 @@ Native eligibility is resolved in this order:
    exact built-in `CSVHandler` must own the detected format. Any registry
    subclass, detector override, handler replacement/subclass, component
    mutation, or `parse` override selects the materialized compatibility SPI.
-2. `MESSY_XLSX_DISABLE_NATIVE` is read once for the operation.
+2. `MESSY_XLSX_DISABLE_NATIVE` is read once for the operation. Only the exact
+   string `"1"` disables native execution; all other and unset values are
+   treated as enabled.
 3. Runtime must be non-free-threaded CPython 3.11 through 3.14. This guard runs
    before importing the extension. Future CPython versions may install an ABI3
    wheel but execute its bundled materialized path.
@@ -606,8 +767,8 @@ Fallback behavior:
 - use the existing materialized pandas compatibility reader;
 - preserve values, dtypes, warnings, errors, and public API;
 - do not claim native streaming memory guarantees;
-- expose `CSV_NATIVE` or `CSV_MATERIALIZED_FALLBACK` and an exact reason through
-  backend metrics/debug state;
+- expose the typed execution decision and reason through the reader and
+  backend metrics;
 - allow deterministic selection with
   `MESSY_XLSX_DISABLE_NATIVE=1`.
 
@@ -649,21 +810,36 @@ PEP 660 editable installs default to native mode on supported CPython and fail
 closed. `MESSY_XLSX_BUILD_MODE=fallback` explicitly creates a fallback
 editable install. CI parses CSV and asserts backend selection for both modes.
 
-`cibuildwheel==4.1.1` uses `CIBW_BUILD=cp311-*` to produce:
+`cibuildwheel==4.1.1` uses `CIBW_BUILD=cp311-*` to compile ABI3 exactly once
+per platform/architecture. The build jobs are deterministic:
 
-- manylinux_2_17 and musllinux_1_2 x86-64/aarch64 `cp311-abi3` wheels;
-- macOS x86-64 with deployment target 10.13 and arm64 with target 11.0;
-- Windows x86-64 `cp311-abi3` wheels.
+- manylinux x86-64 runs on an x86-64 Linux runner with
+  `CIBW_ARCHS_LINUX=x86_64` and
+  `CIBW_MANYLINUX_X86_64_IMAGE=manylinux2014`;
+- manylinux aarch64 runs on a native arm64 Linux runner with
+  `CIBW_ARCHS_LINUX=aarch64` and
+  `CIBW_MANYLINUX_AARCH64_IMAGE=manylinux2014`;
+- musllinux x86-64 and aarch64 run on the corresponding native architecture
+  with explicit `musllinux_1_2` images;
+- macOS x86-64 uses deployment target 10.13 and macOS arm64 uses target 11.0
+  on native architecture runners;
+- Windows uses x86-64.
+
+These jobs produce manylinux_2_17 and musllinux_1_2 x86-64/aarch64, macOS
+x86-64/arm64, and Windows x86-64 `cp311-abi3` wheels.
 
 Free-threaded and all other architectures are excluded and use materialized
-fallback. ABI3 is built from CPython 3.11, then every wheel family is installed
-and exercised on CPython 3.11, 3.12, 3.13, and 3.14. Apple arm64 tests run on
-an Apple-silicon runner. No claimed combination may use `allow-empty` or an
-unreviewed `test-skip`.
+fallback. Cibuildwheel's build-environment test runs on CPython 3.11. Separate
+`abi3-smoke` jobs install the exact already-built artifact by path and exercise
+every applicable wheel family on CPython 3.12, 3.13, and 3.14; this verifies
+later ABI3 runtimes without rebuilding duplicate wheel filenames. Apple arm64
+tests run on an Apple-silicon runner. No claimed combination may use
+`allow-empty` or an unreviewed `test-skip`.
 
 The source distribution is built once and contains the `.pyx` source. Its
 isolated build installs Cython and requires a platform compiler. The universal
-fallback wheel provides compiler-free installation on unsupported systems.
+fallback wheel requires no compiler for messy-xlsx itself on unsupported
+systems; dependency wheels retain their own published platform requirements.
 
 Every native and fallback wheel is built from a clean extraction of that exact
 source archive. The release set contains exactly seven native wheels, one
@@ -674,11 +850,14 @@ wheel content and tag checks, `abi3audit==0.0.26 --strict`, `twine check`, and
 Smoke installations use direct artifact paths or an isolated
 `--no-index --find-links` wheelhouse outside the source tree.
 
-Native wheel smoke tests assert extension presence and active CSV parsing on
-all supported runtimes. Fallback wheel tests assert extension absence and
-automatic materialized parsing. Native wheels also test the runtime kill
-switch. Resolver/tag tests prove native preference on supported tags and the
-runtime guard on unsupported future CPython.
+Candidate native-wheel smoke tests assert extension presence and direct
+internal-adapter CSV parsing on all supported runtimes while the production
+gate remains disabled. Final native-wheel smoke tests repeat those assertions
+and require public built-in CSV operations to select native. Fallback wheel
+tests assert extension absence and automatic materialized parsing. Final native
+wheels also test the runtime kill switch. Resolver/tag tests prove native
+preference on supported tags and the runtime guard on unsupported future
+CPython.
 
 ## Verification strategy
 
@@ -688,7 +867,8 @@ Every semantic fixture compares the materialized `CSVHandler` and native
 tokenizer paths using `pandas==3.0.5` across public batch sizes 1, 2, 3, and
 127. Every NUL, quote, malformed, CR-only, blank, header, and implicit-index
 fixture runs once in C mode and once in Python/footer mode.
-Assertions cover values, columns, warnings, error class, and error context.
+For schema-compatible fixtures, assertions cover values, physical scalar
+families, columns, warnings, error class, and error context.
 
 The matrix includes:
 
@@ -713,17 +893,32 @@ The matrix includes:
   replacements/subclasses, and component mutation;
 - records larger than 8 MiB.
 
+Dedicated exception fixtures assert:
+
+- bounded-schema streams yield the successful schema-compatible prefix, then
+  raise `StreamingTypeError` at the first incompatible accepted-row offset
+  instead of reproducing whole-file widening or `DtypeWarning`;
+- a late strict path decode failure remains lazy and terminal instead of
+  restarting already-emitted rows as Latin-1;
+- warning-as-error filters become contextual `FormatError`;
+- `max_rows` completion before physical EOF, including zero;
+- object overflow, boolean-with-missing, and heterogeneous-evidence fallback;
+- header-none all-footer input, implicit-index establishment by a row removed
+  later, and generated multi-header type rendering.
+
 ### Differential fuzzing
 
 Hypothesis generates valid and malformed byte streams and randomized chunk
-splits. It compares accepted physical scalars, columns, warnings, physical
-line information, and error classes against pandas 3.0.5. C and Python modes
-each run at least 5,000 generated examples using fixed CI seeds
+splits. Schema-compatible cases compare accepted physical scalars, columns,
+warnings, physical line information, and error classes against pandas 3.0.5.
+C and Python modes each run at least 5,000 generated examples using fixed CI seeds
 `0x0C5A14` and `0xBADC5EED`. Every discovered mismatch is minimized and added
 to a checked-in byte-fixture regression corpus. Subprocess cases impose an
 explicit timeout so crashes and hangs leave durable reproducers. Native and
-materialized routes must agree, except for the documented late path-decode
-case, before production routing is enabled.
+materialized routes must agree for schema-compatible input before production
+routing is enabled. Generated late-incompatible cases separately assert the
+stable-prefix/first-`StreamingTypeError` contract; generated late path-decode
+cases separately assert the documented lazy exception.
 
 ### Lifecycle and failure tests
 
@@ -754,10 +949,17 @@ Debug state exposes:
 - `current_record_active`;
 - `undecoded_buffer_bytes`;
 - `field_tokenized_successor_rows`;
+- `current_record_payload_bytes`;
+- `footer_payload_bytes`;
+- `output_payload_bytes`;
 - `native_allocation_bytes`.
 
-Tests assert the invariants after every callback and batch return. These are
-architecture tests rather than timing-based proxies.
+Tests read the permitted snapshot accessor from source-read and warning
+callbacks and assert row, buffer, and logical payload invariants at every
+callback and batch return. `native_allocation_bytes` is reported and
+cross-checked against allocator hooks but is not treated as a portable
+Python-process memory formula. These are architecture tests rather than
+timing-based proxies.
 
 ### Performance tests
 
@@ -766,6 +968,12 @@ seed `0x0C5A14`. Each comparison performs three warmups and seven alternating
 measured runs, reports the median, and computes a geometric mean across
 corpora. The harness records Python, pandas, native API, compiler, platform,
 CPU, and build-mode metadata.
+
+Routing performance thresholds are authoritative on the project's dedicated
+Ubuntu 24.04 x86-64 benchmark runner, its pinned image/CPU identity, CPython
+3.12, and the installed manylinux native wheel. Results from other supported
+platforms are required release evidence but are corroborating rather than
+threshold-gating.
 
 Benchmarks cover:
 
@@ -789,14 +997,14 @@ Production routing requires:
 - no-footer geometric-mean slowdown at most 2.0 times direct pandas C;
 - footer geometric-mean speedup at least 4.0 times the retained Python
   streaming reference;
-- end-to-end native peak retained rows and bytes satisfying the deterministic
-  formulas for every corpus.
+- end-to-end native row, fixed-buffer, and logical payload ownership satisfying
+  the deterministic invariants for every corpus.
 
-End-to-end reports include throughput, peak retained rows, retained payload
-bytes, and source position at each public batch. Relative timings are recorded
-in the performance report. There is no automatic performance waiver: a miss
-keeps production routing disabled until the spec and user-approved plan are
-amended.
+End-to-end reports include throughput, peak retained rows, logical retained
+payload bytes, native allocation bytes, measured process/Python peak memory,
+and source position at each public batch. Relative timings are recorded in the
+performance report. There is no automatic performance waiver: a miss keeps
+production routing disabled until the spec and user-approved plan are amended.
 
 ## Supersession and migration
 
@@ -844,24 +1052,31 @@ The current uncommitted Task 14 work is classified as follows:
    deterministic memory counters.
 6. Add the pandas physical-value adapter and integrate native batches with the
    existing Arrow/normalization pipeline.
-7. Pass semantic, lifecycle, safety, bound, and performance gates; only then
-   enable exact built-in native routing.
-8. Complete native/fallback PEP 660 builds, exact-sdist dual wheel builds,
-   cibuildwheel matrices, wheel audits, smoke/resolver tests, and merged
-   release artifacts.
-9. Run full repository verification, independent native memory-safety review,
-   final compatibility review, and release readiness review.
+7. Pass semantic, lifecycle, safety, bound, and performance gates while default
+   production routing remains disabled.
+8. Complete candidate native/fallback PEP 660 builds, exact-sdist dual wheel
+   builds, cibuildwheel matrices, wheel audits, direct internal-adapter smoke,
+   ABI3 runtime smoke, and resolver tests with production routing disabled.
+9. Only after the candidate artifact matrix passes, enable exact built-in
+   native routing, build a new final sdist and all final wheels from that exact
+   revision, and rerun the complete artifact, public-routing, kill-switch,
+   resolver, and runtime matrix. Only this second verified set is releasable.
+10. Run full repository verification, independent native memory-safety review,
+    final compatibility review, and release readiness review.
 
 ## Acceptance criteria
 
 The design is complete when:
 
-1. Native and materialized outputs agree across the engine-specific oracle
-   matrix and differential fuzzing, except for the documented late path-decode
-   streaming exception.
+1. Native and materialized outputs agree across the schema-compatible
+   engine-specific oracle matrix and differential fuzzing; late incompatible
+   values and late path decoding satisfy their separately documented streaming
+   exception contracts.
 2. Every public native batch contains at most `batch_size` accepted rows.
-3. Deterministic counters prove output/footer/current-record/buffer/allocation
-   bounds and immediate stopping after the requested batch becomes releasable.
+3. Deterministic counters prove output/footer/current-record/fixed-buffer and
+   logical payload ownership bounds and immediate stopping after the requested
+   batch becomes releasable; platform-dependent allocation totals are measured
+   and reported.
 4. Late errors remain demand-driven and process failures remain unmasked.
 5. Caller streams are never closed and their exact entry cursors are restored.
 6. Custom registry handlers remain authoritative and materialized.
@@ -872,4 +1087,6 @@ The design is complete when:
    future-Python guards and the environment kill switch.
 10. Full tests, Ruff, formatting, mypy, security checks, docs, wheel smoke
    tests, and source-distribution smoke tests pass.
-11. All native safety and performance targets pass before production routing.
+11. All native safety, performance, and disabled candidate-wheel gates pass
+    before default production routing is enabled; the complete final-wheel
+    matrix passes again before release.
