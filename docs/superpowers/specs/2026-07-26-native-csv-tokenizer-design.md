@@ -1,6 +1,6 @@
 # Native CSV Tokenizer Design
 
-**Status:** Proposed revision pending final review
+**Status:** Independently reviewed; pending user approval
 
 **Date:** 2026-07-26
 
