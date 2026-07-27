@@ -2872,149 +2872,98 @@ git commit -m "refactor: unify multi-sheet planning"
 
 ### Task 14: Optimize CSV, TSV, and TXT Paths and Add Streaming Batches
 
+> **Superseded and expanded on 2026-07-27.** The pandas-chunk full-pass
+> implementation below was invalidated by adversarial review: pandas changes
+> malformed-row behavior at chunk boundaries and reads far beyond a public
+> batch. The normative design is now
+> `docs/superpowers/specs/2026-07-26-native-csv-tokenizer-design.md`.
+> After the revised design receives final approval, a dedicated implementation
+> plan must execute it before Task 14 can be marked complete.
+
 **Files:**
+- Create: `src/messy_xlsx/_csv_tokenizer.pyx`
+- Create: `src/messy_xlsx/parsing/csv_native.py`
+- Create: `src/messy_xlsx/parsing/csv_value_adapter.py`
 - Create: `src/messy_xlsx/parsing/csv_streaming.py`
+- Create: native oracle, ABI, safety, wheel, and benchmark tests defined by the
+  native-tokenizer implementation plan
 - Create: `tests/test_csv_streaming.py`
 - Modify: `src/messy_xlsx/parsing/csv_handler.py`
+- Modify: `src/messy_xlsx/parsing/csv_io.py` or move its reference
+  implementation under tests
+- Modify: `src/messy_xlsx/workbook.py`
+- Modify: `pyproject.toml`
+- Modify: `.github/workflows/test.yml`
+- Modify: `.github/workflows/publish.yml`
 - Modify: `tests/test_parsing/test_csv_handler.py`
 - Modify: `tests/test_edge_cases/test_csv_variations.py`
 - Modify: `tests/test_source_handle.py`
 
 **Interfaces:**
-- Produces: `CSVStreamingReader`, implementing `StreamingBatchReader` using pandas chunks.
-- Preserves: path, seekable stream, non-seekable spool, encoding, delimiter, metadata-row, header, footer, and malformed-row behavior.
+- Produces: `CSVStreamingReader`, implementing `StreamingBatchReader` through
+  the internal native tokenizer only after all routing gates pass.
+- Produces: `NativeCSVTokenizer`, an internal Cython component with an exact
+  API/version handshake and bounded evidence/full-pass contracts.
+- Produces: explicit `CSV_NATIVE` and `CSV_MATERIALIZED_FALLBACK` backend
+  metrics.
+- Preserves: exact `CSVHandler` behavior under `pandas==3.0.5`, using C-engine
+  semantics without a footer and Python-engine semantics with a footer, except
+  for the approved late path-decode streaming exception.
+- Preserves: materialized custom-registry authority and caller-stream
+  ownership.
 
-- [ ] **Step 1: Write failing direct-stream and footer tests**
+- [ ] **Stage 0: Prove the native ABI and safety shell**
 
-```python
-# tests/test_csv_streaming.py
-import io
+Build and execute the exact Cython extension type, typed memoryview,
+Python-source read, callback, allocation, reentrancy, and cleanup shell across
+all claimed platforms and CPython 3.11–3.14. Pass `abi3audit --strict`,
+ASan/UBSan, debug allocator, and allocation-failure gates before tokenizer
+implementation. If ABI3 fails, use reviewed per-minor native wheels.
 
-from messy_xlsx import MessyWorkbook, SheetConfig
+- [ ] **Stage 1: Freeze engine-specific materialized behavior**
 
+Add deterministic fixtures and differential fuzzing for both materialized
+branches, headers, multi-headers, skip rows, physical pandas scalar types,
+malformed rows, NUL/quote behavior, footer ordering, encodings, warnings,
+errors, and lifecycle.
 
-class NoUnboundedRead(io.BytesIO):
-    def read(self, size: int = -1) -> bytes:
-        assert size >= 0, "complete source read is forbidden"
-        return super().read(size)
+- [ ] **Stage 2: Implement bounded evidence and native routing shell**
 
+Implement evidence statuses, header plans, stable schema compilation,
+materialized fallback, exact built-in registry eligibility, backend metrics,
+the environment kill switch, and the native API/semantic handshake. Production
+native routing remains disabled.
 
-def test_seekable_csv_never_requests_an_unbounded_read() -> None:
-    source = NoUnboundedRead(b"name,amount\na,1\nb,2\n")
-    with MessyWorkbook(source, filename="data.csv") as workbook:
-        frame = workbook.to_dataframe()
-    assert frame.shape == (2, 2)
+- [ ] **Stage 3: Implement C semantic mode**
 
+Implement bounded decoding, framing, quoting, NUL/quote-junk behavior, implicit
+indexes, malformed rows, physical scalar conversion, and fixed-buffer
+lifecycle for `skip_footer == 0`.
 
-def test_csv_streaming_footer_buffer_drops_only_final_rows() -> None:
-    source = io.BytesIO(b"name,amount\na,1\nb,2\nfooter,x\n")
-    config = SheetConfig(auto_detect=False, skip_footer=1)
-    with MessyWorkbook(source, filename="data.csv") as workbook:
-        with workbook.iter_batches(batch_size=1, config=config) as stream:
-            values = [batch.column(0)[0].as_py() for batch in stream]
-    assert values == ["a", "b"]
-```
+- [ ] **Stage 4: Implement Python/footer semantic mode**
 
-Add a test comparing seekable-buffer and path outputs for normalized/raw parsing and cursor restoration.
+Implement physical-line skipping, Python quote-error behavior, footer
+retention, multi-header post-processing, row limits, and deterministic
+`batch_size + skip_footer` counters.
 
-Run: `.venv/bin/pytest tests/test_csv_streaming.py -q`
+- [ ] **Stage 5: Integrate and gate production routing**
 
-Expected: the unbounded-read assertion fails on the current byte-cache path.
+Connect native physical values to the existing Arrow and normalization
+pipeline. Enable routing only after semantic, lifecycle, memory, safety, and
+performance gates pass.
 
-- [ ] **Step 2: Detect from bounded prefixes and pass the borrowed binary stream to pandas**
+- [ ] **Stage 6: Build and verify release artifacts**
 
-Read at most 64 KiB for encoding and delimiter detection, rewind within the active borrow, then call `pd.read_csv(binary_stream, encoding=..., delimiter=...)`. Do not construct a complete decoded string or `StringIO`.
+Switch to the approved setuptools dual build modes. Build all native and
+universal wheels from one sdist, execute the complete platform/runtime matrix,
+audit artifacts, verify resolver/runtime selection, and merge the verified
+release set.
 
-```python
-def inspect_csv_prefix(source, configured_encoding=None):
-    with source.open_binary() as binary:
-        prefix = binary.read(64 * 1024)
-    encoding = detect_encoding(prefix, configured_encoding)
-    delimiter = detect_delimiter(prefix, encoding)
-    return encoding, delimiter
-```
+- [ ] **Stage 7: Commit Task 14**
 
-- [ ] **Step 3: Implement chunk conversion with a bounded footer deque**
-
-```python
-from contextlib import ExitStack
-
-import pandas as pd
-import pyarrow as pa
-
-
-class CSVStreamingReader:
-    def __init__(self, source, plan, normalization_plan, normalizer) -> None:
-        self._stack = ExitStack()
-        try:
-            binary = self._stack.enter_context(source.open_binary())
-            self._reader = pd.read_csv(
-                binary, chunksize=plan.batch_size, **plan.csv_kwargs
-            )
-            self._stack.callback(self._reader.close)
-        except BaseException:
-            self._stack.close()
-            raise
-        self._chunks = iter(self._reader)
-        self._pending = pd.DataFrame()
-        self._plan = plan
-        self._normalization_plan = normalization_plan
-        self._normalizer = normalizer
-        self._closed = False
-        self._batches = self._iter_batches()
-
-    @property
-    def schema(self) -> pa.Schema:
-        return self._normalization_plan.schema
-
-    def _iter_batches(self):
-        for frame in self._chunks:
-            combined = pd.concat((self._pending, frame), ignore_index=True)
-            footer = self._plan.skip_footer
-            if footer and len(combined) <= footer:
-                self._pending = combined
-                continue
-            released = combined if footer == 0 else combined.iloc[:-footer]
-            self._pending = combined.iloc[0:0] if footer == 0 else combined.iloc[-footer:]
-            table = pa.Table.from_pandas(
-                released,
-                schema=self._normalization_plan.schema,
-                preserve_index=False,
-                safe=True,
-            )
-            for batch in table.to_batches(max_chunksize=self._plan.batch_size):
-                yield self._normalizer.normalize(batch, self._normalization_plan)
-
-    def read_next_batch(self) -> pa.RecordBatch | None:
-        try:
-            return next(self._batches)
-        except StopIteration:
-            self.close()
-            return None
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._stack.close()
-```
-
-Translate safe conversion failures into `StreamingTypeError`. The pending footer
-frame is bounded by `skip_footer`; each combined frame is bounded by
-`batch_size + skip_footer`.
-
-- [ ] **Step 4: Run CSV, source, and compatibility suites**
-
-Run: `.venv/bin/pytest tests/test_csv_streaming.py tests/test_parsing/test_csv_handler.py tests/test_edge_cases/test_csv_variations.py tests/test_source_handle.py tests/compatibility/test_v010_contract.py -q`
-
-Expected: all text formats preserve v0.10.0 materialized output and stream without whole-text duplication.
-
-- [ ] **Step 5: Commit text streaming optimization**
-
-```bash
-git add src/messy_xlsx/parsing/csv_streaming.py src/messy_xlsx/parsing/csv_handler.py tests/test_csv_streaming.py tests/test_parsing/test_csv_handler.py tests/test_edge_cases/test_csv_variations.py tests/test_source_handle.py
-git commit -m "perf: stream CSV sources without text copies"
-```
+Commit only after independent compatibility, native-safety, packaging,
+performance, and whole-repository reviews are clean. Update the SDD ledger and
+Task 14 tracker in a separate documentation commit.
 
 ---
 
