@@ -47,7 +47,8 @@
 - `src/messy_xlsx/parsing/xlsx_materialized.py` — fastexcel materialized Arrow reader.
 - `src/messy_xlsx/parsing/legacy_adapter.py` — Arrow-to-pandas compatibility authority for existing APIs.
 - `src/messy_xlsx/parsing/xlsx_streaming.py` — openpyxl read-only Arrow batch reader.
-- `src/messy_xlsx/parsing/csv_streaming.py` — pandas-chunk CSV/TSV/TXT Arrow reader with footer buffering.
+- `src/messy_xlsx/parsing/csv_streaming.py` — bounded CSV/TSV/TXT inspection
+  and Arrow adapter shell; the full pass is the internal native reader.
 - `src/messy_xlsx/parsing/xls_streaming.py` — optional xlrd row-window Arrow reader.
 - `src/messy_xlsx/parsing/sheet_planner.py` — one sheet-selection and per-sheet configuration authority.
 - `src/messy_xlsx/normalization/plan.py` — immutable normalization schema and late-value policy.
@@ -2877,8 +2878,10 @@ git commit -m "refactor: unify multi-sheet planning"
 > malformed-row behavior at chunk boundaries and reads far beyond a public
 > batch. The normative design is now
 > `docs/superpowers/specs/2026-07-26-native-csv-tokenizer-design.md`.
-> After the revised design receives final approval, a dedicated implementation
-> plan must execute it before Task 14 can be marked complete.
+> The approved executable plan is
+> `docs/superpowers/plans/2026-07-28-native-csv-tokenizer.md`; it is the only
+> Task 14 implementation authority. Task 14 cannot be marked complete until
+> that plan's exact-SHA acceptance task passes.
 
 **Files:**
 - Create: `src/messy_xlsx/_csv_tokenizer.pyx`
@@ -2889,8 +2892,8 @@ git commit -m "refactor: unify multi-sheet planning"
   native-tokenizer implementation plan
 - Create: `tests/test_csv_streaming.py`
 - Modify: `src/messy_xlsx/parsing/csv_handler.py`
-- Modify: `src/messy_xlsx/parsing/csv_io.py` or move its reference
-  implementation under tests
+- Delete: `src/messy_xlsx/parsing/csv_io.py` after moving its retained probe
+  helpers into `csv_probe.py` and its reference implementation under tests
 - Modify: `src/messy_xlsx/workbook.py`
 - Modify: `pyproject.toml`
 - Modify: `.github/workflows/test.yml`
@@ -2900,8 +2903,8 @@ git commit -m "refactor: unify multi-sheet planning"
 - Modify: `tests/test_source_handle.py`
 
 **Interfaces:**
-- Produces: `CSVStreamingReader`, implementing `StreamingBatchReader` through
-  the internal native tokenizer only after all routing gates pass.
+- Produces: internal `NativeCSVReader`, implementing `StreamingBatchReader`
+  through the native tokenizer only after all routing gates pass.
 - Produces: `NativeCSVTokenizer`, an internal Cython component with an exact
   API/version handshake and bounded evidence/full-pass contracts.
 - Produces: typed per-operation CSV execution decisions and reason counters for
@@ -2952,7 +2955,9 @@ preserve its whole-column pandas type-rendering contract.
 - [ ] **Stage 5: Integrate with production routing disabled**
 
 Connect native physical values to the existing Arrow and normalization
-pipeline. Pass semantic, lifecycle, memory, safety, and performance gates while
+pipeline. Remove the pandas-chunk reader and installed Python
+framing/filter/footer full pass, retaining only test references and inspection
+probes. Pass semantic, lifecycle, memory, safety, and performance gates while
 default production routing remains disabled.
 
 - [ ] **Stage 6: Build and verify disabled candidate artifacts**
@@ -3692,7 +3697,9 @@ git commit -m "ci: gate parser performance against v0.10.0"
 
 **Interfaces:**
 - Publishes: documented legacy migration table, Arrow/stream examples, source ownership, formula boundary, streaming normalization boundary, custom-handler limits, security limits, and performance guidance.
-- Sets: package and module versions to `1.0.0`; release workflow continues to publish only the `v1.0.0` tag at the tip of `main` after all gates pass.
+- Verifies: package and module versions already equal `1.0.0`; release workflow
+  continues to publish only the `v1.0.0` tag at the tip of `main` after all
+  gates pass.
 
 - [ ] **Step 1: Write failing version/export/documentation smoke tests**
 
@@ -3707,11 +3714,12 @@ def test_v100_version_and_exports() -> None:
     } <= set(messy_xlsx.__all__)
 ```
 
-Add wheel/sdist smoke code that imports every new public name, reads an Arrow table, exhausts one batch stream, verifies a legacy warning under `warnings.simplefilter("error", LegacyAPIWarning)`, and checks the caller stream remains open/restored.
+Add wheel/sdist smoke code that imports every new public name, reads an Arrow table, exhausts one batch stream, verifies a legacy warning under `warnings.simplefilter("error", LegacyAPIWarning)`, and checks the caller stream remains open/restored. Add documentation/changelog assertions for every item in Step 2 and for the `v1.0.0` release section.
 
 Run: `.venv/bin/pytest tests/test_integration.py::test_v100_version_and_exports -q`
 
-Expected: failure because version metadata remains `0.10.0`.
+Expected: the version/export portion passes; the new documentation/changelog
+smoke assertions fail until Steps 2–3 update those files.
 
 - [ ] **Step 2: Update all public documentation**
 
@@ -3736,14 +3744,19 @@ exclude_docs: |
   superpowers/
 ```
 
-- [ ] **Step 3: Set version and changelog metadata**
+- [ ] **Step 3: Verify version and set changelog metadata**
 
-Set both `pyproject.toml` and `src/messy_xlsx/__init__.py` to `1.0.0`. Add `## [1.0.0] - 2026-07-22` to `CHANGELOG.md` with compatibility, performance, API, security, and migration notes. Keep `docs/changelog.md` including the canonical root changelog.
+Assert both `pyproject.toml` and `src/messy_xlsx/__init__.py` already equal
+`1.0.0`; do not create a second version transition. Add
+`## [1.0.0] - 2026-07-22` to `CHANGELOG.md` with compatibility, performance,
+API, security, and migration notes. Keep `docs/changelog.md` including the
+canonical root changelog.
 
 - [ ] **Step 4: Run the full local release gate**
 
-Add `build>=1.3` and `twine>=6.2` to the `dev` extra so the documented release
-gate is reproducible from `pip install -e '.[dev,docs,all]'`.
+Verify `build>=1.3`, `twine>=6.2`, and the pinned native-release tools are
+already present in the development configuration, then synchronize with
+`pip install -e '.[dev,docs,all]' -r requirements/native-release.txt`.
 
 Run: `.venv/bin/ruff check src/messy_xlsx tests scripts`
 
@@ -3765,13 +3778,10 @@ Run: `.venv/bin/mkdocs build --strict --site-dir /tmp/messy-xlsx-v100-site`
 
 Expected: documentation builds with no warnings or errors.
 
-Run: `.venv/bin/python -m build`
-
-Expected: wheel and source distribution build successfully.
-
-Run: `.venv/bin/twine check dist/*`
-
-Expected: wheel and source distribution build and both pass Twine validation.
+Run local fallback-source and native-wheel builds from separate clean
+extractions of one new source archive, followed by Twine and `abi3audit
+--strict`. These are local diagnostics; the committed release SHA owns the
+authoritative complete matrix in Step 7.
 
 - [ ] **Step 5: Smoke-test wheel and source distribution in clean environments**
 
@@ -3794,7 +3804,15 @@ Run: `gh workflow view test.yml`
 
 Run: `gh workflow view publish.yml`
 
-Expected: test workflow is valid and publish workflow requires a `v*` tag whose version matches package, module, changelog, and `main` tip.
+After an explicitly authorized branch push, run the complete final native
+artifact workflow on this exact release SHA.
+
+Expected: test/publish workflows are valid, and one source archive, seven
+native ABI3 wheels, and one universal fallback wheel build from that source
+archive and pass manifest, resolver, ABI, smoke, safety, performance, and
+provenance verification. No earlier candidate/final manifest may be reused
+after documentation/changelog changes. The publish workflow requires a `v*`
+tag whose version matches package, module, changelog, and `main` tip.
 
 Only after the branch is pushed, every required GitHub check passes, the paired benchmark artifact is accepted, and the user explicitly authorizes publication should execution create and push tag `v1.0.0`.
 
