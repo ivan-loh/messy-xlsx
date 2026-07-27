@@ -2932,8 +2932,9 @@ errors, and lifecycle.
 
 Implement evidence statuses, header plans, stable schema compilation,
 materialized fallback, exact built-in registry eligibility, backend metrics,
-the environment kill switch, and the native API/semantic handshake. Production
-native routing remains disabled.
+the exact production evidence budgets, the environment kill switch, and the
+native API/semantic handshake. The source-controlled production gate remains
+false.
 
 - [ ] **Stage 3: Implement C semantic mode**
 
@@ -2959,14 +2960,16 @@ default production routing remains disabled.
 Switch to the approved setuptools dual build modes. Build all native and
 universal wheels from one sdist, execute the complete platform/runtime matrix,
 audit artifacts, and verify the internal native adapter, ABI3 runtimes, and
-resolver/runtime selection while production routing remains disabled.
+resolver/runtime selection through the private candidate smoke seam while
+public production routing remains disabled.
 
 - [ ] **Stage 7: Enable routing and rebuild final artifacts**
 
-Enable exact built-in native routing only after the candidate matrix passes.
-Build a new final sdist and all final wheels from that exact revision and rerun
-the complete artifact, public-routing, kill-switch, resolver, and runtime
-matrix. Only this second set is releasable.
+After the candidate matrix passes, make the production-gate constant the only
+functional source change that enables exact built-in native routing. Build a
+new final sdist and all final wheels from that exact revision and rerun the
+complete artifact, public-routing, kill-switch, resolver, and runtime matrix.
+Only this second set is releasable.
 
 - [ ] **Stage 8: Commit Task 14**
 

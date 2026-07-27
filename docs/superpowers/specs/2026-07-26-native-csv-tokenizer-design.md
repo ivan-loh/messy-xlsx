@@ -174,9 +174,11 @@ class NativeSemanticEngine(Enum):
 @dataclass(frozen=True, slots=True)
 class NativeEvidenceLimits:
     requested_data_rows: int
-    max_records: int
-    max_payload_bytes: int
-    max_cells: int
+    max_records_examined: int
+    max_payload_bytes_examined: int
+    max_cells_examined: int
+    max_replay_bytes: int
+    max_retained_cells: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +226,8 @@ class NativeEvidence:
     records_examined: int
     payload_bytes_examined: int
     cells_examined: int
+    replay_bytes_retained: int
+    cells_retained: int
     eof: bool
 
 
@@ -265,12 +269,28 @@ extension dtypes or heterogeneous object evidence also select materialized
 fallback. This removes any circular requirement to convert text before the
 authoritative typed sample exists.
 
-`requested_data_rows` is the existing normalization sample-row ceiling after
-applying the public `max_rows` limit. It may be zero. Once the named data width
-is established, the scanner sets returned `target_data_rows` to the lesser of
-that ceiling and the rows that fit `max_cells`. The three `max_*` values are
-hard work/retention budgets, not alternate sample targets. Construction
-rejects negative targets or limits.
+Production limits are exact:
+
+```python
+NativeEvidenceLimits(
+    requested_data_rows=(
+        1_000 if operation_max_rows is None else min(1_000, operation_max_rows)
+    ),
+    max_records_examined=1_000_000,
+    max_payload_bytes_examined=256 * 1024**2,
+    max_cells_examined=16_000_000,
+    max_replay_bytes=8 * 1024**2,
+    max_retained_cells=1_000_000,
+)
+```
+
+For `operation_max_rows == 0`, `requested_data_rows` is zero. Once named data
+width is established, the scanner sets returned `target_data_rows` to the
+lesser of that request and the rows that fit `max_retained_cells`. The first
+three limits bound work performed while scanning; the final two independently
+bound retained original replay bytes and retained decoded cells. They are hard
+budgets, not alternate sample targets. Construction rejects negative targets
+or limits.
 
 `scan_evidence(source, framing, limits)` returns a `NativeEvidenceStatus`,
 raw and pandas-typed data rows, final column names, physical-line metadata,
@@ -286,26 +306,27 @@ evidence borrow is restored.
 Evidence callbacks collect diagnostics but emit no caller-visible warnings.
 Returned `target_data_rows` counts accepted post-header data rows. Header, blank,
 malformed, and footer rows may require more logical records; if exact evidence
-cannot be obtained inside all three budgets, the status is
+cannot be obtained inside every budget, the status is
 `BUDGET_EXHAUSTED`.
 
 `NativeEvidenceReplay` is an internal immutable sequence of original byte
 fragments plus stage metadata sufficient to present the selected header,
 sample, and footer records to pandas without changing their quoting or line
-endings. Its retained bytes count inside `max_payload_bytes`.
+endings. Its retained bytes count inside `max_replay_bytes`.
 
 `NativeEvidence` owns immutable Python copies independent of native buffers.
 `eof` is true only with `status == COMPLETE`; `SAMPLE_FULL` and
 `BUDGET_EXHAUSTED` are never presented as EOF. Budget checks are incremental:
-before consuming the next decoded byte, creating the next cell, or retaining
-the next completed record, the scanner verifies the corresponding limit. It
+before examining the next decoded byte, examining or retaining the next cell,
+retaining the next replay byte, or examining the next completed record, the
+scanner verifies the corresponding limit. It
 may return `BUDGET_EXHAUSTED` with an incomplete current record and need not
 find that record's terminator. Partial-record state is discarded; retained
-bytes, cells, and records never exceed their limits. Fixed-buffer prefetched
-but unread bytes are excluded from `payload_bytes_examined` and are neither
-decoded nor parsed. If `requested_data_rows > 0` but one complete data row
-cannot fit after width resolution, the result is `BUDGET_EXHAUSTED`, not a
-zero-row `SAMPLE_FULL`.
+replay bytes/cells and examined bytes/cells/records never exceed their
+respective limits. Fixed-buffer prefetched but unread bytes are excluded from
+`payload_bytes_examined` and are neither decoded nor parsed. If
+`requested_data_rows > 0` but one complete data row cannot fit after width
+resolution, the result is `BUDGET_EXHAUSTED`, not a zero-row `SAMPLE_FULL`.
 
 Python constructs `CSVHeaderPlan` from `ParseOptions` and resolved metadata
 skipping before evidence. The Python evidence adapter then combines native
@@ -421,8 +442,9 @@ scalar representation.
 - Actual named CSV header cells and discarded implicit-index fields bypass
   data conversion.
 - Generated multi-header rows are ordinary pandas data rows before
-  `_generate_column_names`; they receive authoritative pandas physical
-  conversion before name rendering.
+  `_generate_column_names`; in v1.0.0 the materialized `CSVHandler`, not the
+  native value adapter, performs their authoritative pandas physical conversion
+  and name rendering.
 - A later non-null lexeme incompatible with the fixed sampled type raises
   contextual `StreamingTypeError` at its absolute accepted-row offset.
 
@@ -555,8 +577,10 @@ Public streams still compile configuration and stable schemas before return.
 Native bounded evidence uses the same semantic-engine, header-plan, footer,
 blank, malformed, implicit-index, and physical-value rules as the full pass.
 It runs inside
-`NativeEvidenceLimits(requested_data_rows, max_records, max_payload_bytes,
-max_cells)`. Footer lookahead bytes count toward every applicable budget. It
+`NativeEvidenceLimits(requested_data_rows, max_records_examined,
+max_payload_bytes_examined, max_cells_examined, max_replay_bytes,
+max_retained_cells)`. Footer lookahead work and retained values count toward
+every applicable budget. It
 does not create an unbounded source copy; a complete small-source replay is
 permitted only within every hard budget. It never converts budget exhaustion
 into synthetic EOF.
@@ -633,14 +657,15 @@ This late path behavior is an explicit compatibility exception: materialized
 earlier bytes. A streaming reader cannot revise already emitted rows. The
 exception is documented for v1.0.0 and has dedicated compatibility tests.
 
-When bounded path evidence selects the legacy Latin-1 fallback, the resolved
-configuration also selects the legacy fallback bad-line policy. The existing
-fallback reader omits `on_bad_lines="warn"`, so its default error behavior is
-part of the oracle rather than being silently normalized to the ordinary
-warning route. If that native full pass encounters a parser failure, the
-adapter raises the legacy terminal `FormatError("Cannot read CSV with any
-encoding")` with the established `attempted_formats` context and the native
-failure chained as its cause.
+When bounded path evidence selects the legacy Latin-1 fallback, the recomputed
+evidence and resolved configuration also select the legacy fallback bad-line
+policy. The existing fallback reader omits `on_bad_lines="warn"`, so its
+default error behavior is part of the oracle rather than being silently
+normalized to the ordinary warning route. Any ordinary parser failure during
+recomputed fallback evidence, its pandas replay, or the native full pass raises
+the legacy terminal `FormatError("Cannot read CSV with any encoding")` with the
+established `attempted_formats` context and the parser failure chained as its
+cause. Process failures propagate unchanged.
 
 The tokenizer may use Python incremental codecs internally for uncommon
 encodings. Common UTF-8, Latin-1, and UTF-16 paths may receive specialized
@@ -680,6 +705,7 @@ Failure translation is:
 | Evidence budget exhaustion | Restore evidence borrow, then select materialized route |
 | Evidence parser/decoder/I/O failure | Eager contextual `FormatError` before public return |
 | Full-pass parser/decoder/I/O failure | Lazy contextual `FormatError`, terminal |
+| Parser failure after path fallback encoding was selected, in evidence/replay/full pass | Legacy `Cannot read CSV with any encoding` `FormatError` plus `attempted_formats`; process failures unchanged |
 | Native warning event | Exact message via `pandas.errors.ParserWarning`, `stacklevel=3` |
 | Ordinary warning-emission callback failure | Contextual `FormatError` with the callback failure as cause, terminal |
 | Downstream physical incompatibility | Preserve contextual `StreamingTypeError` |
@@ -745,19 +771,42 @@ decision. Custom registry execution preserves
 `CSVExecutionKind.CUSTOM_SPI`; it never mislabels a custom handler as the
 built-in pandas fallback.
 
+The production gate is a source-controlled internal constant in
+`csv_native.py`:
+
+```python
+_NATIVE_CSV_PRODUCTION_READY: Final[bool] = False  # candidate revision
+```
+
+The final enablement revision changes only this functional source line to
+`True`; documentation and generated release metadata may change separately.
+Candidate public built-in CSV operations therefore select
+`MATERIALIZED_FALLBACK/PRODUCTION_GATE_DISABLED`.
+
+Candidate artifact smoke uses only the private
+`csv_native._run_candidate_artifact_smoke(...)` entry point. Internally it
+passes a module-owned `_CANDIDATE_SMOKE_TOKEN` to the adapter constructor,
+rechecks exact built-in configuration, runtime, import, and handshake
+eligibility, bypasses only the production-ready constant, and never
+participates in workbook/public routing. It records `NATIVE/NATIVE_SELECTED` in
+its isolated test metrics. No environment variable or public selector can
+activate this bypass.
+
 Native eligibility is resolved in this order:
 
 1. The exact built-in `HandlerRegistry`, unchanged built-in components, and
    exact built-in `CSVHandler` must own the detected format. Any registry
    subclass, detector override, handler replacement/subclass, component
    mutation, or `parse` override selects the materialized compatibility SPI.
-2. `MESSY_XLSX_DISABLE_NATIVE` is read once for the operation. Only the exact
+2. `_NATIVE_CSV_PRODUCTION_READY` must be true; otherwise public execution
+   selects the materialized route with `PRODUCTION_GATE_DISABLED`.
+3. `MESSY_XLSX_DISABLE_NATIVE` is read once for the operation. Only the exact
    string `"1"` disables native execution; all other and unset values are
    treated as enabled.
-3. Runtime must be non-free-threaded CPython 3.11 through 3.14. This guard runs
+4. Runtime must be non-free-threaded CPython 3.11 through 3.14. This guard runs
    before importing the extension. Future CPython versions may install an ABI3
    wheel but execute its bundled materialized path.
-4. The extension must import and report
+5. The extension must import and report
    `NATIVE_API_VERSION == 1` and
    `PANDAS_SEMANTIC_VERSION == "3.0.5"`.
 
@@ -828,7 +877,7 @@ per platform/architecture. The build jobs are deterministic:
   with explicit `musllinux_1_2` images;
 - macOS x86-64 uses deployment target 10.13 and macOS arm64 uses target 11.0
   on native architecture runners;
-- Windows uses x86-64.
+- Windows sets `CIBW_ARCHS_WINDOWS=AMD64` and produces only x86-64.
 
 These jobs produce manylinux_2_17 and musllinux_1_2 x86-64/aarch64, macOS
 x86-64/arm64, and Windows x86-64 `cp311-abi3` wheels.
@@ -854,6 +903,13 @@ wheel content and tag checks, `abi3audit==0.0.26 --strict`, `twine check`, and
 `pip check`.
 Smoke installations use direct artifact paths or an isolated
 `--no-index --find-links` wheelhouse outside the source tree.
+
+Candidate and final outputs use separate immutable artifact namespaces because
+their filenames and version tags coincide. Manifests record the SHA-256 of
+each source archive and wheel; final jobs verify every final wheel was built
+from the final source archive and never merge a candidate artifact. Resolver
+tests also prove unsupported-platform and free-threaded tags select the
+universal fallback wheel.
 
 Candidate native-wheel smoke tests assert extension presence and direct
 internal-adapter CSV parsing on all supported runtimes while the production
@@ -906,6 +962,8 @@ Dedicated exception fixtures assert:
 - a late strict path decode failure remains lazy and terminal instead of
   restarting already-emitted rows as Latin-1;
 - warning-as-error filters become contextual `FormatError`;
+- a fallback-encoding parser failure during footer evidence/pandas replay uses
+  the legacy terminal message and `attempted_formats` context;
 - `max_rows` completion before physical EOF, including zero;
 - object overflow, boolean-with-missing, and heterogeneous-evidence fallback;
 - header-none all-footer input, implicit-index establishment by a row removed
@@ -990,6 +1048,16 @@ Benchmarks cover:
 - `batch_size=1`;
 - large logical records;
 - nonzero footer retention.
+
+Every generated corpus stays below 310,000 logical records, 48 MiB of examined
+payload, and 4.8 million examined cells. Its selected header/sample/footer
+replay stays below 2 MiB and 100,000 retained cells. The large logical record
+appears after the first 1,000 accepted data rows so it exercises full-pass
+growth rather than evidence fallback. The footer corpus uses
+`skip_footer == 10`, reaches EOF inside the same limits, and must record
+`CSVExecutionKind.NATIVE`. Every performance case asserts the native decision
+before timing; unexpected fallback invalidates the run instead of silently
+benchmarking materialization.
 
 No-footer tokenizer-only cases compare with direct pandas C. Footer cases
 compare with both the retained Python streaming reference implementation and
