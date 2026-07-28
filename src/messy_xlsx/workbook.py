@@ -2189,29 +2189,32 @@ class MessyWorkbook:
                 plan,
                 construction_owner=construction_owner,
             )
+        csv_execution: tuple[CSVExecutionKind, CSVExecutionReason] | None = None
         if decision.backend is BackendKind.CSV_STREAMING and self._uses_builtin_csv_planner():
             reason = csv_native.capability_reason()
             if reason is None:
-                self.parse_metrics.record_csv_execution(
+                csv_execution = (
                     CSVExecutionKind.NATIVE,
                     CSVExecutionReason.NATIVE_SELECTED,
                 )
-                return prepare_csv_streaming_reader(
+                prepared = prepare_csv_streaming_reader(
                     self._source_handle,
                     plan,
                     self.parse_metrics,
                     construction_owner=construction_owner,
                 )
-            self.parse_metrics.record_csv_execution(
+                self.parse_metrics.record_csv_execution(*csv_execution)
+                return prepared
+            csv_execution = (
                 CSVExecutionKind.MATERIALIZED_FALLBACK,
                 reason,
             )
 
-        if (
+        elif (
             decision.backend is BackendKind.CUSTOM_DATAFRAME
             and format_type in {"csv", "tsv", "txt"}
         ):
-            self.parse_metrics.record_csv_execution(
+            csv_execution = (
                 CSVExecutionKind.CUSTOM_SPI,
                 CSVExecutionReason.CUSTOM_SPI,
             )
@@ -2225,12 +2228,15 @@ class MessyWorkbook:
             if not has_custom_registry and format_type in {"xlsx", "xlsm", "xltx", "xltm"}
             else "1900"
         )
-        return prepare_materialized_streaming_reader(
+        prepared = prepare_materialized_streaming_reader(
             frame,
             plan,
             batch_size,
             date_system=date_system,
         )
+        if csv_execution is not None:
+            self.parse_metrics.record_csv_execution(*csv_execution)
+        return prepared
 
     def _prepare_ooxml_stream(
         self,

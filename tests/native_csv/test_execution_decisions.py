@@ -9,7 +9,7 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
-from messy_xlsx import MessyWorkbook
+from messy_xlsx import MessyWorkbook, SheetConfig
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
 
 
@@ -102,6 +102,13 @@ def custom_csv_registry() -> HandlerRegistry:
     return CustomCSVRegistry()
 
 
+def _assert_csv_execution_unrecorded(workbook: MessyWorkbook) -> None:
+    metrics = workbook.parse_metrics
+    assert metrics.csv_operation_sequence == 0
+    assert metrics.last_csv_execution is None
+    assert metrics.csv_execution_counts == {}
+
+
 def test_candidate_public_csv_route_is_materialized(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -130,6 +137,28 @@ def test_candidate_public_csv_route_is_materialized(
         )
 
 
+def test_candidate_reader_construction_failure_records_no_csv_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import messy_xlsx.workbook as workbook_module
+    from messy_xlsx.parsing import csv_native
+
+    def fail_reader_construction(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("candidate reader construction failed")
+
+    monkeypatch.setattr(csv_native, "_NATIVE_CSV_PRODUCTION_READY", False)
+    monkeypatch.setattr(
+        workbook_module,
+        "prepare_materialized_streaming_reader",
+        fail_reader_construction,
+    )
+
+    with MessyWorkbook(io.BytesIO(b"a\n1\n"), filename="candidate.csv") as workbook:
+        with pytest.raises(RuntimeError, match="candidate reader construction failed"):
+            workbook.iter_batches(config=SheetConfig(auto_detect=False))
+        _assert_csv_execution_unrecorded(workbook)
+
+
 def test_custom_csv_keeps_custom_backend_and_csv_decision(
     custom_csv_registry: HandlerRegistry,
 ) -> None:
@@ -147,3 +176,28 @@ def test_custom_csv_keeps_custom_backend_and_csv_decision(
             workbook.parse_metrics.last_csv_execution.reason
             is CSVExecutionReason.CUSTOM_SPI
         )
+
+
+def test_custom_reader_construction_failure_records_no_csv_decision(
+    custom_csv_registry: HandlerRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import messy_xlsx.workbook as workbook_module
+
+    def fail_reader_construction(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("custom reader construction failed")
+
+    monkeypatch.setattr(
+        workbook_module,
+        "prepare_materialized_streaming_reader",
+        fail_reader_construction,
+    )
+
+    with MessyWorkbook(
+        io.BytesIO(b"a\n1\n"),
+        filename="custom.csv",
+        registry=custom_csv_registry,
+    ) as workbook:
+        with pytest.raises(RuntimeError, match="custom reader construction failed"):
+            workbook.iter_batches(config=SheetConfig(auto_detect=False))
+        _assert_csv_execution_unrecorded(workbook)

@@ -770,7 +770,7 @@ def test_csv_prepare_return_interruption_closes_preowned_reader() -> None:
     assert workbook._active_operation_token is None
     assert workbook._active_stream is None
     assert source.tell() == 2
-    assert workbook.parse_metrics == _expected_native_metrics(sample_reads=1)
+    assert workbook.parse_metrics == ParseMetrics(sample_reads=1)
     with workbook.iter_batches(
         batch_size=1,
         config=SheetConfig(auto_detect=False),
@@ -948,7 +948,7 @@ def test_csv_sample_failure_is_counted_once_and_restores_cursor(
                 batch_size=1,
                 config=SheetConfig(auto_detect=False),
             )
-        assert workbook.parse_metrics == _expected_native_metrics(failed_attempts=1)
+        assert workbook.parse_metrics == ParseMetrics(failed_attempts=1)
         assert source.tell() == 3
     finally:
         workbook.close()
@@ -1807,7 +1807,7 @@ def test_csv_sample_process_failure_is_not_retried_as_encoding_fallback(
                 config=SheetConfig(auto_detect=False),
             )
         assert calls == 1
-        assert workbook.parse_metrics == _expected_native_metrics(failed_attempts=1)
+        assert workbook.parse_metrics == ParseMetrics(failed_attempts=1)
     finally:
         workbook.close()
 
