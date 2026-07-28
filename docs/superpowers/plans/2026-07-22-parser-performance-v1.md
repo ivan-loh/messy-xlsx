@@ -3905,6 +3905,11 @@ mx_release_run="$(
     --ledger "$mx_release_review_dir/final-run-ledger.json" \
     --workflow native-artifacts.yml
 )"
+mx_release_artifact_record="$mx_release_review_dir/final-artifact.json"
+"$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/verify_native_ci.py" collect-artifact \
+  --ledger "$mx_release_review_dir/final-run-ledger.json" \
+  --name "final-$mx_release_sha-release-set" \
+  --output "$mx_release_artifact_record"
 mx_release_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-native-release-set-$mx_release_sha-XXXXXX")"
 gh run download "$mx_release_run" \
   --name "final-$mx_release_sha-release-set" \
@@ -3914,6 +3919,7 @@ test -f "$mx_release_performance_report"
 "$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/release_artifacts.py" verify \
   --phase final \
   --revision "$mx_release_sha" \
+  --workflow-run-id "$mx_release_run" \
   --dist "$mx_release_download/release-set" \
   --manifest "$mx_release_download/final-manifest.json" \
   --performance-report "$mx_release_performance_report"
@@ -3927,6 +3933,7 @@ test -f "$mx_release_performance_report"
   --ledger "$mx_release_review_dir/final-run-ledger.json" \
   --manifest "$mx_release_download/final-manifest.json" \
   --performance-report "$mx_release_performance_report" \
+  --artifact-record "$mx_release_artifact_record" \
   --output "$mx_release_review_dir/final-acceptance.json"
 "$mx_release_venv/bin/twine" check "$mx_release_download"/release-set/*
 mx_release_sdist="$(find "$mx_release_download/release-set" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"

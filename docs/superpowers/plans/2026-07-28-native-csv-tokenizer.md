@@ -2162,7 +2162,8 @@ counters, source position at each batch, and a stable output hash. The
 authoritative report additionally contains exact `phase`, forty-character
 `revision`, installed native-wheel SHA-256, runner-image digest, runner CPU
 identity, `python_version == "3.12"`, `pandas_version == "3.0.5"`, and
-`thresholds_passed is True`; validation rejects any mismatch.
+`thresholds_passed is True`, top-level `workflow_run_id`, and expected
+aggregate artifact name; validation rejects any mismatch.
 
 The large logical record must appear after the first 1,000 accepted data rows.
 The footer corpus must use `skip_footer=10`, reach physical EOF within every
@@ -2403,12 +2404,16 @@ class PerformanceRecord(TypedDict):
     python_version: Literal["3.12"]
     pandas_version: Literal["3.0.5"]
     thresholds_passed: Literal[True]
+    workflow_run_id: int
+    aggregate_artifact_name: str
 
 
 class ReleaseManifest(TypedDict):
     schema_version: Literal[1]
     phase: Literal["candidate", "final"]
     revision: str
+    workflow_run_id: int
+    aggregate_artifact_name: str
     package_version: Literal["1.0.0"]
     sdist_sha256: str
     artifacts: list[ArtifactRecord]
@@ -2424,7 +2429,8 @@ record matrix and rejects a record whose phase, wheel hash, or expected
 candidate/final decision contract differs. The performance record must name
 the one authoritative phase/SHA-specific report, match its content hash,
 revision, phase, exact manylinux x86-64 wheel hash, pinned runner identity,
-Python/pandas versions, and successful thresholds.
+Python/pandas versions, successful thresholds, top-level workflow run ID, and
+aggregate artifact name.
 
 Each platform builder writes one provenance fragment with
 `record --phase --revision --sdist-sha256 --artifact --output`. Aggregation
@@ -2648,7 +2654,7 @@ Implement the workflow in three separate reviewed cycles:
 |---|---|---|---|
 | A — wheel jobs | `test_exact_seven_wheel_matrix`, `test_each_wheel_has_exact_runtime_smokes`, `test_builds_use_clean_exact_sdist` | source job plus seven exclusive wheel jobs and per-wheel smoke records | `pytest tests/packaging/test_workflow_contract.py -q -k "seven_wheel or runtime_smokes or exact_sdist"` |
 | B — aggregate provenance | `test_phase_is_source_derived`, `test_aggregate_requires_nine_all_smoke_and_performance_records`, `test_candidate_final_namespaces_are_disjoint` | transactional fragment/performance download, assemble, and static verify jobs | `pytest tests/packaging/test_workflow_contract.py -q -k "phase or aggregate or namespaces or performance"` |
-| C — orchestrator/run verification | `test_push_bootstrap_dispatch_call_and_nested_job_graph`, `test_exact_sha_run_ledger`, `test_acceptance_record_cross_binds_ledger_manifest_and_performance`, `test_test_workflow_requires_orchestrator` | one push-triggered/reusable top-level orchestrator, exact-SHA verifier/acceptance record, caller gate | `pytest tests/packaging/test_workflow_contract.py tests/packaging/test_ci_run_verifier.py -q` |
+| C — orchestrator/run verification | `test_push_bootstrap_dispatch_call_and_nested_job_graph`, `test_exact_sha_run_ledger`, `test_artifact_record_requires_exact_run_name_id_and_digest`, `test_acceptance_record_cross_binds_ledger_manifest_performance_and_artifact`, `test_test_workflow_requires_orchestrator` | one push-triggered/reusable top-level orchestrator, exact-SHA verifier/artifact/acceptance records, caller gate | `pytest tests/packaging/test_workflow_contract.py tests/packaging/test_ci_run_verifier.py -q` |
 
 Run packaging specification and workflow-security reviews after each cycle.
 
@@ -2675,9 +2681,29 @@ exact revision, top-level database ID/conclusion, and every required nested
 job name/conclusion. `print-revision --ledger PATH` emits only the validated
 forty-character revision; tests reject a malformed or internally inconsistent
 ledger. `accept --ledger PATH --manifest PATH --performance-report PATH
---output PATH` writes a versioned external acceptance record only when all
-three inputs agree on revision, phase, report hash, and run identity.
+--artifact-record PATH --output PATH` writes a versioned external acceptance
+record only when all four inputs agree on revision, phase, report hash,
+top-level run ID, and aggregate artifact name.
 `print-revision --acceptance PATH` validates that record and emits its SHA.
+
+The post-upload artifact record is exact:
+
+```python
+class WorkflowArtifactRecord(TypedDict):
+    workflow_run_id: int
+    artifact_id: int
+    name: str
+    digest: str
+    expired: Literal[False]
+```
+
+`collect-artifact --ledger PATH --name NAME --output PATH` queries the selected
+run's artifact API, requires exactly one unexpired artifact with that name and
+a `sha256:[0-9a-f]{64}` digest, and atomically writes this external record. The aggregate
+artifact digest cannot live inside its own manifest without a circular hash;
+the acceptance record binds that post-upload ID/digest to the manifest/report
+run ID and artifact name. Mixed same-SHA runs and altered artifact records are
+explicit rejection tests.
 
 - [ ] **Step 2: Run the red workflow contract**
 
@@ -2754,6 +2780,8 @@ Aggregation runs:
 python scripts/release_artifacts.py assemble \
   --phase "$ARTIFACT_PHASE" \
   --revision "$GITHUB_SHA" \
+  --workflow-run-id "$GITHUB_RUN_ID" \
+  --aggregate-artifact-name "$ARTIFACT_PHASE-$GITHUB_SHA-release-set" \
   --fragments incoming/fragments \
   --smoke-records incoming/smoke-records \
   --performance-report "incoming/performance/$ARTIFACT_PHASE-$GITHUB_SHA-native-csv-performance.json" \
@@ -2763,6 +2791,7 @@ python scripts/release_artifacts.py assemble \
 python scripts/release_artifacts.py verify \
   --phase "$ARTIFACT_PHASE" \
   --revision "$GITHUB_SHA" \
+  --workflow-run-id "$GITHUB_RUN_ID" \
   --dist release-set \
   --manifest "$ARTIFACT_PHASE-manifest.json" \
   --performance-report "incoming/performance/$ARTIFACT_PHASE-$GITHUB_SHA-native-csv-performance.json"
@@ -2798,7 +2827,8 @@ exact-SHA run, verifies the complete required nested job graph through `gh run
 view RUN_ID --json jobs`, and writes the immutable ledger. `print-run-id`
 reads that ledger and returns the selected top-level ID; `print-revision`
 returns the validated exact SHA from a ledger or acceptance record. `accept`
-atomically writes the cross-bound acceptance record outside the repository.
+atomically writes the ledger/manifest/report/artifact cross-bound acceptance
+record outside the repository.
 
 - [ ] **Step 6: Run and commit workflow contracts**
 
@@ -2891,6 +2921,11 @@ mx_candidate_run="$(
     --ledger "$mx_candidate_review_dir/candidate-run-ledger.json" \
     --workflow native-artifacts.yml
 )"
+mx_candidate_artifact_record="$mx_candidate_review_dir/candidate-artifact.json"
+.venv/bin/python scripts/verify_native_ci.py collect-artifact \
+  --ledger "$mx_candidate_review_dir/candidate-run-ledger.json" \
+  --name "candidate-$mx_candidate_sha-release-set" \
+  --output "$mx_candidate_artifact_record"
 mx_candidate_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-candidate-$mx_candidate_sha-XXXXXX")"
 gh run download "$mx_candidate_run" \
   --name "candidate-$mx_candidate_sha-release-set" \
@@ -2900,6 +2935,7 @@ test -f "$mx_candidate_performance"
 .venv/bin/python scripts/release_artifacts.py verify \
   --phase candidate \
   --revision "$mx_candidate_sha" \
+  --workflow-run-id "$mx_candidate_run" \
   --dist "$mx_candidate_download/release-set" \
   --manifest "$mx_candidate_download/candidate-manifest.json" \
   --performance-report "$mx_candidate_performance"
@@ -2914,6 +2950,7 @@ sha256sum "$mx_candidate_download/candidate-manifest.json" "$mx_candidate_perfor
   --ledger "$mx_candidate_review_dir/candidate-run-ledger.json" \
   --manifest "$mx_candidate_download/candidate-manifest.json" \
   --performance-report "$mx_candidate_performance" \
+  --artifact-record "$mx_candidate_artifact_record" \
   --output "$mx_candidate_review_dir/candidate-acceptance.json"
 ```
 
@@ -2925,10 +2962,11 @@ and benchmark report all verify.
 - [ ] **Step 4: Record the candidate acceptance checkpoint**
 
 Attach the one top-level workflow ID, its complete nested-job ledger, candidate
-manifest SHA-256, performance-report SHA-256, and local verification output to
-the external task review package. No source file or Git commit changes in this
-task. If any claimed ABI combination fails, stop and amend the approved design
-to per-minor wheels before tokenizer work continues.
+manifest SHA-256, performance-report SHA-256, aggregate artifact ID/digest,
+`candidate-acceptance.json`, and local verification output to the external task
+review package. No source file or Git commit changes in this task. If any
+claimed ABI combination fails, stop and amend the approved design to per-minor
+wheels before tokenizer work continues.
 
 ---
 
@@ -2972,6 +3010,11 @@ mx_candidate_run="$(
     --ledger "$mx_candidate_review_dir/candidate-run-ledger.json" \
     --workflow native-artifacts.yml
 )"
+mx_candidate_artifact_record="$mx_candidate_review_dir/candidate-artifact.json"
+.venv/bin/python scripts/verify_native_ci.py collect-artifact \
+  --ledger "$mx_candidate_review_dir/candidate-run-ledger.json" \
+  --name "candidate-$mx_candidate_sha-release-set" \
+  --output "$mx_candidate_artifact_record"
 mx_candidate_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-candidate-recheck-$mx_candidate_sha-XXXXXX")"
 gh run download "$mx_candidate_run" \
   --name "candidate-$mx_candidate_sha-release-set" \
@@ -2981,12 +3024,19 @@ test -f "$mx_candidate_performance"
 .venv/bin/python scripts/release_artifacts.py verify \
   --phase candidate \
   --revision "$mx_candidate_sha" \
+  --workflow-run-id "$mx_candidate_run" \
   --dist "$mx_candidate_download/release-set" \
   --manifest "$mx_candidate_download/candidate-manifest.json" \
   --performance-report "$mx_candidate_performance"
 .venv/bin/python scripts/run_native_csv_benchmarks.py \
   --phase candidate \
   --validate-report "$mx_candidate_performance"
+.venv/bin/python scripts/verify_native_ci.py accept \
+  --ledger "$mx_candidate_review_dir/candidate-run-ledger.json" \
+  --manifest "$mx_candidate_download/candidate-manifest.json" \
+  --performance-report "$mx_candidate_performance" \
+  --artifact-record "$mx_candidate_artifact_record" \
+  --output "$mx_candidate_review_dir/candidate-recheck-acceptance.json"
 ```
 
 Expected: the worktree is clean except intentionally untracked `CONTINUE.md`,
@@ -3065,6 +3115,11 @@ mx_final_artifact_run="$(
     --ledger "$mx_final_review_dir/final-run-ledger.json" \
     --workflow native-artifacts.yml
 )"
+mx_final_artifact_record="$mx_final_review_dir/final-artifact.json"
+.venv/bin/python scripts/verify_native_ci.py collect-artifact \
+  --ledger "$mx_final_review_dir/final-run-ledger.json" \
+  --name "final-$mx_final_sha-release-set" \
+  --output "$mx_final_artifact_record"
 mx_final_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-final-$mx_final_sha-XXXXXX")"
 gh run download "$mx_final_artifact_run" \
   --name "final-$mx_final_sha-release-set" \
@@ -3074,6 +3129,7 @@ test -f "$mx_final_performance"
 .venv/bin/python scripts/release_artifacts.py verify \
   --phase final \
   --revision "$mx_final_sha" \
+  --workflow-run-id "$mx_final_artifact_run" \
   --dist "$mx_final_download/release-set" \
   --manifest "$mx_final_download/final-manifest.json" \
   --performance-report "$mx_final_performance"
@@ -3084,6 +3140,12 @@ test -f "$mx_final_performance"
   --phase final \
   --validate-report "$mx_final_performance"
 sha256sum "$mx_final_download/final-manifest.json" "$mx_final_performance"
+.venv/bin/python scripts/verify_native_ci.py accept \
+  --ledger "$mx_final_review_dir/final-run-ledger.json" \
+  --manifest "$mx_final_download/final-manifest.json" \
+  --performance-report "$mx_final_performance" \
+  --artifact-record "$mx_final_artifact_record" \
+  --output "$mx_final_review_dir/final-acceptance.json"
 ```
 
 The authorized push starts the top-level final run. The verifier selects
@@ -3134,6 +3196,11 @@ mx_accept_run="$(
     --ledger "$mx_accept_review_dir/final-run-ledger.json" \
     --workflow native-artifacts.yml
 )"
+mx_accept_artifact_record="$mx_accept_review_dir/final-artifact.json"
+.venv/bin/python scripts/verify_native_ci.py collect-artifact \
+  --ledger "$mx_accept_review_dir/final-run-ledger.json" \
+  --name "final-$mx_accept_sha-release-set" \
+  --output "$mx_accept_artifact_record"
 mx_accept_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-final-accept-$mx_accept_sha-XXXXXX")"
 gh run download "$mx_accept_run" \
   --name "final-$mx_accept_sha-release-set" \
@@ -3143,6 +3210,7 @@ test -f "$mx_accept_performance"
 .venv/bin/python scripts/release_artifacts.py verify \
   --phase final \
   --revision "$mx_accept_sha" \
+  --workflow-run-id "$mx_accept_run" \
   --dist "$mx_accept_download/release-set" \
   --manifest "$mx_accept_download/final-manifest.json" \
   --performance-report "$mx_accept_performance"
@@ -3153,6 +3221,7 @@ test -f "$mx_accept_performance"
   --ledger "$mx_accept_review_dir/final-run-ledger.json" \
   --manifest "$mx_accept_download/final-manifest.json" \
   --performance-report "$mx_accept_performance" \
+  --artifact-record "$mx_accept_artifact_record" \
   --output "$mx_accept_review_dir/final-acceptance.json"
 ```
 
@@ -3273,6 +3342,11 @@ mx_accept_run="$(
     --ledger "$mx_accept_review_dir/final-run-ledger.json" \
     --workflow native-artifacts.yml
 )"
+mx_accept_artifact_record="$mx_accept_review_dir/final-artifact.json"
+"$mx_accept_venv/bin/python" "$mx_accept_exact_root/source/scripts/verify_native_ci.py" collect-artifact \
+  --ledger "$mx_accept_review_dir/final-run-ledger.json" \
+  --name "final-$mx_accept_sha-release-set" \
+  --output "$mx_accept_artifact_record"
 mx_accept_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-final-gates-$mx_accept_sha-XXXXXX")"
 gh run download "$mx_accept_run" \
   --name "final-$mx_accept_sha-release-set" \
@@ -3282,6 +3356,7 @@ test -f "$mx_accept_performance_report"
 "$mx_accept_venv/bin/python" "$mx_accept_exact_root/source/scripts/release_artifacts.py" verify \
   --phase final \
   --revision "$mx_accept_sha" \
+  --workflow-run-id "$mx_accept_run" \
   --dist "$mx_accept_download/release-set" \
   --manifest "$mx_accept_download/final-manifest.json" \
   --performance-report "$mx_accept_performance_report"
@@ -3291,6 +3366,12 @@ test -f "$mx_accept_performance_report"
 "$mx_accept_venv/bin/python" "$mx_accept_exact_root/source/scripts/run_native_csv_benchmarks.py" \
   --phase final \
   --validate-report "$mx_accept_performance_report"
+"$mx_accept_venv/bin/python" "$mx_accept_exact_root/source/scripts/verify_native_ci.py" accept \
+  --ledger "$mx_accept_review_dir/final-run-ledger.json" \
+  --manifest "$mx_accept_download/final-manifest.json" \
+  --performance-report "$mx_accept_performance_report" \
+  --artifact-record "$mx_accept_artifact_record" \
+  --output "$mx_accept_review_dir/final-acceptance.json"
 (
   cd "$mx_accept_exact_root/source"
   "$mx_accept_venv/bin/python" scripts/run_native_csv_fuzz.py \
@@ -3337,9 +3418,10 @@ Python full pass, no public API change, and no ownership/memory regression.
 Give each reviewer the approved design, this plan, the complete diff, focused
 and full test output, sanitizer/fuzz reports, performance JSON, candidate/final
 manifests, CI URLs, `final-acceptance.json`, and the exact-SHA workflow ledger.
-Each approval names that accepted revision. Resolve every blocker with a
-regression test and repeat the affected gate. Do not mark Task 14 complete on
-reviewer promises or partial CI.
+Include the post-upload artifact ID/digest record. Each approval names that
+accepted revision, workflow run ID, and artifact digest. Resolve every blocker
+with a regression test and repeat the affected gate. Do not mark Task 14
+complete on reviewer promises or partial CI.
 
 - [ ] **Step 6: Close the exact-SHA acceptance checkpoint without source changes**
 
