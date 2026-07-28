@@ -2920,16 +2920,21 @@ git commit -m "refactor: unify multi-sheet planning"
 
 Build and execute the exact Cython extension type, typed memoryview,
 Python-source read, callback, allocation, reentrancy, and cleanup shell across
-all claimed platforms and CPython 3.11–3.14. Pass `abi3audit --strict`,
-ASan/UBSan, debug allocator, and allocation-failure gates before tokenizer
-implementation. If ABI3 fails, use reviewed per-minor native wheels.
+all claimed platforms and CPython 3.11–3.14. Pass `abi3audit --strict` before
+tokenizer implementation. Run a shell-level sanitizer/debug smoke, but defer
+the complete semantic ASan/UBSan, debug-allocator, and allocation-failure
+matrix until the tokenizer and its test-owned allocation manifest exist. If
+ABI3 fails, use reviewed per-minor native wheels.
 
 - [ ] **Stage 1: Freeze engine-specific materialized behavior**
 
-Add deterministic fixtures and differential fuzzing for both materialized
-branches, headers, multi-headers, skip rows, physical pandas scalar types,
-malformed rows, NUL/quote behavior, footer ordering, encodings, warnings,
-errors, and lifecycle.
+Add deterministic fixtures and the fixed-seed fuzz generator/worker contract
+for both materialized branches before semantic implementation. Freeze headers,
+multi-headers, skip rows, physical pandas scalar types, malformed rows,
+NUL/quote behavior, footer ordering, encodings, warnings, errors, and
+lifecycle. Activate and run each engine's generated native differential subset
+as that semantic slice lands; run the complete 5,000-case-per-engine gate
+after both engines are implemented.
 
 - [ ] **Stage 2: Implement bounded evidence and native routing shell**
 
@@ -2974,13 +2979,18 @@ After the candidate matrix passes, make the production-gate constant the only
 functional source change that enables exact built-in native routing. Build a
 new final sdist and all final wheels from that exact revision and rerun the
 complete artifact, public-routing, kill-switch, resolver, and runtime matrix.
-Only this second set is releasable.
+This second set proves the implementation revision, but later
+README/changelog/release-metadata changes invalidate its hashes. Only parent
+Task 20's newly rebuilt and reverified final set from the exact
+post-documentation release SHA is releasable.
 
 - [ ] **Stage 8: Commit Task 14**
 
-Commit only after independent compatibility, native-safety, packaging,
-performance, and whole-repository reviews are clean. Update the SDD ledger and
-Task 14 tracker in a separate documentation commit.
+Close only after independent compatibility, native-safety, packaging,
+performance, and whole-repository reviews are clean. Record the checkpoint
+outside Git so the accepted final SHA remains unchanged; parent Task 20 folds
+the SDD ledger and Task 14 tracker update into its release-documentation commit
+and rebuilds the final artifact matrix on that exact new SHA.
 
 ---
 
@@ -3694,6 +3704,8 @@ git commit -m "ci: gate parser performance against v0.10.0"
 - Modify: `.github/workflows/test.yml`
 - Modify: `.github/workflows/publish.yml`
 - Modify: `tests/test_integration.py`
+- Create: `scripts/smoke_release_install.py`
+- Create: `tests/packaging/test_release_smoke_cli.py`
 
 **Interfaces:**
 - Publishes: documented legacy migration table, Arrow/stream examples, source ownership, formula boundary, streaming normalization boundary, custom-handler limits, security limits, and performance guidance.
@@ -3715,6 +3727,12 @@ def test_v100_version_and_exports() -> None:
 ```
 
 Add wheel/sdist smoke code that imports every new public name, reads an Arrow table, exhausts one batch stream, verifies a legacy warning under `warnings.simplefilter("error", LegacyAPIWarning)`, and checks the caller stream remains open/restored. Add documentation/changelog assertions for every item in Step 2 and for the `v1.0.0` release section.
+Implement those install checks in `scripts/smoke_release_install.py
+--artifact PATH`; its subprocess tests in
+`tests/packaging/test_release_smoke_cli.py` prove that it creates an isolated
+environment outside the repository, installs exactly the supplied wheel or
+sdist with `[all]`, runs `pip check`, and exercises the same behavior for both
+artifact kinds.
 
 Run: `.venv/bin/pytest tests/test_integration.py::test_v100_version_and_exports -q`
 
@@ -3755,8 +3773,12 @@ canonical root changelog.
 - [ ] **Step 4: Run the full local release gate**
 
 Verify `build>=1.3`, `twine>=6.2`, and the pinned native-release tools are
-already present in the development configuration, then synchronize with
-`pip install -e '.[dev,docs,all]' -r requirements/native-release.txt`.
+already present in the development configuration, then synchronize:
+
+```bash
+uv pip install --python .venv/bin/python -e ".[dev,docs,all]" -r requirements/native-release.txt
+.venv/bin/python -c "import build, twine; assert tuple(map(int, build.__version__.split('.')[:2])) >= (1, 3); assert tuple(map(int, twine.__version__.split('.')[:2])) >= (6, 2)"
+```
 
 Run: `.venv/bin/ruff check src/messy_xlsx tests scripts`
 
@@ -3778,19 +3800,57 @@ Run: `.venv/bin/mkdocs build --strict --site-dir /tmp/messy-xlsx-v100-site`
 
 Expected: documentation builds with no warnings or errors.
 
-Run local fallback-source and native-wheel builds from separate clean
-extractions of one new source archive, followed by Twine and `abi3audit
---strict`. These are local diagnostics; the committed release SHA owns the
-authoritative complete matrix in Step 7.
+Build local fallback and native artifacts from separate clean extractions of
+one new source archive:
+
+```bash
+mx_release_local_root="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-release-local-XXXXXX")"
+mkdir -p "$mx_release_local_root/sdist" "$mx_release_local_root/fallback-source" "$mx_release_local_root/native-source" "$mx_release_local_root/fallback" "$mx_release_local_root/native"
+MESSY_XLSX_BUILD_MODE=fallback .venv/bin/python -m build --sdist --outdir "$mx_release_local_root/sdist"
+tar -xzf "$mx_release_local_root"/sdist/*.tar.gz -C "$mx_release_local_root/fallback-source"
+tar -xzf "$mx_release_local_root"/sdist/*.tar.gz -C "$mx_release_local_root/native-source"
+mx_release_fallback_tree="$(find "$mx_release_local_root/fallback-source" -mindepth 1 -maxdepth 1 -type d)"
+mx_release_native_tree="$(find "$mx_release_local_root/native-source" -mindepth 1 -maxdepth 1 -type d)"
+(
+  cd "$mx_release_fallback_tree"
+  MESSY_XLSX_BUILD_MODE=fallback /home/ivan/Projects/messy-xlsx/.worktrees/parser-v1/.venv/bin/python -m build --wheel --outdir "$mx_release_local_root/fallback"
+)
+(
+  cd "$mx_release_native_tree"
+  MESSY_XLSX_BUILD_MODE=native /home/ivan/Projects/messy-xlsx/.worktrees/parser-v1/.venv/bin/python -m build --wheel --outdir "$mx_release_local_root/native"
+)
+.venv/bin/twine check "$mx_release_local_root"/sdist/* "$mx_release_local_root"/fallback/* "$mx_release_local_root"/native/*
+uvx --from abi3audit==0.0.26 abi3audit --strict "$mx_release_local_root"/native/*abi3*.whl
+```
+
+These are local diagnostics; the committed release SHA owns the authoritative
+complete matrix in Step 7.
 
 - [ ] **Step 5: Smoke-test wheel and source distribution in clean environments**
 
-Create separate temporary virtual environments, install the wheel with `[all]`, install the source distribution, run `pip check`, import all public names, parse `tests/samples/budget_vs_actuals.xlsx`, and validate the context-managed batch API. Expected: both artifacts pass identical smoke behavior.
+Create fresh local artifacts and smoke them through the tested CLI:
+
+```bash
+mx_release_smoke_root="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-release-smoke-XXXXXX")"
+mkdir -p "$mx_release_smoke_root/dist"
+MESSY_XLSX_BUILD_MODE=native .venv/bin/python -m build --sdist --wheel --outdir "$mx_release_smoke_root/dist"
+mx_release_smoke_wheel="$(find "$mx_release_smoke_root/dist" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+mx_release_smoke_sdist="$(find "$mx_release_smoke_root/dist" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+test -n "$mx_release_smoke_wheel"
+test -n "$mx_release_smoke_sdist"
+.venv/bin/pytest tests/packaging/test_release_smoke_cli.py -q
+.venv/bin/python scripts/smoke_release_install.py --artifact "$mx_release_smoke_wheel"
+.venv/bin/python scripts/smoke_release_install.py --artifact "$mx_release_smoke_sdist"
+```
+
+Expected: both isolated installs pass `pip check`, import every public name,
+parse `tests/samples/budget_vs_actuals.xlsx`, preserve the caller stream, emit
+the expected legacy warning, and pass the context-managed batch API.
 
 - [ ] **Step 6: Commit the v1.0.0 release candidate**
 
 ```bash
-git add README.md docs mkdocs.yml CHANGELOG.md pyproject.toml src/messy_xlsx/__init__.py .github/workflows tests/test_integration.py
+git add README.md docs mkdocs.yml CHANGELOG.md pyproject.toml src/messy_xlsx/__init__.py .github/workflows tests/test_integration.py scripts/smoke_release_install.py tests/packaging/test_release_smoke_cli.py
 git commit -m "release: prepare messy-xlsx v1.0.0"
 ```
 
@@ -3800,12 +3860,56 @@ Run: `git status --short --branch`
 
 Expected: clean branch with the release commit at `HEAD`.
 
-Run: `gh workflow view test.yml`
+Run:
 
-Run: `gh workflow view publish.yml`
+```bash
+gh workflow view test.yml
+gh workflow view publish.yml
+gh workflow view native-artifacts.yml
+```
 
-After an explicitly authorized branch push, run the complete final native
-artifact workflow on this exact release SHA.
+After an explicitly authorized branch push, dispatch and accept the single
+complete native artifact orchestrator on this exact release SHA:
+
+```bash
+mx_release_sha="$(git rev-parse HEAD)"
+mx_release_branch="$(git branch --show-current)"
+git fetch origin "$mx_release_branch"
+test "$(git rev-parse "origin/$mx_release_branch")" = "$mx_release_sha"
+gh workflow run native-artifacts.yml --ref "$mx_release_branch"
+mx_release_review_dir="${TMPDIR:-/tmp}/messy-xlsx-native-release-$mx_release_sha"
+mkdir -p "$mx_release_review_dir"
+.venv/bin/python scripts/verify_native_ci.py collect \
+  --revision "$mx_release_sha" \
+  --workflow native-artifacts.yml \
+  --output "$mx_release_review_dir/final-run-ledger.json"
+mx_release_run="$(
+  .venv/bin/python scripts/verify_native_ci.py print-run-id \
+    --ledger "$mx_release_review_dir/final-run-ledger.json" \
+    --workflow native-artifacts.yml
+)"
+mx_release_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-native-release-set-$mx_release_sha-XXXXXX")"
+gh run download "$mx_release_run" \
+  --name "final-$mx_release_sha-release-set" \
+  --dir "$mx_release_download"
+.venv/bin/python scripts/release_artifacts.py verify \
+  --phase final \
+  --revision "$mx_release_sha" \
+  --dist "$mx_release_download/release-set" \
+  --manifest "$mx_release_download/final-manifest.json"
+.venv/bin/python scripts/check_wheel_resolution.py \
+  --wheelhouse "$mx_release_download/release-set" \
+  --manifest "$mx_release_download/final-manifest.json"
+mx_release_performance_report="$(
+  find "$mx_release_download" -type f -name 'native-csv-performance.json' -print -quit
+)"
+test -n "$mx_release_performance_report"
+.venv/bin/python scripts/run_native_csv_benchmarks.py \
+  --phase final \
+  --validate-report "$mx_release_performance_report"
+.venv/bin/twine check "$mx_release_download"/release-set/*
+test "$(git rev-parse HEAD)" = "$mx_release_sha"
+```
 
 Expected: test/publish workflows are valid, and one source archive, seven
 native ABI3 wheels, and one universal fallback wheel build from that source

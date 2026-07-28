@@ -295,8 +295,10 @@ committing.
 - Create: `tests/packaging/test_build_support.py`
 - Create: `tests/packaging/test_build_modes.py`
 - Create: `tests/packaging/test_ci_run_verifier.py`
+- Create: `tests/native_csv/conftest.py`
 - Create: `tests/native_csv/test_abi_shell.py`
 - Create: `scripts/verify_native_ci.py`
+- Create: `scripts/run_native_csv_sanitizers.sh`
 - Create: `.github/workflows/native-abi.yml`
 - Modify: `pyproject.toml`
 - Modify: `.gitignore`
@@ -338,6 +340,7 @@ required matrix jobs must fail.
 Run:
 
 ```bash
+uv pip install --python .venv/bin/python "build>=1.3" wheel
 .venv/bin/pytest tests/packaging/test_build_support.py tests/packaging/test_build_modes.py tests/packaging/test_ci_run_verifier.py tests/native_csv/test_abi_shell.py -q
 ```
 
@@ -396,7 +399,14 @@ overflow checks, terminal state, and no-throw `__dealloc__`, without parsing
 CSV yet. `setup.py` hashes the `.pyx`, passes that value through Cython's
 compile-time environment, and the extension exposes it as
 `NATIVE_SOURCE_SHA256`. The autouse native-test fixture recomputes the hash and
-fails immediately if a stale installed extension is loaded.
+fails immediately if a stale installed extension is loaded. Put that fixture
+in `tests/native_csv/conftest.py` so every later native suite inherits it.
+
+Create the shell version of `scripts/run_native_csv_sanitizers.sh`. It builds
+the ABI shell in a fresh extraction with ASan/UBSan and runs only
+`test_abi_shell.py`, lifecycle construction/close loops, and the one initial
+allocation/reallocation fault path. Task 15 expands the same script to the full
+semantic suite and test-owned allocation manifest.
 
 - [ ] **Step 4: Build, audit, and test both modes locally**
 
@@ -406,19 +416,33 @@ Run:
 mx_abi_native="$(mktemp -d)"
 mx_abi_fallback="$(mktemp -d)"
 mx_abi_sdist="$(mktemp -d)"
+mx_abi_native_source="$(mktemp -d)"
+mx_abi_fallback_source="$(mktemp -d)"
 uv pip install --python .venv/bin/python -e ".[dev]" -r requirements/native-release.txt
 MESSY_XLSX_BUILD_MODE=native uv pip install --python .venv/bin/python --no-deps --reinstall -e .
 .venv/bin/pytest tests/packaging/test_build_support.py tests/packaging/test_build_modes.py tests/packaging/test_ci_run_verifier.py tests/native_csv/test_abi_shell.py -q
-MESSY_XLSX_BUILD_MODE=native .venv/bin/python -m build --wheel --outdir "$mx_abi_native"
-uvx --from abi3audit==0.0.26 abi3audit --strict "$mx_abi_native"/*abi3*.whl
-MESSY_XLSX_BUILD_MODE=fallback .venv/bin/python -m build --wheel --outdir "$mx_abi_fallback"
 MESSY_XLSX_BUILD_MODE=fallback .venv/bin/python -m build --sdist --outdir "$mx_abi_sdist"
+tar -xzf "$mx_abi_sdist"/*.tar.gz -C "$mx_abi_native_source"
+tar -xzf "$mx_abi_sdist"/*.tar.gz -C "$mx_abi_fallback_source"
+mx_abi_native_tree="$(find "$mx_abi_native_source" -mindepth 1 -maxdepth 1 -type d)"
+mx_abi_fallback_tree="$(find "$mx_abi_fallback_source" -mindepth 1 -maxdepth 1 -type d)"
+(
+  cd "$mx_abi_native_tree"
+  MESSY_XLSX_BUILD_MODE=native /home/ivan/Projects/messy-xlsx/.worktrees/parser-v1/.venv/bin/python -m build --wheel --outdir "$mx_abi_native"
+)
+uvx --from abi3audit==0.0.26 abi3audit --strict "$mx_abi_native"/*abi3*.whl
+(
+  cd "$mx_abi_fallback_tree"
+  MESSY_XLSX_BUILD_MODE=fallback /home/ivan/Projects/messy-xlsx/.worktrees/parser-v1/.venv/bin/python -m build --wheel --outdir "$mx_abi_fallback"
+)
 .venv/bin/python -m zipfile -l "$mx_abi_fallback"/*.whl
+bash scripts/run_native_csv_sanitizers.sh --shell-only
 ```
 
 Expected: native build/test passes and audits as `cp311-abi3`; fallback wheel
 contains no extension and is `py3-none-any`. Native/fallback editable modes
-are also built from separate clean source extractions.
+are built/tested from separate clean source extractions, the fallback wheel has
+no `.so`/`.pyd`, and the shell sanitizer/debug smoke passes.
 
 `native-abi.yml` is both dispatchable and reusable. Before Task 3 it must build
 the ABI shell on the complete claimed platform matrix: manylinux and
@@ -431,7 +455,7 @@ empty, skipped, or unsupported matrix leg.
 - [ ] **Step 5: Commit the ABI proof**
 
 ```bash
-git add build_support.py setup.py setup.cfg MANIFEST.in requirements/native-release.txt pyproject.toml .gitignore src/messy_xlsx/_csv_tokenizer.pyx scripts/verify_native_ci.py tests/packaging tests/native_csv/test_abi_shell.py .github/workflows/native-abi.yml
+git add build_support.py setup.py setup.cfg MANIFEST.in requirements/native-release.txt pyproject.toml .gitignore src/messy_xlsx/_csv_tokenizer.pyx scripts/verify_native_ci.py scripts/run_native_csv_sanitizers.sh tests/packaging tests/native_csv/conftest.py tests/native_csv/test_abi_shell.py .github/workflows/native-abi.yml
 git commit -m "build: prove native CSV stable ABI"
 ```
 
@@ -444,10 +468,12 @@ Obtain explicit user authorization before pushing. After the authorized push:
 
 ```bash
 mx_abi_sha="$(git rev-parse HEAD)"
+mx_abi_review_dir="${TMPDIR:-/tmp}/messy-xlsx-native-review-$mx_abi_sha"
+mkdir -p "$mx_abi_review_dir"
 .venv/bin/python scripts/verify_native_ci.py collect \
   --revision "$mx_abi_sha" \
   --workflow native-abi.yml \
-  --output native-abi-run-ledger.json
+  --output "$mx_abi_review_dir/native-abi-run-ledger.json"
 ```
 
 Expected: the exact commit has a completed successful workflow with every
@@ -464,6 +490,9 @@ x86-64 wheel alone is insufficient.
 - Create: `tests/native_csv/fixtures/*.csv.bin`
 - Create: `tests/native_csv/test_oracle.py`
 - Create: `tests/native_csv/test_differential.py`
+- Create: `tests/native_csv/test_fuzz_contract.py`
+- Create: `tests/native_csv/fuzz_worker.py`
+- Create: `scripts/run_native_csv_fuzz.py`
 - Modify: `tests/test_parsing/test_csv_handler.py`
 - Modify: `tests/test_edge_cases/test_csv_variations.py`
 
@@ -488,6 +517,11 @@ class OracleResult:
     scalar_types: tuple[tuple[str, ...], ...] | None
     warnings: tuple[tuple[type[Warning], str], ...]
     error: tuple[type[BaseException], str, tuple[tuple[str, object], ...]] | None
+    source_kind: OracleSourceKind
+    entry_cursor: int | None
+    exit_cursor: int | None
+    caller_closed: bool | None
+    requested_read_sizes: tuple[int, ...]
 
 
 def materialized_oracle(
@@ -497,16 +531,17 @@ def materialized_oracle(
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         try:
-            with source_case.open() as (source, path):
-                frame = CSVHandler().parse(source, path, options)
+            with source_case.open() as opened:
+                frame = CSVHandler().parse(opened.argument, None, options)
         except BaseException as error:
-            return OracleResult(None, None, None, captured(caught), error_contract(error))
+            return oracle_failure(source_case, caught, error)
     return OracleResult(
         tuple(frame.columns),
         tuple(map(tuple, frame.itertuples(index=False, name=None))),
         tuple(tuple(type(value).__qualname__ for value in frame.iloc[:, i]) for i in range(frame.shape[1])),
         captured(caught),
         None,
+        *source_case.lifecycle_contract(),
     )
 ```
 
@@ -515,6 +550,12 @@ def materialized_oracle(
 strict decoding and fallback-encoding retries. Caller-stream variants exercise
 ignore/no-retry behavior and assert exact entry-cursor restoration without
 closing the caller.
+`open()` yields `OpenedOracleSource(argument)` where `argument` is the actual
+`Path` for `PATH` and the actual instrumented binary stream for all stream
+variants; the second `CSVHandler.parse` argument is always `None` because CSV
+has no sheet selector. `lifecycle_contract()` records source kind, exact
+entry/exit cursor, caller `closed` state, and requested read sizes on both
+success and failure.
 
 Add explicit C/Python variants for LF/CRLF/CR-only, NUL, quote junk,
 unterminated quote, embedded newline, short/wide rows, implicit index, blank
@@ -526,7 +567,7 @@ warning-as-error, and `max_rows + skip_footer`.
 contain missing sentinels. It compares each cell through a missing-kind
 classifier, then separately compares nonmissing values, Python scalar family,
 columns, warning category/message/order, error class/message/context, and
-source lifecycle.
+source kind/cursor/closed/read-size lifecycle.
 
 - [ ] **Step 2: Run oracle tests against pandas 3.0.5**
 
@@ -555,18 +596,43 @@ native expected result. Freeze raw structural expectations beside typed oracle
 expectations so Tasks 6–8 can test decoded fields without depending on the
 Task 9 value adapter.
 
-- [ ] **Step 4: Run and commit the frozen oracle**
+- [ ] **Step 4: Freeze the deterministic fuzz generator/worker contract**
+
+Before native semantics exist, implement `fuzz_worker.py` generation and
+materialized-oracle modes plus
+`run_native_csv_fuzz.py --oracle-only`. Contract tests fix both seeds, case
+ordering, byte/source-chunk generation, per-case timeout handling, result JSON
+schema, and minimized-regression filename hashing. Native C/Python execution
+adapters remain explicit `NotImplementedError` branches activated by Tasks 7
+and 11.
 
 Run:
 
 ```bash
-.venv/bin/pytest tests/native_csv/test_oracle.py tests/native_csv/test_differential.py tests/test_parsing/test_csv_handler.py tests/test_edge_cases/test_csv_variations.py -q
+.venv/bin/pytest tests/native_csv/test_fuzz_contract.py -q
+.venv/bin/python scripts/run_native_csv_fuzz.py \
+  --oracle-only \
+  --c-seed 0x0C5A14 \
+  --python-seed 0xBADC5EED \
+  --examples 100 \
+  --timeout 30
+```
+
+Expected: deterministic reruns produce identical case/result hashes for both
+materialized engines.
+
+- [ ] **Step 5: Run and commit the frozen oracle**
+
+Run:
+
+```bash
+.venv/bin/pytest tests/native_csv/test_oracle.py tests/native_csv/test_differential.py tests/native_csv/test_fuzz_contract.py tests/test_parsing/test_csv_handler.py tests/test_edge_cases/test_csv_variations.py -q
 ```
 
 Then:
 
 ```bash
-git add tests/native_csv tests/test_parsing/test_csv_handler.py tests/test_edge_cases/test_csv_variations.py
+git add tests/native_csv scripts/run_native_csv_fuzz.py tests/test_parsing/test_csv_handler.py tests/test_edge_cases/test_csv_variations.py
 git commit -m "test: freeze pandas CSV engine semantics"
 ```
 
@@ -668,12 +734,15 @@ Pandas compilation has one non-exceptional result type:
 @dataclass(frozen=True, slots=True)
 class CompiledNativeEvidence:
     evidence: NativeEvidence | None
+    config: ResolvedNativeCSVConfig | None
     fallback_reason: CSVExecutionReason | None
 ```
 
-Construction enforces exactly one populated field. Unsupported extension
-dtypes or heterogeneous object evidence return the corresponding fallback
-reason; parser, decoder, source, and process failures remain exceptions.
+Construction enforces either both `evidence` and `config` with no fallback
+reason, or one fallback reason with both success fields absent. Unsupported
+extension dtypes or heterogeneous object evidence return the corresponding
+fallback reason; parser, decoder, source, and process failures remain
+exceptions.
 
 The fake module must simulate `COMPLETE`, `SAMPLE_FULL`, budget exhaustion,
 warnings, terminal failures, `done` without source EOF, and immutable debug
@@ -711,6 +780,18 @@ git commit -m "feat: define native CSV contracts"
 - Preserves: GIL and ownership rules before semantic parsing exists.
 
 - [ ] **Step 1: Write failing state/source protocol tests**
+
+Execute these microcycles in order; do not add the next cycle's tests until the
+current one is green and reviewed:
+
+| Cycle | Red test nodes | Minimal implementation | Rebuild/green command |
+|---|---|---|---|
+| A — states | `test_new_bind_read_close_transitions`, `test_bind_is_one_shot`, `test_nonpositive_request_rejected` | native state enum, constructor, `bind`, request validation, idempotent `close` only | native reinstall; `pytest tests/native_csv/test_native_api.py -q -k "transitions or one_shot or nonpositive"` |
+| B — source values | `test_source_protocol_copies_supported_binary_results`, `test_rejects_invalid_memoryview`, `test_over_return_is_terminal`, `test_partial_and_zero_reads` | bounded `read(1..65_536)`, byte/memoryview validation, owned copy, terminal failure | native reinstall; `pytest tests/native_csv/test_native_api.py -q -k "source_protocol or memoryview or over_return or partial"` |
+| C — lifecycle/reentrancy | `test_recursive_read_rejected`, `test_observer_debug_snapshot_allowed`, `test_callback_failure_terminal`, `test_partial_construction_and_finalizer` | non-reentrant mutation guard, immutable debug snapshots, one cleanup path, no-throw deallocator | native reinstall; `PYTHONMALLOC=debug pytest tests/native_csv/test_native_api.py tests/native_csv/test_lifecycle.py -q` |
+
+After each green command, run the Task 5 specification review on only that
+cycle's diff before starting the next cycle.
 
 ```python
 @pytest.mark.parametrize("value", [b"x", bytearray(b"x"), memoryview(b"x")])
@@ -985,7 +1066,11 @@ git commit -m "feat: match pandas C CSV edge semantics"
 ```python
 def test_payload_budget_stops_inside_unterminated_record() -> None:
     limits = replace(native_evidence_limits(None), max_payload_bytes_examined=16)
-    evidence = scan_structural(b'a\n"' + b"x" * 1_000_000, limits)
+    evidence = scan_c_structural_evidence(
+        ScriptedBinarySource(b'a\n"' + b"x" * 1_000_000),
+        c_framing_config(),
+        limits,
+    )
     assert evidence.status is NativeEvidenceStatus.BUDGET_EXHAUSTED
     assert evidence.payload_bytes_examined == 16
     assert evidence.replay_bytes_retained <= limits.max_replay_bytes
@@ -1064,6 +1149,17 @@ git commit -m "feat: add bounded native CSV evidence"
 
 - [ ] **Step 1: Add failing converter-classification tests**
 
+Execute three reviewed microcycles:
+
+| Cycle | Red test nodes | Minimal implementation | Green command |
+|---|---|---|---|
+| A — pandas classification | `test_pandas_evidence_classifies_exact_scalar_family`, `test_missing_kind_classification`, `test_original_replay_is_authoritative` | replay parse, scalar-family/missing classifier, successful `CompiledNativeEvidence(evidence, config, None)` | `pytest tests/native_csv/test_pandas_evidence.py -q -k "classifies or missing_kind or replay"` |
+| B — typed fallback | `test_heterogeneous_object_selects_fallback`, `test_extension_dtype_selects_fallback`, `test_failure_is_not_fallback` | exclusive fallback result for only the two approved unsupported categories | `pytest tests/native_csv/test_pandas_evidence.py -q -k "fallback or failure_is_not"` |
+| C — later conversion | `test_each_converter_exact_values`, `test_late_incompatible_value_context`, `test_missing_sentinel_output` | `PandasCSVValueAdapter.convert` and first-incompatible `StreamingTypeError` | `pytest tests/native_csv/test_value_adapter.py -q` |
+
+Run a specification review after each cycle; do not enable Task 9's typed
+differential cases until Cycle C passes.
+
 ```python
 @pytest.mark.parametrize(
     ("csv", "kind", "missing"),
@@ -1075,14 +1171,17 @@ git commit -m "feat: add bounded native CSV evidence"
     ],
 )
 def test_pandas_evidence_classifies_exact_scalar_family(csv, kind, missing) -> None:
-    evidence = compile_evidence(csv)
-    assert evidence.converters[0] == PandasValueConverter(kind, missing)
+    compiled = compile_evidence(csv)
+    assert compiled.evidence is not None
+    assert compiled.config is not None
+    assert compiled.config.value_converters[0] == PandasValueConverter(kind, missing)
 ```
 
 Add string dtype with float NaN, uint64, object text, default/configured NA
 markers, whitespace, quoted/unquoted empties, structural missing fields,
-footer exclusion, heterogeneous-object fallback, unsupported extension dtype,
-and original replay quoting.
+heterogeneous-object fallback, unsupported extension dtype, and original
+replay quoting. Footer exclusion is deferred to Task 11 because Task 9 is
+C/no-footer only.
 
 - [ ] **Step 2: Run converter tests and confirm red**
 
@@ -1104,7 +1203,8 @@ For supported input, construct the approved `NativeEvidence` by copying all
 structural counters/replay/raw rows and adding pandas `typed_data_rows` and
 final `column_names`; compile `ResolvedNativeCSVConfig`. For unsupported
 extension or heterogeneous object evidence, return
-`CompiledNativeEvidence(None, CSVExecutionReason.UNSUPPORTED_EVIDENCE_TYPE)`.
+`CompiledNativeEvidence(None, None,
+CSVExecutionReason.UNSUPPORTED_EVIDENCE_TYPE)`.
 No backend metric is recorded until Task 12 successfully constructs a reader.
 
 Convert later lexemes only according to the compiled descriptor. On the first
@@ -1162,6 +1262,17 @@ git commit -m "feat: convert native CSV physical values"
   selector can request this otherwise-internal combination.
 
 - [ ] **Step 1: Add failing Python-engine tests without footer assertions**
+
+Execute these reviewed microcycles, rebuilding the extension before each green
+command:
+
+| Cycle | Red test nodes | Minimal implementation | Green command |
+|---|---|---|---|
+| A — physical lines | `test_python_skiprows_can_bisect_multiline_record`, `test_python_cr_only_line_accounting` | Python-engine physical-line skip and CR/LF accounting | native reinstall; `pytest tests/native_csv/test_tokenizer_python.py -q -k "skiprows or line_accounting"` |
+| B — parser recovery | `test_python_csv_error_warns_and_discards`, `test_python_unterminated_quote`, `test_python_quote_junk` | Python quote-error transitions and one-record recovery/diagnostic | native reinstall; `pytest tests/native_csv/test_tokenizer_python.py -q -k "csv_error or unterminated or quote_junk"` |
+| C — width/stage order | `test_python_width_before_post_skip`, `test_python_blank_before_width`, `test_python_implicit_index` | first eligible physical width/index and blank/post-skip order | native reinstall; `pytest tests/native_csv/test_tokenizer_python.py -q -k "width or blank or implicit_index"` |
+
+Run the Task 10 specification review after each cycle.
 
 ```python
 def test_python_skiprows_can_bisect_multiline_record() -> None:
@@ -1342,6 +1453,10 @@ git commit -m "feat: add bounded Python-mode CSV footers"
 - Produces:
   `_run_candidate_artifact_smoke(source, plan, metrics) -> PreparedStreamingReader`,
   whose wrapper supplies the module-owned token internally.
+- Produces:
+  `_prepare_native_streaming_reader(source, plan, metrics, *,
+  candidate_token=None) -> PreparedStreamingReader`, the only constructor that
+  accepts the internal token.
 - Removes: `_PreownedPandasReader` and pandas `chunksize` from the full pass.
 - Retains: current bounded inspection, `PreparedStreamingReader`,
   `_CloseOnceReader`, normalization compilation, physical encoding, and public
@@ -1353,8 +1468,11 @@ git commit -m "feat: add bounded Python-mode CSV footers"
 @pytest.mark.parametrize("batch_size", [1, 2, 3, 127])
 def test_private_candidate_native_stream_matches_oracle(csv_case, batch_size) -> None:
     with candidate_native_stream(csv_case.data, csv_case.options, batch_size) as stream:
-        table = pa.Table.from_batches(list(stream))
-    assert table_rows(table) == materialized_oracle(csv_case.data, csv_case.options).rows
+        actual = native_outcome_from_batches(stream)
+    assert_oracle_equivalent(
+        actual,
+        materialized_oracle(csv_case.data, csv_case.options),
+    )
 ```
 
 Cover `normalize=True/False`, all-null columns, duplicate/non-string labels,
@@ -1408,7 +1526,16 @@ built-in registry/detector/handler/component ownership, then the public gate
 (unless the identity-equal module token is present), then reads the kill switch
 once, checks non-free-threaded CPython 3.11–3.14 before import, narrowly loads
 the extension, and validates both handshake constants. `NativeCapability` is
-immutable and contains either a module or one typed fallback reason.
+defined in `csv_native.py` as:
+
+```python
+@dataclass(frozen=True, slots=True)
+class NativeCapability:
+    module: NativeModule | None
+    fallback_reason: CSVExecutionReason | None
+```
+
+Construction enforces exactly one populated field.
 
 Cycle B applies generated-header and compiled-evidence decisions before
 full-pass startup. It restores the evidence borrow before constructing any
@@ -1416,9 +1543,19 @@ materialized reader. Evidence parse failure records the existing failure
 metric but no CSV execution decision. No native-to-materialized transition is
 permitted after full-pass binding.
 
-Cycle C adds `_run_candidate_artifact_smoke(source, plan, metrics)`. The
-wrapper, not its caller, supplies `_CANDIDATE_SMOKE_TOKEN` to the internal
-constructor. There is no environment or public selector for the bypass.
+Cycle C adds
+`_prepare_native_streaming_reader(..., candidate_token=None)` and
+`_run_candidate_artifact_smoke(source, plan, metrics)`. The wrapper, not its
+caller, supplies `_CANDIDATE_SMOKE_TOKEN` to the internal constructor. The
+wrapper returns the ordinary frozen `PreparedStreamingReader`; callers inspect
+`prepared.reader.execution_decision` and must close `prepared.reader` in
+`finally`. A caller-created token is rejected by the constructor. There is no
+environment or public selector for the bypass.
+
+Cycle D removes Task 1's gate-mutating autouse fixture. Retained native
+characterization tests use `candidate_native_stream`, which calls only
+`_run_candidate_artifact_smoke`; public route tests run with the checked-in
+false gate and remain materialized.
 
 `prepare_csv_streaming_reader` performs inspection, native evidence, pandas
 converter compilation, normalization-plan compilation, and routing while no
@@ -1477,6 +1614,17 @@ git commit -m "feat: integrate native CSV streaming"
 - Produces: warning emission once in full pass, never from evidence.
 
 - [ ] **Step 1: Add failing warning/error/lifecycle tests**
+
+Execute three reviewed microcycles, forcing a native reinstall before each
+green command:
+
+| Cycle | Red test nodes | Minimal implementation | Green command |
+|---|---|---|---|
+| A — warnings | `test_evidence_warning_is_suppressed`, `test_full_warning_once_stacklevel_three`, `test_warning_promoted_to_error_uses_materialized_format_boundary` | captured evidence diagnostics and one full-pass `warnings.warn(..., stacklevel=3)` boundary | native reinstall; `pytest tests/native_csv/test_failures.py -q -k warning` |
+| B — data errors | `test_eager_and_lazy_decode_boundaries`, `test_fallback_encoding_footer_evidence_uses_legacy_terminal_context`, `test_internal_state_error_propagates` | contextual `FormatError` for data/source failures, legacy fallback context, unchanged internal/process failures | native reinstall; `pytest tests/native_csv/test_failures.py -q -k "decode or fallback_encoding or internal_state"` |
+| C — cleanup precedence | `test_cleanup_precedence_matrix`, `test_return_gap_restore_failure`, `test_finalizer_and_early_close_restore` | tokenizer-close then borrow-restore order and ordinary/process precedence | native reinstall; `pytest tests/native_csv/test_lifecycle.py tests/test_resource_lifecycle.py tests/test_stream_lifecycle.py -q -k "cleanup or return_gap or finalizer or early_close"` |
+
+Run specification and quality reviews after each cycle.
 
 ```python
 def test_warning_promoted_to_error_uses_materialized_format_boundary() -> None:
@@ -1675,11 +1823,11 @@ git commit -m "test: prove native CSV deterministic bounds"
 
 **Files:**
 - Create: `tests/native_csv/test_fuzz.py`
-- Create: `tests/native_csv/test_fuzz_contract.py`
-- Create: `tests/native_csv/fuzz_worker.py`
+- Modify: `tests/native_csv/test_fuzz_contract.py`
+- Modify: `tests/native_csv/fuzz_worker.py`
 - Add: `tests/native_csv/regressions/*.bin`
-- Create: `scripts/run_native_csv_fuzz.py`
-- Create: `scripts/run_native_csv_sanitizers.sh`
+- Modify: `scripts/run_native_csv_fuzz.py`
+- Modify: `scripts/run_native_csv_sanitizers.sh`
 - Create: `.github/workflows/native-safety.yml`
 - Modify: `.github/workflows/native-abi.yml`
 
@@ -1746,12 +1894,16 @@ approved oracle or a named streaming-exception contract.
 extraction and builds with:
 
 ```text
--O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -Werror
+CFLAGS=-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -Werror
+LDFLAGS=-fsanitize=address,undefined
+LD_PRELOAD=$(gcc -print-file-name=libasan.so)
 ASAN_OPTIONS=detect_leaks=0:halt_on_error=1
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
 ```
 
-It sets `MESSY_XLSX_BUILD_MODE=native`, installs the extension freshly, checks
+It validates that `gcc -print-file-name=libasan.so` returns an existing
+absolute path before setting `LD_PRELOAD`, sets
+`MESSY_XLSX_BUILD_MODE=native`, installs the extension freshly, checks
 `NATIVE_SOURCE_SHA256`, runs `tests/native_csv`, then repeats lifecycle,
 allocation-failure, and reentrancy suites under `PYTHONMALLOC=debug`.
 
@@ -1974,9 +2126,11 @@ counters, source position at each batch, and a stable output hash.
 
 The large logical record must appear after the first 1,000 accepted data rows.
 The footer corpus must use `skip_footer=10`, reach physical EOF within every
-evidence limit, and record `CSVExecutionKind.NATIVE` in isolated candidate
-metrics. Each corpus also asserts the public route remains
-`MATERIALIZED_FALLBACK/PRODUCTION_GATE_DISABLED`.
+evidence limit, and record `CSVExecutionKind.NATIVE`. Report-contract tests
+parameterize both phases by monkeypatching the gate: candidate isolated metrics
+require private native plus public
+`MATERIALIZED_FALLBACK/PRODUCTION_GATE_DISABLED`; final metrics require public
+native plus kill-switch fallback.
 
 - [ ] **Step 2: Run the contract tests and confirm the red state**
 
@@ -1994,12 +2148,24 @@ exist.
 
 `benchmarks/native_csv.py` generates each corpus without timing file creation.
 `scripts/run_native_csv_benchmarks.py` installs or accepts the exact native
-wheel path. Tokenizer-only no-footer timing invokes the internal tokenizer
+wheel path and requires `--phase candidate|final`. It also exposes a
+non-benchmarking validation mode:
+
+```bash
+python scripts/run_native_csv_benchmarks.py \
+  --phase candidate|final \
+  --validate-report REPORT.json
+```
+
+That mode parses the recorded metadata, hashes, counters, ratios, phase-specific
+execution decisions, and thresholds without regenerating a corpus or rerunning
+timings. Tokenizer-only no-footer timing invokes the internal tokenizer
 extension directly with a precompiled `ResolvedNativeCSVConfig`; immediately
 before timing, an untimed Task 12 candidate-wrapper run proves the same corpus
 selects `NATIVE/NATIVE_SELECTED`. End-to-end correctness/memory timing uses
 the private wrapper and isolated metrics.
-The public route is executed outside the timer and must remain materialized.
+The public route is executed outside the timer. It must be disabled fallback
+for candidate and native (plus kill-switch fallback) for final.
 The harness performs three warmups, then alternates contenders for seven
 measured runs. It reports medians and computes geometric means from per-corpus
 ratios.
@@ -2013,8 +2179,8 @@ Reject a performance report unless all of these are true:
 each no-footer native/direct-pandas-C median ratio <= 3.0
 geometric mean of no-footer native/direct-pandas-C ratios <= 2.0
 geometric mean of footer reference/native median ratios >= 4.0
-every private candidate case records CSVExecutionKind.NATIVE
-every public case records MATERIALIZED_FALLBACK/PRODUCTION_GATE_DISABLED
+candidate: every private case is NATIVE and every public case is PRODUCTION_GATE_DISABLED
+final: every public case is NATIVE and exact "1" produces KILL_SWITCH fallback
 every deterministic row, fixed-buffer, and logical-payload bound passes
 ```
 
@@ -2050,6 +2216,7 @@ MESSY_XLSX_BUILD_MODE=native uv pip install --python .venv/bin/python --no-deps 
   --seed 0x0C5A14 \
   --warmups 3 \
   --runs 7 \
+  --phase candidate \
   --output /tmp/messy-xlsx-native-csv-performance.json
 ```
 
@@ -2088,6 +2255,16 @@ git commit -m "perf: gate native CSV production routing"
   and a nine-distribution allowlist independently of GitHub Actions.
 
 - [ ] **Step 1: Write failing build and artifact-provenance tests**
+
+Execute three reviewed microcycles:
+
+| Cycle | Red test nodes | Minimal implementation | Green command |
+|---|---|---|---|
+| A — build mode | `test_explicit_build_modes`, `test_invalid_build_mode`, `test_supported_default`, `test_fallback_has_no_extension` | pure `resolve_build_mode`, setup delegation, exact wheel purity/tag checks | `pytest tests/packaging/test_build_support.py tests/packaging/test_build_modes.py -q -k "build_mode or supported_default or no_extension"` |
+| B — static inventory | `test_rejects_wrong_count_tags_and_contents`, `test_rejects_metadata_drift`, `test_rejects_forbidden_sdist_files` | read-only wheel/sdist inventory and metadata validator | `pytest tests/packaging/test_release_artifacts.py -q -k "count or tags or contents or metadata or forbidden"` |
+| C — provenance | `test_record_fragment_schema`, `test_assemble_rejects_lineage_mismatch`, `test_verify_rejects_hash_phase_revision_mismatch` | `record`, transactional `assemble`, and static `verify` subcommands | `pytest tests/packaging/test_release_artifacts.py -q -k "fragment or lineage or hash or phase or revision"` |
+
+Run build/release specification review after each cycle.
 
 Test `build_support.resolve_build_mode()` with explicit `native`, explicit
 `fallback`, invalid values, supported CPython, unsupported/free-threaded
@@ -2141,7 +2318,9 @@ Do not weaken the Task 2 build-system or development-tool pins.
 allowlisted release set, and verifies phase, revision, nine-file count,
 filenames, wheel tags, purity, extension inventory, cross-wheel `METADATA`,
 source inventory, exact source-archive lineage, SHA-256 content,
-`abi3audit --strict`, `twine check`, and clean-environment `pip check`.
+`abi3audit --strict`, `twine check`, and complete per-wheel smoke-record
+coverage. It never attempts to install an incompatible cross-platform wheel on
+the aggregation host.
 
 The JSON manifest schema is fixed and versioned:
 
@@ -2156,6 +2335,18 @@ class ArtifactRecord(TypedDict):
     source_sdist_sha256: str
 
 
+class WheelSmokeRecord(TypedDict):
+    wheel_sha256: str
+    phase: Literal["candidate", "final"]
+    python_version: Literal["3.11", "3.12", "3.13", "3.14"]
+    platform_tag: str
+    extension_present: bool
+    pip_check_passed: Literal[True]
+    public_decision: str
+    private_decision: str | None
+    kill_switch_decision: str | None
+
+
 class ReleaseManifest(TypedDict):
     schema_version: Literal[1]
     phase: Literal["candidate", "final"]
@@ -2163,12 +2354,15 @@ class ReleaseManifest(TypedDict):
     package_version: Literal["1.0.0"]
     sdist_sha256: str
     artifacts: list[ArtifactRecord]
+    smoke_records: list[WheelSmokeRecord]
 ```
 
 `revision` must match `[0-9a-f]{40}`; every digest must match
 `[0-9a-f]{64}`. The verifier enforces the exact nine filenames/tags for the
 selected phase and requires every `source_sdist_sha256` to equal the manifest
-source digest.
+source digest. It also requires the exact wheel-hash/runtime/platform smoke
+record matrix and rejects a record whose phase, wheel hash, or expected
+candidate/final decision contract differs.
 
 Each platform builder writes one provenance fragment with
 `record --phase --revision --sdist-sha256 --artifact --output`. Aggregation
@@ -2198,31 +2392,11 @@ mx_native_tree="$(find "$mx_pack_root/native-source" -mindepth 1 -maxdepth 1 -ty
   MESSY_XLSX_BUILD_MODE=native /home/ivan/Projects/messy-xlsx/.worktrees/parser-v1/.venv/bin/python -m build --wheel --outdir "$mx_pack_root/native"
 )
 uvx --from abi3audit==0.0.26 abi3audit --strict "$mx_pack_root/native"/*abi3*.whl
-mx_sdist_path="$(find "$mx_pack_root/sdist" -maxdepth 1 -type f -name '*.tar.gz')"
-mx_sdist_sha256="$(sha256sum "$mx_sdist_path" | cut -d ' ' -f 1)"
-.venv/bin/python scripts/release_artifacts.py record \
-  --phase candidate \
-  --revision "$(git rev-parse HEAD)" \
-  --sdist-sha256 "$mx_sdist_sha256" \
-  --artifact "$mx_sdist_path" \
-  --output "$mx_pack_root/sdist-fragment.json"
-.venv/bin/python scripts/release_artifacts.py record \
-  --phase candidate \
-  --revision "$(git rev-parse HEAD)" \
-  --sdist-sha256 "$mx_sdist_sha256" \
-  --artifact "$(find "$mx_pack_root/fallback" -maxdepth 1 -type f -name '*.whl')" \
-  --output "$mx_pack_root/fallback-fragment.json"
-.venv/bin/python scripts/release_artifacts.py record \
-  --phase candidate \
-  --revision "$(git rev-parse HEAD)" \
-  --sdist-sha256 "$mx_sdist_sha256" \
-  --artifact "$(find "$mx_pack_root/native" -maxdepth 1 -type f -name '*abi3*.whl')" \
-  --output "$mx_pack_root/native-fragment.json"
 ```
 
 Expected: both separate clean exact-sdist build modes, artifact unit tests,
-native audit, source inventory, and local provenance fragments pass. Synthetic
-nine-file fixtures exercise `assemble` and `verify` in
+native audit, and source inventory pass. Synthetic nine-file fixtures exercise
+`record`, `assemble`, and `verify` in
 `test_release_artifacts.py`.
 
 - [ ] **Step 6: Commit exact-sdist provenance tooling**
@@ -2234,6 +2408,46 @@ git commit -m "build: verify exact-sdist artifact provenance"
 
 Do not stage `CONTINUE.md`, `.superpowers`, generated C/native files, or
 `uv.lock`. The gate remains false.
+
+- [ ] **Step 7: Issue revision-bearing provenance only from the clean commit**
+
+Run from the new committed `HEAD`; do not reuse Step 5 artifacts:
+
+```bash
+git diff --quiet
+git diff --cached --quiet
+mx_provenance_sha="$(git rev-parse HEAD)"
+mx_provenance_root="$(mktemp -d)"
+mkdir -p "$mx_provenance_root/sdist" "$mx_provenance_root/fallback-source" "$mx_provenance_root/native-source" "$mx_provenance_root/fallback" "$mx_provenance_root/native"
+MESSY_XLSX_BUILD_MODE=fallback .venv/bin/python -m build --sdist --outdir "$mx_provenance_root/sdist"
+tar -xzf "$mx_provenance_root"/sdist/*.tar.gz -C "$mx_provenance_root/fallback-source"
+tar -xzf "$mx_provenance_root"/sdist/*.tar.gz -C "$mx_provenance_root/native-source"
+mx_provenance_fallback_tree="$(find "$mx_provenance_root/fallback-source" -mindepth 1 -maxdepth 1 -type d)"
+mx_provenance_native_tree="$(find "$mx_provenance_root/native-source" -mindepth 1 -maxdepth 1 -type d)"
+(
+  cd "$mx_provenance_fallback_tree"
+  MESSY_XLSX_BUILD_MODE=fallback /home/ivan/Projects/messy-xlsx/.worktrees/parser-v1/.venv/bin/python -m build --wheel --outdir "$mx_provenance_root/fallback"
+)
+(
+  cd "$mx_provenance_native_tree"
+  MESSY_XLSX_BUILD_MODE=native /home/ivan/Projects/messy-xlsx/.worktrees/parser-v1/.venv/bin/python -m build --wheel --outdir "$mx_provenance_root/native"
+)
+mx_provenance_sdist="$(find "$mx_provenance_root/sdist" -maxdepth 1 -type f -name '*.tar.gz')"
+mx_provenance_sdist_sha="$(sha256sum "$mx_provenance_sdist" | cut -d ' ' -f 1)"
+for mx_distribution in "$mx_provenance_sdist" "$mx_provenance_root"/fallback/*.whl "$mx_provenance_root"/native/*abi3*.whl; do
+  mx_fragment_name="$(basename "$mx_distribution").json"
+  .venv/bin/python scripts/release_artifacts.py record \
+    --phase candidate \
+    --revision "$mx_provenance_sha" \
+    --sdist-sha256 "$mx_provenance_sdist_sha" \
+    --artifact "$mx_distribution" \
+    --output "$mx_provenance_root/$mx_fragment_name"
+done
+```
+
+Expected: every fragment names the clean committed revision and one exact
+source digest. A failure requires a new corrective commit and a fresh rebuild;
+never relabel an existing distribution.
 
 ---
 
@@ -2256,20 +2470,32 @@ Do not stage `CONTINUE.md`, `.superpowers`, generated C/native files, or
 - [ ] **Step 1: Write failing seam, resolver, and publish-contract tests**
 
 ```python
-assert csv_native._NATIVE_CSV_PRODUCTION_READY is False
+monkeypatch.setattr(csv_native, "_NATIVE_CSV_PRODUCTION_READY", False)
 assert public_csv_decision().reason is CSVExecutionReason.PRODUCTION_GATE_DISABLED
 with pytest.raises(PermissionError):
-    NativeCSVReader._construct_for_candidate(
+    csv_native._prepare_native_streaming_reader(
         source, plan, metrics, candidate_token=object()
     )
-with csv_native._run_candidate_artifact_smoke(source, plan, metrics) as reader:
-    assert reader.execution_decision.kind is CSVExecutionKind.NATIVE
+prepared = csv_native._run_candidate_artifact_smoke(source, plan, metrics)
+try:
+    assert prepared.reader.execution_decision.kind is CSVExecutionKind.NATIVE
+finally:
+    prepared.reader.close()
+
+monkeypatch.setattr(csv_native, "_NATIVE_CSV_PRODUCTION_READY", True)
+assert public_csv_decision().kind is CSVExecutionKind.NATIVE
 ```
 
 The wrapper has no token parameter and internally supplies the module-owned
 token. Add negative cases for custom ownership, kill switch, unsupported
 runtime, import failure, handshake mismatch, evidence budget, and unsupported
 evidence type.
+
+All smoke and benchmark contract tests parameterize `phase` as `candidate` or
+`final`; they do not assume the checked-in constant. Candidate requires
+private native plus public disabled fallback. Final requires public native and
+the exact `"1"` kill-switch fallback. The source-derived workflow phase selects
+which prewritten assertions run, so Task 23 changes only the gate line.
 
 Resolver tests use an isolated temporary wheelhouse with
 `--no-index --find-links --no-deps`. They prove native preference on each
@@ -2294,16 +2520,18 @@ unverified publish path.
 
 - [ ] **Step 3: Implement isolated smoke and resolver CLIs**
 
-`scripts/smoke_csv_artifact.py --phase candidate` installs each exact wheel by
-path outside the repository. Native wheels assert extension presence/source
-handshake, private native parsing, and public disabled fallback. The universal
-wheel asserts extension absence and automatic materialization.
+`scripts/smoke_csv_artifact.py --phase candidate --wheel PATH --wheel-sha256
+DIGEST --output RECORD` installs one compatible exact wheel by path outside the
+repository, runs `pip check`, and emits one wheel-hash/runtime/platform-bound
+smoke record. Native wheels assert extension presence/source handshake,
+private native parsing, and public disabled fallback. The universal wheel
+asserts extension absence and automatic materialization.
 
 `--phase final` repeats direct extension checks, requires public native routing
 on supported runtimes, exercises the kill switch, and retains fallback
 behavior on universal/unsupported cases.
 
-`scripts/check_wheel_resolution.py` consumes only a verified manifest and
+`scripts/check_wheel_resolution.py` consumes only a statically verified manifest and
 wheelhouse. It cannot download or rebuild artifacts.
 
 - [ ] **Step 4: Make publishing consume only verified final artifacts**
@@ -2345,8 +2573,21 @@ git commit -m "ci: verify native resolver smoke and publishing"
 - Produces: one exact source archive, seven native wheels, one fallback wheel,
   provenance fragments, and one manifest outside the release directory.
 - Derives: candidate/final phase only from the source-controlled gate.
+- Produces: one exact-SHA top-level `native-artifacts.yml` run whose nested job
+  graph contains ABI, safety, performance, wheel, resolver, smoke, and
+  aggregate acceptance.
 
 - [ ] **Step 1: Write failing workflow-contract tests**
+
+Implement the workflow in three separate reviewed cycles:
+
+| Cycle | Red test nodes | Minimal workflow change | Green command |
+|---|---|---|---|
+| A — wheel jobs | `test_exact_seven_wheel_matrix`, `test_each_wheel_has_exact_runtime_smokes`, `test_builds_use_clean_exact_sdist` | source job plus seven exclusive wheel jobs and per-wheel smoke records | `pytest tests/packaging/test_workflow_contract.py -q -k "seven_wheel or runtime_smokes or exact_sdist"` |
+| B — aggregate provenance | `test_phase_is_source_derived`, `test_aggregate_requires_nine_and_all_smoke_records`, `test_candidate_final_namespaces_are_disjoint` | transactional fragment download/assemble/static verify jobs | `pytest tests/packaging/test_workflow_contract.py -q -k "phase or aggregate or namespaces"` |
+| C — orchestrator/run verification | `test_dispatch_trigger_and_nested_job_graph`, `test_exact_sha_run_ledger`, `test_test_workflow_requires_orchestrator` | one dispatchable top-level orchestrator, generic exact-SHA verifier, caller gate | `pytest tests/packaging/test_workflow_contract.py tests/packaging/test_ci_run_verifier.py -q` |
+
+Run packaging specification and workflow-security reviews after each cycle.
 
 Parse the YAML and fail unless all actions are commit-pinned, every claimed
 matrix leg is nonempty, official builds set `MESSY_XLSX_BUILD_MODE`
@@ -2354,11 +2595,19 @@ explicitly, Linux uses `CIBW_ENVIRONMENT`, Windows uses AMD64 only, each Linux
 libc family has an exclusive selector, ABI smokes install exact artifact paths
 outside the repository, and callers cannot request `final`.
 
+Require `native-artifacts.yml` to declare both `workflow_dispatch` and
+`workflow_call`. Its dispatch path owns the complete nested graph; reusable
+wheel, ABI, safety, and performance workflows may be called only from that
+graph. `test.yml` requires the orchestrator result but is not a second source
+of artifact acceptance.
+
 Test `verify_native_ci.py collect` with recorded `gh run list --json` fixtures.
-Reject older/wrong SHAs, queued/in-progress/cancelled/skipped/neutral runs,
-duplicate ambiguous successful runs without deterministic newest selection,
-missing workflows, and missing required matrix legs. Its output ledger records
-the exact revision and selected database ID/conclusion for every workflow.
+It accepts exactly one `--workflow native-artifacts.yml`, rejects
+older/wrong SHAs, queued/in-progress/cancelled/skipped/neutral runs, duplicate
+ambiguous successful runs without deterministic newest selection, missing
+nested jobs, and missing required matrix legs. Its output ledger records the
+exact revision, top-level database ID/conclusion, and every required nested
+job name/conclusion.
 
 - [ ] **Step 2: Run the red workflow contract**
 
@@ -2388,6 +2637,19 @@ All are `cp311-abi3`. Cibuildwheel tests CPython 3.11; separate jobs install
 each exact already-built wheel on CPython 3.12, 3.13, and 3.14. Do not use
 `allow-empty`, floating images, `macos-latest`, Windows `auto`, broad Linux
 selectors, or unreviewed `test-skip`.
+
+Inside each compatible platform/runtime job, outside the repository:
+
+```bash
+python scripts/smoke_csv_artifact.py \
+  --phase "$ARTIFACT_PHASE" \
+  --wheel "$EXACT_WHEEL_PATH" \
+  --wheel-sha256 "$EXACT_WHEEL_SHA256" \
+  --output "$SMOKE_RECORD"
+```
+
+The universal fallback wheel has its own compatible CPython 3.11–3.14 smoke
+jobs. Aggregation never installs foreign wheels.
 
 - [ ] **Step 4: Implement provenance recording and aggregation**
 
@@ -2423,6 +2685,7 @@ python scripts/release_artifacts.py assemble \
   --phase "$ARTIFACT_PHASE" \
   --revision "$GITHUB_SHA" \
   --fragments incoming/fragments \
+  --smoke-records incoming/smoke-records \
   --artifacts incoming/distributions \
   --dist release-set \
   --manifest "$ARTIFACT_PHASE-manifest.json"
@@ -2433,10 +2696,6 @@ python scripts/release_artifacts.py verify \
   --manifest "$ARTIFACT_PHASE-manifest.json"
 python scripts/check_wheel_resolution.py \
   --wheelhouse release-set \
-  --manifest "$ARTIFACT_PHASE-manifest.json"
-python scripts/smoke_csv_artifact.py \
-  --phase "$ARTIFACT_PHASE" \
-  --release-set release-set \
   --manifest "$ARTIFACT_PHASE-manifest.json"
 ```
 
@@ -2449,12 +2708,17 @@ outside it. Candidate and final namespaces never merge.
 manifest, reentrancy, and lifecycle stress. `native-performance.yml` consumes
 the exact manylinux x86-64 artifact. `test.yml` requires ABI, safety,
 performance, wheel, resolver, smoke, and aggregate jobs with no empty leg.
+`native-artifacts.yml` is the single top-level exact-SHA orchestrator and has
+both `workflow_dispatch` and `workflow_call` triggers. Its nested graph calls
+the reusable workflows and exposes one aggregate conclusion only after every
+required job and matrix leg succeeds.
 
-`scripts/verify_native_ci.py collect --revision SHA --workflow ... --output
-ledger.json` invokes `gh run list --commit SHA --json`, selects only completed
-successful exact-SHA runs, verifies required matrix jobs through `gh run view
-RUN_ID --json jobs`, and writes the immutable ledger. `print-run-id` reads that
-ledger and returns the selected ID for one workflow.
+`scripts/verify_native_ci.py collect --revision SHA --workflow
+native-artifacts.yml --output ledger.json` invokes `gh run list --commit SHA
+--workflow native-artifacts.yml --json`, selects only a completed successful
+exact-SHA run, verifies the complete required nested job graph through `gh run
+view RUN_ID --json jobs`, and writes the immutable ledger. `print-run-id`
+reads that ledger and returns the selected top-level ID.
 
 - [ ] **Step 6: Run and commit workflow contracts**
 
@@ -2491,7 +2755,7 @@ Run:
 ```bash
 git status --short --branch
 mx_candidate_sha="$(git rev-parse HEAD)"
-git show "$mx_candidate_sha":src/messy_xlsx/parsing/csv_native.py | rg '_NATIVE_CSV_PRODUCTION_READY: Final\\[bool\\] = False'
+git show "$mx_candidate_sha":src/messy_xlsx/parsing/csv_native.py | rg -F '_NATIVE_CSV_PRODUCTION_READY: Final[bool] = False'
 ```
 
 Expected: only intentionally untracked `CONTINUE.md` is present and the exact
@@ -2499,37 +2763,49 @@ candidate SHA contains the false gate. If the branch has not been pushed,
 obtain explicit user authorization before pushing it; this task does not infer
 push authority.
 
-- [ ] **Step 2: Require successful workflow runs for the exact SHA**
+- [ ] **Step 2: Dispatch the single orchestrator for the exact remote tip**
 
-After the authorized push, query each required workflow with `--commit`:
+After the authorized push, run:
 
 ```bash
+mx_candidate_sha="$(git rev-parse HEAD)"
+mx_candidate_branch="$(git branch --show-current)"
+git fetch origin "$mx_candidate_branch"
+test "$(git rev-parse "origin/$mx_candidate_branch")" = "$mx_candidate_sha"
+gh workflow run native-artifacts.yml --ref "$mx_candidate_branch"
+mx_candidate_review_dir="${TMPDIR:-/tmp}/messy-xlsx-native-review-$mx_candidate_sha"
+mkdir -p "$mx_candidate_review_dir"
 .venv/bin/python scripts/verify_native_ci.py collect \
   --revision "$mx_candidate_sha" \
-  --workflow native-abi.yml \
-  --workflow native-safety.yml \
-  --workflow native-performance.yml \
   --workflow native-artifacts.yml \
-  --workflow test.yml \
-  --output candidate-run-ledger.json
+  --output "$mx_candidate_review_dir/candidate-run-ledger.json"
 ```
 
-The verifier programmatically requires `headSha == $mx_candidate_sha`,
-`status == completed`, `conclusion == success`, and every required matrix job.
-Missing, cancelled, skipped, neutral, stale-branch, older-SHA, or incomplete
-runs block enablement.
+`collect` polls the dispatched top-level run to completion within its declared
+timeout. The verifier programmatically requires `headSha ==
+$mx_candidate_sha`, `status == completed`, `conclusion == success`, and the
+complete nested ABI, safety, performance, wheel, resolver, smoke, and aggregate
+job graph. Missing, cancelled, skipped, neutral, stale-branch, older-SHA, or
+incomplete runs block enablement.
 
 - [ ] **Step 3: Download and independently verify the exact candidate manifest**
 
-Resolve the verified `native-artifacts.yml` database ID, then run:
+Use a self-contained shell so no variable or worktree ledger from Step 2 is
+required:
 
 ```bash
+mx_candidate_sha="$(git rev-parse HEAD)"
+mx_candidate_review_dir="${TMPDIR:-/tmp}/messy-xlsx-native-review-$mx_candidate_sha"
+.venv/bin/python scripts/verify_native_ci.py collect \
+  --revision "$mx_candidate_sha" \
+  --workflow native-artifacts.yml \
+  --output "$mx_candidate_review_dir/candidate-run-ledger.json"
 mx_candidate_run="$(
   .venv/bin/python scripts/verify_native_ci.py print-run-id \
-    --ledger candidate-run-ledger.json \
+    --ledger "$mx_candidate_review_dir/candidate-run-ledger.json" \
     --workflow native-artifacts.yml
 )"
-mx_candidate_download="$(mktemp -d)"
+mx_candidate_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-candidate-$mx_candidate_sha-XXXXXX")"
 gh run download "$mx_candidate_run" \
   --name "candidate-$mx_candidate_sha-release-set" \
   --dir "$mx_candidate_download"
@@ -2541,24 +2817,20 @@ gh run download "$mx_candidate_run" \
 .venv/bin/python scripts/check_wheel_resolution.py \
   --wheelhouse "$mx_candidate_download/release-set" \
   --manifest "$mx_candidate_download/candidate-manifest.json"
-.venv/bin/python scripts/smoke_csv_artifact.py \
-  --phase candidate \
-  --release-set "$mx_candidate_download/release-set" \
-  --manifest "$mx_candidate_download/candidate-manifest.json"
 ```
 
 Expected: schema version, phase, exact revision, v1.0.0 metadata, nine-file
 allowlist, seven ABI3 audits, source-archive lineage, hashes, resolver matrix,
-private native smoke, public disabled fallback, fallback extension absence,
-safety legs, and benchmark report all verify.
+per-wheel private native/public-disabled/fallback smoke records, safety legs,
+and benchmark report all verify.
 
 - [ ] **Step 4: Record the candidate acceptance checkpoint**
 
-Attach the five workflow IDs, candidate manifest SHA-256, performance-report
-SHA-256, and local verification output to the task review package. No source
-file or Git commit changes in this task. If any claimed ABI combination fails,
-stop and amend the approved design to per-minor wheels before tokenizer work
-continues.
+Attach the one top-level workflow ID, its complete nested-job ledger, candidate
+manifest SHA-256, performance-report SHA-256, and local verification output to
+the external task review package. No source file or Git commit changes in this
+task. If any claimed ABI combination fails, stop and amend the approved design
+to per-minor wheels before tokenizer work continues.
 
 ---
 
@@ -2580,12 +2852,28 @@ continues.
 
 - [ ] **Step 1: Verify the exact disabled candidate before editing**
 
-Run:
+Re-collect and re-download the accepted candidate in one shell; do not rely on
+Task 22 shell state:
 
 ```bash
 git status --short --branch
 mx_candidate_sha="$(git rev-parse HEAD)"
-git show "$mx_candidate_sha":src/messy_xlsx/parsing/csv_native.py | rg '_NATIVE_CSV_PRODUCTION_READY: Final\\[bool\\] = False'
+git show "$mx_candidate_sha":src/messy_xlsx/parsing/csv_native.py | rg -F '_NATIVE_CSV_PRODUCTION_READY: Final[bool] = False'
+mx_candidate_review_dir="${TMPDIR:-/tmp}/messy-xlsx-native-review-$mx_candidate_sha"
+mkdir -p "$mx_candidate_review_dir"
+.venv/bin/python scripts/verify_native_ci.py collect \
+  --revision "$mx_candidate_sha" \
+  --workflow native-artifacts.yml \
+  --output "$mx_candidate_review_dir/candidate-run-ledger.json"
+mx_candidate_run="$(
+  .venv/bin/python scripts/verify_native_ci.py print-run-id \
+    --ledger "$mx_candidate_review_dir/candidate-run-ledger.json" \
+    --workflow native-artifacts.yml
+)"
+mx_candidate_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-candidate-recheck-$mx_candidate_sha-XXXXXX")"
+gh run download "$mx_candidate_run" \
+  --name "candidate-$mx_candidate_sha-release-set" \
+  --dir "$mx_candidate_download"
 .venv/bin/python scripts/release_artifacts.py verify \
   --phase candidate \
   --revision "$mx_candidate_sha" \
@@ -2655,20 +2943,22 @@ Bind acceptance to the exact gate-true SHA:
 
 ```bash
 mx_final_sha="$(git rev-parse HEAD)"
+mx_final_branch="$(git branch --show-current)"
+git fetch origin "$mx_final_branch"
+test "$(git rev-parse "origin/$mx_final_branch")" = "$mx_final_sha"
+gh workflow run native-artifacts.yml --ref "$mx_final_branch"
+mx_final_review_dir="${TMPDIR:-/tmp}/messy-xlsx-native-review-$mx_final_sha"
+mkdir -p "$mx_final_review_dir"
 .venv/bin/python scripts/verify_native_ci.py collect \
   --revision "$mx_final_sha" \
-  --workflow native-abi.yml \
-  --workflow native-safety.yml \
-  --workflow native-performance.yml \
   --workflow native-artifacts.yml \
-  --workflow test.yml \
-  --output final-run-ledger.json
+  --output "$mx_final_review_dir/final-run-ledger.json"
 mx_final_artifact_run="$(
   .venv/bin/python scripts/verify_native_ci.py print-run-id \
-    --ledger final-run-ledger.json \
+    --ledger "$mx_final_review_dir/final-run-ledger.json" \
     --workflow native-artifacts.yml
 )"
-mx_final_download="$(mktemp -d)"
+mx_final_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-final-$mx_final_sha-XXXXXX")"
 gh run download "$mx_final_artifact_run" \
   --name "final-$mx_final_sha-release-set" \
   --dir "$mx_final_download"
@@ -2680,14 +2970,10 @@ gh run download "$mx_final_artifact_run" \
 .venv/bin/python scripts/check_wheel_resolution.py \
   --wheelhouse "$mx_final_download/release-set" \
   --manifest "$mx_final_download/final-manifest.json"
-.venv/bin/python scripts/smoke_csv_artifact.py \
-  --phase final \
-  --release-set "$mx_final_download/release-set" \
-  --manifest "$mx_final_download/final-manifest.json"
 ```
 
 The verifier selects `$mx_final_artifact_run` only from a completed successful
-exact-SHA row and verifies all matrix jobs. Store the ledger and final
+exact-SHA row and verifies the complete nested job graph. Store the ledger and final
 manifest/report hashes in the review package.
 
 If final CI fails, revert the gate to false, fix and verify under a new
@@ -2712,18 +2998,32 @@ Never patch an enabled revision in place.
 
 - [ ] **Step 1: Freeze and reverify the exact final revision**
 
-Run:
+Re-collect and re-download the final set in one self-contained shell:
 
 ```bash
 git status --short --branch
 mx_accept_sha="$(git rev-parse HEAD)"
-test "$mx_accept_sha" = "$mx_final_sha"
-git show "$mx_accept_sha":src/messy_xlsx/parsing/csv_native.py | rg '_NATIVE_CSV_PRODUCTION_READY: Final\\[bool\\] = True'
+git show "$mx_accept_sha":src/messy_xlsx/parsing/csv_native.py | rg -F '_NATIVE_CSV_PRODUCTION_READY: Final[bool] = True'
+mx_accept_review_dir="${TMPDIR:-/tmp}/messy-xlsx-native-review-$mx_accept_sha"
+mkdir -p "$mx_accept_review_dir"
+.venv/bin/python scripts/verify_native_ci.py collect \
+  --revision "$mx_accept_sha" \
+  --workflow native-artifacts.yml \
+  --output "$mx_accept_review_dir/final-run-ledger.json"
+mx_accept_run="$(
+  .venv/bin/python scripts/verify_native_ci.py print-run-id \
+    --ledger "$mx_accept_review_dir/final-run-ledger.json" \
+    --workflow native-artifacts.yml
+)"
+mx_accept_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-final-accept-$mx_accept_sha-XXXXXX")"
+gh run download "$mx_accept_run" \
+  --name "final-$mx_accept_sha-release-set" \
+  --dir "$mx_accept_download"
 .venv/bin/python scripts/release_artifacts.py verify \
   --phase final \
   --revision "$mx_accept_sha" \
-  --dist "$mx_final_download/release-set" \
-  --manifest "$mx_final_download/final-manifest.json"
+  --dist "$mx_accept_download/release-set" \
+  --manifest "$mx_accept_download/final-manifest.json"
 ```
 
 Expected: only intentionally untracked `CONTINUE.md` is present, HEAD is the
@@ -2773,14 +3073,79 @@ uvx --from abi3audit==0.0.26 abi3audit --strict "$mx_accept_root"/native/*abi3*.
 git diff --check
 ```
 
-Also rerun the fixed-seed 5,000-case differential fuzz suites, ASan/UBSan,
-debug-allocator lifecycle suite, deterministic performance-contract tests,
-native/fallback clean-install smoke, and artifact/resolver verification.
+- [ ] **Step 4: Run exact native safety, performance, smoke, and artifact commands**
+
+Run this self-contained gate:
+
+```bash
+mx_accept_sha="$(git rev-parse HEAD)"
+mx_accept_review_dir="${TMPDIR:-/tmp}/messy-xlsx-native-review-$mx_accept_sha"
+mkdir -p "$mx_accept_review_dir"
+.venv/bin/python scripts/verify_native_ci.py collect \
+  --revision "$mx_accept_sha" \
+  --workflow native-artifacts.yml \
+  --output "$mx_accept_review_dir/final-run-ledger.json"
+mx_accept_run="$(
+  .venv/bin/python scripts/verify_native_ci.py print-run-id \
+    --ledger "$mx_accept_review_dir/final-run-ledger.json" \
+    --workflow native-artifacts.yml
+)"
+mx_accept_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-final-gates-$mx_accept_sha-XXXXXX")"
+gh run download "$mx_accept_run" \
+  --name "final-$mx_accept_sha-release-set" \
+  --dir "$mx_accept_download"
+.venv/bin/python scripts/release_artifacts.py verify \
+  --phase final \
+  --revision "$mx_accept_sha" \
+  --dist "$mx_accept_download/release-set" \
+  --manifest "$mx_accept_download/final-manifest.json"
+.venv/bin/python scripts/check_wheel_resolution.py \
+  --wheelhouse "$mx_accept_download/release-set" \
+  --manifest "$mx_accept_download/final-manifest.json"
+mx_accept_performance_report="$(
+  find "$mx_accept_download" -type f -name 'native-csv-performance.json' -print -quit
+)"
+test -n "$mx_accept_performance_report"
+.venv/bin/python scripts/run_native_csv_benchmarks.py \
+  --phase final \
+  --validate-report "$mx_accept_performance_report"
+.venv/bin/python scripts/run_native_csv_fuzz.py \
+  --c-seed 0x0C5A14 \
+  --python-seed 0xBADC5EED \
+  --examples 5000 \
+  --timeout 300
+bash scripts/run_native_csv_sanitizers.sh
+PYTHONMALLOC=debug .venv/bin/pytest tests/native_csv -q
+.venv/bin/pytest tests/test_performance/test_native_csv_contract.py -q
+mx_accept_native_wheel="$(
+  find "$mx_accept_download/release-set" -maxdepth 1 -type f \
+    -name '*manylinux_2_17_x86_64.manylinux2014_x86_64.whl' -print -quit
+)"
+mx_accept_fallback_wheel="$(
+  find "$mx_accept_download/release-set" -maxdepth 1 -type f \
+    -name '*-py3-none-any.whl' -print -quit
+)"
+test -n "$mx_accept_native_wheel"
+test -n "$mx_accept_fallback_wheel"
+mx_accept_native_sha="$(sha256sum "$mx_accept_native_wheel" | cut -d' ' -f1)"
+mx_accept_fallback_sha="$(sha256sum "$mx_accept_fallback_wheel" | cut -d' ' -f1)"
+.venv/bin/python scripts/smoke_csv_artifact.py \
+  --phase final \
+  --wheel "$mx_accept_native_wheel" \
+  --wheel-sha256 "$mx_accept_native_sha" \
+  --output "$mx_accept_review_dir/local-native-smoke.json"
+.venv/bin/python scripts/smoke_csv_artifact.py \
+  --phase final \
+  --wheel "$mx_accept_fallback_wheel" \
+  --wheel-sha256 "$mx_accept_fallback_sha" \
+  --output "$mx_accept_review_dir/local-fallback-smoke.json"
+test "$(git rev-parse HEAD)" = "$mx_accept_sha"
+```
 
 Expected: all checks pass with no production pandas-chunk reader, no duplicate
 Python full pass, no public API change, and no ownership/memory regression.
 
-- [ ] **Step 4: Obtain independent compatibility, safety, and release-readiness reviews**
+- [ ] **Step 5: Obtain independent compatibility, safety, and release-readiness reviews**
 
 Give each reviewer the approved design, this plan, the complete diff, focused
 and full test output, sanitizer/fuzz reports, performance JSON, candidate/final
@@ -2788,12 +3153,20 @@ manifests, and CI URLs. Resolve every blocker with a regression test and repeat
 the affected gate. Do not mark Task 14 complete on reviewer promises or
 partial CI.
 
-- [ ] **Step 5: Close the exact-SHA acceptance checkpoint without source changes**
+- [ ] **Step 6: Close the exact-SHA acceptance checkpoint without source changes**
 
 Attach full local output, exact workflow IDs, candidate/final manifests,
 performance JSON, fuzz seeds/results, sanitizer logs, clean-install smoke, and
-all three independent approvals to the implementation review package. Confirm
-`git rev-parse HEAD` still equals `$mx_accept_sha`.
+all three independent approvals to the implementation review package. Run:
+
+```bash
+mx_accept_sha="$(git rev-parse HEAD)"
+git show "$mx_accept_sha":src/messy_xlsx/parsing/csv_native.py | rg -F '_NATIVE_CSV_PRODUCTION_READY: Final[bool] = True'
+git status --short --branch
+```
+
+Expected: HEAD is still the independently accepted gate-true revision and only
+intentionally untracked `CONTINUE.md` is present.
 
 Do not edit, commit, tag, or publish in this task. Parent Task 20 later updates
 README/docs/changelog and must rebuild/reverify a new final set on that exact
