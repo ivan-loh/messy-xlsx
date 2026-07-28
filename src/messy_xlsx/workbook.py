@@ -2235,7 +2235,24 @@ class MessyWorkbook:
             date_system=date_system,
         )
         if csv_execution is not None:
-            self.parse_metrics.record_csv_execution(*csv_execution)
+            if construction_owner is not None:
+                construction_owner.attach(prepared.reader)
+                self.parse_metrics.record_csv_execution(*csv_execution)
+            else:
+                try:
+                    self.parse_metrics.record_csv_execution(*csv_execution)
+                except BaseException as error:
+                    _run_cleanups(
+                        [
+                            (
+                                "unowned materialized CSV reader rollback",
+                                lambda: _close_if_present(prepared.reader),
+                            )
+                        ],
+                        primary_error=error,
+                        primary_traceback=_exception_traceback(error),
+                    )
+                    raise
         return prepared
 
     def _prepare_ooxml_stream(

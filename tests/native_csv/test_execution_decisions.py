@@ -109,6 +109,26 @@ def _assert_csv_execution_unrecorded(workbook: MessyWorkbook) -> None:
     assert metrics.csv_execution_counts == {}
 
 
+def _track_materialized_reader_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[object]:
+    import messy_xlsx.parsing.materialized_streaming as materialized_streaming
+
+    close_calls: list[object] = []
+    real_close = materialized_streaming.PublicSchemaReader.close
+
+    def record_close(reader: object) -> None:
+        close_calls.append(reader)
+        real_close(reader)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        materialized_streaming.PublicSchemaReader,
+        "close",
+        record_close,
+    )
+    return close_calls
+
+
 def test_candidate_public_csv_route_is_materialized(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -201,3 +221,74 @@ def test_custom_reader_construction_failure_records_no_csv_decision(
         with pytest.raises(RuntimeError, match="custom reader construction failed"):
             workbook.iter_batches(config=SheetConfig(auto_detect=False))
         _assert_csv_execution_unrecorded(workbook)
+
+
+@pytest.mark.parametrize("route", ["candidate", "custom"])
+def test_materialized_csv_recording_failure_closes_owned_reader_once(
+    route: str,
+    custom_csv_registry: HandlerRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messy_xlsx.parsing import csv_native
+    from messy_xlsx.parsing.contracts import ParseMetrics
+
+    close_calls = _track_materialized_reader_closes(monkeypatch)
+    failure = MemoryError(f"{route} CSV metric recording failed")
+
+    def fail_recording(
+        _metrics: ParseMetrics,
+        _kind: object,
+        _reason: object,
+    ) -> None:
+        raise failure
+
+    monkeypatch.setattr(csv_native, "_NATIVE_CSV_PRODUCTION_READY", False)
+    monkeypatch.setattr(ParseMetrics, "record_csv_execution", fail_recording)
+    registry = custom_csv_registry if route == "custom" else None
+
+    with MessyWorkbook(
+        io.BytesIO(b"a\n1\n"),
+        filename=f"{route}.csv",
+        registry=registry,
+    ) as workbook:
+        with pytest.raises(MemoryError) as captured:
+            workbook.iter_batches(
+                batch_size=1,
+                config=SheetConfig(auto_detect=False),
+            )
+        assert captured.value is failure
+        assert len(close_calls) == 1
+
+    assert len(close_calls) == 1
+
+
+def test_materialized_csv_recording_failure_without_owner_rolls_back_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messy_xlsx.parsing import csv_native
+    from messy_xlsx.parsing.contracts import ParseMetrics
+
+    close_calls = _track_materialized_reader_closes(monkeypatch)
+    failure = MemoryError("unowned CSV metric recording failed")
+
+    def fail_recording(
+        _metrics: ParseMetrics,
+        _kind: object,
+        _reason: object,
+    ) -> None:
+        raise failure
+
+    monkeypatch.setattr(csv_native, "_NATIVE_CSV_PRODUCTION_READY", False)
+    monkeypatch.setattr(ParseMetrics, "record_csv_execution", fail_recording)
+
+    with MessyWorkbook(io.BytesIO(b"a\n1\n"), filename="unowned.csv") as workbook:
+        with pytest.raises(MemoryError) as captured:
+            workbook._prepare_streaming_operation(
+                None,
+                1,
+                SheetConfig(auto_detect=False),
+            )
+        assert captured.value is failure
+        assert len(close_calls) == 1
+
+    assert len(close_calls) == 1
