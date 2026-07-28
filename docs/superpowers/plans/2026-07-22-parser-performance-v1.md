@@ -3582,10 +3582,12 @@ def run_xlsx(path: str) -> dict[str, object]:
         "shape": list(frame.shape),
         "dtypes": [str(dtype) for dtype in frame.dtypes],
         "output_hash": hashlib.sha256(payload.encode()).hexdigest(),
+        "pandas_version": pd.__version__,
     }
 
 
 def main() -> None:
+    assert pd.__version__ == "3.0.5"
     parser = argparse.ArgumentParser()
     parser.add_argument("--xlsx", required=True)
     args = parser.parse_args()
@@ -3596,7 +3598,11 @@ if __name__ == "__main__":
     main()
 ```
 
-Add worker modes for raw/normalized CSV path and seekable buffer, multi-sheet counters, Arrow batches, and shared-string-heavy OOXML. Include dependency versions and `/proc/cpuinfo` model where available.
+Add worker modes for raw/normalized CSV path and seekable buffer, multi-sheet
+counters, Arrow batches, and shared-string-heavy OOXML. Every record includes
+`"pandas_version": "3.0.5"`; the worker refuses to run under any other pandas
+version. Include all dependency versions and `/proc/cpuinfo` model where
+available. Contract tests reject a missing or different pandas version.
 
 - [ ] **Step 3: Implement paired orchestration and median comparison**
 
@@ -3608,7 +3614,7 @@ defusedxml==0.7.1
 fastexcel==0.20.2
 numpy==2.5.1
 openpyxl==3.1.5
-pandas==3.0.3
+pandas==3.0.5
 pyarrow==25.0.0
 xlrd==2.0.2
 ```
@@ -3766,7 +3772,7 @@ exclude_docs: |
 
 Assert both `pyproject.toml` and `src/messy_xlsx/__init__.py` already equal
 `1.0.0`; do not create a second version transition. Add
-`## [1.0.0] - 2026-07-22` to `CHANGELOG.md` with compatibility, performance,
+`## [1.0.0] - 2026-07-28` to `CHANGELOG.md` with compatibility, performance,
 API, security, and migration notes. Keep `docs/changelog.md` including the
 canonical root changelog.
 
@@ -3868,23 +3874,34 @@ gh workflow view publish.yml
 gh workflow view native-artifacts.yml
 ```
 
-After an explicitly authorized branch push, dispatch and accept the single
-complete native artifact orchestrator on this exact release SHA:
+After an explicitly authorized branch push, land the reviewed release commit
+on `main` through the repository's normal reviewed integration flow. A merge
+or squash creates a new SHA, so no feature-branch artifact is releasable.
+Wait for the `native-artifacts.yml` push trigger on `main`, then accept that
+exact immutable main-tip SHA:
 
 ```bash
-mx_release_sha="$(git rev-parse HEAD)"
-mx_release_branch="$(git branch --show-current)"
-git fetch origin "$mx_release_branch"
-test "$(git rev-parse "origin/$mx_release_branch")" = "$mx_release_sha"
-gh workflow run native-artifacts.yml --ref "$mx_release_branch"
+git fetch origin main
+mx_release_sha="$(git rev-parse origin/main)"
+git show "$mx_release_sha":src/messy_xlsx/parsing/csv_native.py | rg -F '_NATIVE_CSV_PRODUCTION_READY: Final[bool] = True'
+git show "$mx_release_sha":pyproject.toml | rg -F 'version = "1.0.0"'
 mx_release_review_dir="${TMPDIR:-/tmp}/messy-xlsx-native-release-$mx_release_sha"
 mkdir -p "$mx_release_review_dir"
-.venv/bin/python scripts/verify_native_ci.py collect \
+mx_release_exact_root="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-native-release-source-$mx_release_sha-XXXXXX")"
+mkdir -p "$mx_release_exact_root/source"
+git archive "$mx_release_sha" | tar -x -C "$mx_release_exact_root/source"
+mx_release_venv="$(pwd)/.venv"
+uv pip install --python "$mx_release_venv/bin/python" \
+  -e "$mx_release_exact_root/source[dev,docs,all]" \
+  -r "$mx_release_exact_root/source/requirements/native-release.txt"
+MESSY_XLSX_BUILD_MODE=native uv pip install --python "$mx_release_venv/bin/python" \
+  --no-deps --reinstall -e "$mx_release_exact_root/source"
+"$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/verify_native_ci.py" collect \
   --revision "$mx_release_sha" \
   --workflow native-artifacts.yml \
   --output "$mx_release_review_dir/final-run-ledger.json"
 mx_release_run="$(
-  .venv/bin/python scripts/verify_native_ci.py print-run-id \
+  "$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/verify_native_ci.py" print-run-id \
     --ledger "$mx_release_review_dir/final-run-ledger.json" \
     --workflow native-artifacts.yml
 )"
@@ -3892,23 +3909,47 @@ mx_release_download="$(mktemp -d "${TMPDIR:-/tmp}/messy-xlsx-native-release-set-
 gh run download "$mx_release_run" \
   --name "final-$mx_release_sha-release-set" \
   --dir "$mx_release_download"
-.venv/bin/python scripts/release_artifacts.py verify \
+mx_release_performance_report="$mx_release_download/final-$mx_release_sha-native-csv-performance.json"
+test -f "$mx_release_performance_report"
+"$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/release_artifacts.py" verify \
   --phase final \
   --revision "$mx_release_sha" \
   --dist "$mx_release_download/release-set" \
-  --manifest "$mx_release_download/final-manifest.json"
-.venv/bin/python scripts/check_wheel_resolution.py \
+  --manifest "$mx_release_download/final-manifest.json" \
+  --performance-report "$mx_release_performance_report"
+"$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/check_wheel_resolution.py" \
   --wheelhouse "$mx_release_download/release-set" \
   --manifest "$mx_release_download/final-manifest.json"
-mx_release_performance_report="$(
-  find "$mx_release_download" -type f -name 'native-csv-performance.json' -print -quit
-)"
-test -n "$mx_release_performance_report"
-.venv/bin/python scripts/run_native_csv_benchmarks.py \
+"$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/run_native_csv_benchmarks.py" \
   --phase final \
   --validate-report "$mx_release_performance_report"
-.venv/bin/twine check "$mx_release_download"/release-set/*
-test "$(git rev-parse HEAD)" = "$mx_release_sha"
+"$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/verify_native_ci.py" accept \
+  --ledger "$mx_release_review_dir/final-run-ledger.json" \
+  --manifest "$mx_release_download/final-manifest.json" \
+  --performance-report "$mx_release_performance_report" \
+  --output "$mx_release_review_dir/final-acceptance.json"
+"$mx_release_venv/bin/twine" check "$mx_release_download"/release-set/*
+mx_release_sdist="$(find "$mx_release_download/release-set" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+mx_release_native_wheel="$(find "$mx_release_download/release-set" -maxdepth 1 -type f -name '*manylinux_2_17_x86_64.manylinux2014_x86_64.whl' -print -quit)"
+mx_release_fallback_wheel="$(find "$mx_release_download/release-set" -maxdepth 1 -type f -name '*-py3-none-any.whl' -print -quit)"
+test -n "$mx_release_sdist"
+test -n "$mx_release_native_wheel"
+test -n "$mx_release_fallback_wheel"
+"$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/smoke_release_install.py" --artifact "$mx_release_sdist"
+"$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/smoke_release_install.py" --artifact "$mx_release_native_wheel"
+"$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/smoke_release_install.py" --artifact "$mx_release_fallback_wheel"
+mx_release_ledger_sha="$(
+  "$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/verify_native_ci.py" print-revision \
+    --ledger "$mx_release_review_dir/final-run-ledger.json"
+)"
+mx_release_acceptance_sha="$(
+  "$mx_release_venv/bin/python" "$mx_release_exact_root/source/scripts/verify_native_ci.py" print-revision \
+    --acceptance "$mx_release_review_dir/final-acceptance.json"
+)"
+test "$mx_release_ledger_sha" = "$mx_release_sha"
+test "$mx_release_acceptance_sha" = "$mx_release_sha"
+git fetch origin main
+test "$(git rev-parse origin/main)" = "$mx_release_sha"
 ```
 
 Expected: test/publish workflows are valid, and one source archive, seven
@@ -3918,7 +3959,13 @@ provenance verification. No earlier candidate/final manifest may be reused
 after documentation/changelog changes. The publish workflow requires a `v*`
 tag whose version matches package, module, changelog, and `main` tip.
 
-Only after the branch is pushed, every required GitHub check passes, the paired benchmark artifact is accepted, and the user explicitly authorizes publication should execution create and push tag `v1.0.0`.
+Only after the release commit is integrated, the unchanged `origin/main` SHA
+passes every required GitHub check, the exact performance artifact and three
+downloaded install smokes are accepted, and the user explicitly authorizes
+publication should execution create and push tag `v1.0.0` at
+`$mx_release_sha`. Re-fetch and reassert `origin/main == $mx_release_sha`
+immediately before creating the tag; any main-tip change requires a new
+complete final matrix.
 
 ---
 
