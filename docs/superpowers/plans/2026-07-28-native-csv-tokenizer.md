@@ -334,6 +334,8 @@ Add recorded-run tests for
 `verify_native_ci.py collect --revision --workflow --output` and
 `print-run-id`; wrong SHA, nonterminal/nonsuccess conclusions, and missing
 required matrix jobs must fail.
+Add `test_native_abi_workflow_is_dispatchable_and_reusable`, which parses
+`native-abi.yml` and requires both `workflow_dispatch` and `workflow_call`.
 
 - [ ] **Step 2: Run the red build tests**
 
@@ -408,6 +410,13 @@ the ABI shell in a fresh extraction with ASan/UBSan and runs only
 allocation/reallocation fault path. Task 15 expands the same script to the full
 semantic suite and test-owned allocation manifest.
 
+Implement `verify_native_ci.py collect` with a two-hour deadline and a
+30-second poll interval. It waits for the requested exact-SHA dispatch to
+appear and reach a terminal state, then accepts only `success` with the full
+test-owned ABI job matrix. Recorded-fixture tests inject the clock and `gh`
+responses, so they cover not-yet-visible, queued, success, terminal failure,
+timeout, wrong-SHA, and incomplete-matrix states without sleeping.
+
 - [ ] **Step 4: Build, audit, and test both modes locally**
 
 Run:
@@ -468,6 +477,10 @@ Obtain explicit user authorization before pushing. After the authorized push:
 
 ```bash
 mx_abi_sha="$(git rev-parse HEAD)"
+mx_abi_branch="$(git branch --show-current)"
+git fetch origin "$mx_abi_branch"
+test "$(git rev-parse "origin/$mx_abi_branch")" = "$mx_abi_sha"
+gh workflow run native-abi.yml --ref "$mx_abi_branch"
 mx_abi_review_dir="${TMPDIR:-/tmp}/messy-xlsx-native-review-$mx_abi_sha"
 mkdir -p "$mx_abi_review_dir"
 .venv/bin/python scripts/verify_native_ci.py collect \
@@ -476,6 +489,7 @@ mkdir -p "$mx_abi_review_dir"
   --output "$mx_abi_review_dir/native-abi-run-ledger.json"
 ```
 
+`collect` polls for the dispatched exact-SHA run and then verifies it.
 Expected: the exact commit has a completed successful workflow with every
 seven-wheel/CPython 3.11–3.14 shell-smoke leg and strict ABI audit. The
 complete remote ABI-shell matrix must succeed before Task 3 begins; a local
