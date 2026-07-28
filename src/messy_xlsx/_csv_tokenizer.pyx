@@ -151,6 +151,8 @@ cdef class NativeCSVTokenizer:
             raise
 
     def close(self):
+        if self._state == "reading":
+            raise RuntimeError("cannot close native CSV tokenizer while reading")
         if self._state == "closed":
             return
         if self._allocation != NULL:

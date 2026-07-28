@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -47,9 +48,11 @@ class RecordedGH:
         self,
         run_lists: Sequence[list[dict[str, Any]]],
         run_view: dict[str, Any] | None = None,
+        run_details: dict[int, dict[str, Any]] | None = None,
     ) -> None:
         self._run_lists = list(run_lists)
         self._run_view = run_view
+        self._run_details = {} if run_details is None else run_details
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, arguments: Sequence[str]) -> object:
@@ -59,9 +62,22 @@ class RecordedGH:
             if len(self._run_lists) > 1:
                 return self._run_lists.pop(0)
             return self._run_lists[0]
+        if call[:1] == ("api",):
+            run_id = int(call[1].rsplit("/", maxsplit=1)[-1])
+            return self._run_details.get(run_id, _api_run(database_id=run_id))
         if call[:2] == ("run", "view") and self._run_view is not None:
             return self._run_view
         raise AssertionError(f"unexpected gh call: {call!r}")
+
+
+class FeatureBranchWorkflowGH(RecordedGH):
+    """Model gh rejecting a workflow selector absent from the default branch."""
+
+    def __call__(self, arguments: Sequence[str]) -> object:
+        call = tuple(arguments)
+        if call[:2] == ("run", "list") and "--workflow" in call:
+            raise RuntimeError("workflow not found on the default branch")
+        return super().__call__(arguments)
 
 
 class RecordedClock:
@@ -77,19 +93,80 @@ class RecordedClock:
         self.now += seconds
 
 
+class SlowRecordedGH(RecordedGH):
+    def __init__(
+        self,
+        *,
+        clock: RecordedClock,
+        slow_call: str,
+    ) -> None:
+        super().__init__([[_run()]], _view())
+        self._clock = clock
+        self._slow_call = slow_call
+
+    def __call__(self, arguments: Sequence[str]) -> object:
+        result = super().__call__(arguments)
+        call = tuple(arguments)
+        call_kind = (
+            "list"
+            if call[:2] == ("run", "list")
+            else "identity"
+            if call[:1] == ("api",)
+            else "view"
+        )
+        if call_kind == self._slow_call:
+            self._clock.now += 61.0
+        return result
+
+
+class HungProcess:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def __call__(self, command: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        timeout = kwargs.get("timeout")
+        assert isinstance(timeout, float)
+        self.timeouts.append(timeout)
+        raise subprocess.TimeoutExpired(command, timeout)
+
+
 def _run(
     *,
     head_sha: str = REVISION,
+    event: str = "push",
     status: str = "completed",
     conclusion: str | None = "success",
     database_id: int = 4201,
+    workflow_id: int = 901,
 ) -> dict[str, Any]:
     return {
         "databaseId": database_id,
         "headSha": head_sha,
+        "event": event,
         "status": status,
         "conclusion": conclusion,
         "url": f"https://example.invalid/runs/{database_id}",
+        "workflowDatabaseId": workflow_id,
+    }
+
+
+def _api_run(
+    *,
+    database_id: int = 4201,
+    head_sha: str = REVISION,
+    event: str = "push",
+    workflow_id: int = 901,
+    workflow_path: str = ".github/workflows/native-abi.yml",
+) -> dict[str, Any]:
+    return {
+        "id": database_id,
+        "head_sha": head_sha,
+        "event": event,
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": f"https://example.invalid/runs/{database_id}",
+        "workflow_id": workflow_id,
+        "path": workflow_path,
     }
 
 
@@ -108,14 +185,116 @@ def _successful_jobs() -> list[dict[str, Any]]:
 def _view(
     *,
     head_sha: str = REVISION,
+    event: str = "push",
     status: str = "completed",
     conclusion: str | None = "success",
     jobs: list[dict[str, Any]] | None = None,
+    workflow_id: int = 901,
 ) -> dict[str, Any]:
     return {
-        **_run(head_sha=head_sha, status=status, conclusion=conclusion),
+        **_run(
+            head_sha=head_sha,
+            event=event,
+            status=status,
+            conclusion=conclusion,
+            workflow_id=workflow_id,
+        ),
         "jobs": _successful_jobs() if jobs is None else jobs,
     }
+
+
+def test_collect_discovers_feature_only_workflow_without_default_branch_selector(
+    tmp_path: Path,
+) -> None:
+    verifier = _load_verifier()
+    output = tmp_path / "ledger.json"
+    gh = FeatureBranchWorkflowGH([[_run()]], _view())
+
+    ledger = verifier.collect(
+        revision=REVISION,
+        workflow="native-abi.yml",
+        output=output,
+        gh_json=gh,
+    )
+
+    list_call = next(call for call in gh.calls if call[:2] == ("run", "list"))
+    assert "--workflow" not in list_call
+    assert list_call[list_call.index("--event") + 1] == "push"
+    assert any(call[:1] == ("api",) for call in gh.calls)
+    assert ledger["run"]["workflow_id"] == 901
+    assert ledger["run"]["workflow_path"] == ".github/workflows/native-abi.yml"
+
+
+def test_collect_rejects_same_sha_run_from_different_workflow(
+    tmp_path: Path,
+) -> None:
+    verifier = _load_verifier()
+    gh = RecordedGH(
+        [[_run()]],
+        _view(),
+        run_details={
+            4201: _api_run(workflow_path=".github/workflows/unrelated.yml"),
+        },
+    )
+    clock = RecordedClock()
+
+    with pytest.raises(verifier.RunVerificationError):
+        verifier.collect(
+            revision=REVISION,
+            workflow="native-abi.yml",
+            output=tmp_path / "ledger.json",
+            gh_json=gh,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            timeout_seconds=30,
+        )
+
+    assert not (tmp_path / "ledger.json").exists()
+
+
+@pytest.mark.parametrize("slow_call", ["list", "identity", "view"])
+def test_collect_rejects_successful_gh_call_that_returns_after_deadline(
+    tmp_path: Path,
+    slow_call: str,
+) -> None:
+    verifier = _load_verifier()
+    clock = RecordedClock()
+    gh = SlowRecordedGH(clock=clock, slow_call=slow_call)
+
+    with pytest.raises(verifier.RunVerificationError, match="timed out"):
+        verifier.collect(
+            revision=REVISION,
+            workflow="native-abi.yml",
+            output=tmp_path / "ledger.json",
+            gh_json=gh,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            timeout_seconds=60,
+        )
+
+    assert not (tmp_path / "ledger.json").exists()
+
+
+def test_collect_bounds_hung_gh_subprocess_by_remaining_deadline(
+    tmp_path: Path,
+) -> None:
+    verifier = _load_verifier()
+    clock = RecordedClock()
+    process = HungProcess()
+
+    with pytest.raises(verifier.RunVerificationError, match="timed out"):
+        verifier.collect(
+            revision=REVISION,
+            workflow="native-abi.yml",
+            output=tmp_path / "ledger.json",
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            timeout_seconds=47,
+            run_process=process,
+        )
+
+    assert process.timeouts == [47.0]
+    assert not (tmp_path / "ledger.json").exists()
 
 
 def test_collect_waits_for_visibility_and_completion_without_real_sleep(

@@ -11,8 +11,8 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Protocol
 
 DEFAULT_TIMEOUT_SECONDS = 2 * 60 * 60
 POLL_INTERVAL_SECONDS = 30.0
@@ -49,13 +49,31 @@ Monotonic = Callable[[], float]
 Sleep = Callable[[float], None]
 
 
-def _run_gh_json(arguments: Sequence[str]) -> object:
-    process = subprocess.run(
-        ["gh", *arguments],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+class ProcessRunner(Protocol):
+    def __call__(
+        self,
+        command: Sequence[str],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]: ...
+
+
+def _run_gh_json(
+    arguments: Sequence[str],
+    *,
+    timeout_seconds: float,
+    run_process: ProcessRunner | None = None,
+) -> object:
+    execute = subprocess.run if run_process is None else run_process
+    try:
+        process = execute(
+            ["gh", *arguments],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RunVerificationError(f"timed out waiting for gh {' '.join(arguments)}") from exc
     if process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip()
         raise RunVerificationError(f"gh {' '.join(arguments)} failed: {detail}")
@@ -89,6 +107,57 @@ def _run_database_id(run: dict[str, Any]) -> int:
     return database_id
 
 
+def _workflow_path(workflow: str) -> str:
+    candidate = PurePosixPath(workflow)
+    if len(candidate.parts) == 1:
+        candidate = PurePosixPath(".github/workflows") / candidate
+    if candidate.parent != PurePosixPath(".github/workflows") or not candidate.name:
+        raise RunVerificationError("workflow must name one file directly below .github/workflows")
+    return str(candidate)
+
+
+def _remaining_seconds(
+    *,
+    monotonic: Monotonic,
+    deadline: float,
+    detail: str,
+) -> float:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise RunVerificationError(f"timed out waiting for {detail}")
+    return remaining
+
+
+def _call_gh_json(
+    arguments: Sequence[str],
+    *,
+    gh_json: GHJSON | None,
+    run_process: ProcessRunner | None,
+    monotonic: Monotonic,
+    deadline: float,
+    detail: str,
+) -> object:
+    remaining = _remaining_seconds(
+        monotonic=monotonic,
+        deadline=deadline,
+        detail=detail,
+    )
+    if gh_json is None:
+        result = _run_gh_json(
+            arguments,
+            timeout_seconds=remaining,
+            run_process=run_process,
+        )
+    else:
+        result = gh_json(arguments)
+    _remaining_seconds(
+        monotonic=monotonic,
+        deadline=deadline,
+        detail=detail,
+    )
+    return result
+
+
 def _wait_or_timeout(
     *,
     monotonic: Monotonic,
@@ -100,6 +169,97 @@ def _wait_or_timeout(
     if now >= deadline:
         raise RunVerificationError(f"timed out waiting for {detail}")
     sleep(min(POLL_INTERVAL_SECONDS, deadline - now))
+
+
+def _matching_workflow_identity(
+    raw_identity: object,
+    *,
+    run_id: int,
+    revision: str,
+    workflow_path: str,
+) -> tuple[int, str] | None:
+    identity = _as_mapping(raw_identity, "workflow run identity")
+    if identity.get("id") != run_id:
+        raise RunVerificationError("workflow run identity database ID changed")
+    if identity.get("head_sha") != revision:
+        raise RunVerificationError("workflow run identity SHA changed")
+    if identity.get("event") != "push":
+        raise RunVerificationError("workflow run identity event is not push")
+    actual_path = identity.get("path")
+    if not isinstance(actual_path, str):
+        raise RunVerificationError("workflow run identity path is invalid")
+    if actual_path != workflow_path:
+        return None
+    workflow_id = identity.get("workflow_id")
+    if not isinstance(workflow_id, int) or isinstance(workflow_id, bool):
+        raise RunVerificationError("workflow run identity workflow ID is invalid")
+    return workflow_id, actual_path
+
+
+def _discover_matching_runs(
+    raw_runs: object,
+    *,
+    revision: str,
+    workflow_path: str,
+    gh_json: GHJSON | None,
+    run_process: ProcessRunner | None,
+    monotonic: Monotonic,
+    deadline: float,
+) -> list[tuple[dict[str, Any], int, str]]:
+    runs = [_as_mapping(run, "workflow run") for run in _as_sequence(raw_runs, "workflow runs")]
+    exact_runs = [
+        run for run in runs if run.get("headSha") == revision and run.get("event") == "push"
+    ]
+    matching_runs: list[tuple[dict[str, Any], int, str]] = []
+    for candidate in exact_runs:
+        candidate_id = _run_database_id(candidate)
+        identity = _matching_workflow_identity(
+            _call_gh_json(
+                [
+                    "api",
+                    f"repos/{{owner}}/{{repo}}/actions/runs/{candidate_id}",
+                ],
+                gh_json=gh_json,
+                run_process=run_process,
+                monotonic=monotonic,
+                deadline=deadline,
+                detail=f"run {candidate_id} workflow identity",
+            ),
+            run_id=candidate_id,
+            revision=revision,
+            workflow_path=workflow_path,
+        )
+        if identity is not None:
+            workflow_id, actual_workflow_path = identity
+            matching_runs.append((candidate, workflow_id, actual_workflow_path))
+    return matching_runs
+
+
+def _validate_run_view(
+    raw_view: object,
+    *,
+    run_id: int,
+    revision: str,
+    workflow_id: int,
+) -> dict[str, Any]:
+    viewed = _as_mapping(raw_view, "workflow run view")
+    if viewed.get("headSha") != revision:
+        raise RunVerificationError(
+            f"run view SHA {viewed.get('headSha')!r} does not match {revision}"
+        )
+    if viewed.get("event") != "push":
+        raise RunVerificationError("run view event is not push")
+    if viewed.get("status") != "completed" or viewed.get("conclusion") != "success":
+        raise RunVerificationError(
+            "run view is not completed successfully: "
+            f"status={viewed.get('status')!r}, "
+            f"conclusion={viewed.get('conclusion')!r}"
+        )
+    if _run_database_id(viewed) != run_id:
+        raise RunVerificationError("run view database ID changed")
+    if viewed.get("workflowDatabaseId") != workflow_id:
+        raise RunVerificationError("run view workflow ID changed")
+    return viewed
 
 
 def _validate_required_jobs(raw_jobs: object) -> list[dict[str, Any]]:
@@ -157,6 +317,7 @@ def collect(
     monotonic: Monotonic | None = None,
     sleep: Sleep | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    run_process: ProcessRunner | None = None,
 ) -> dict[str, Any]:
     """Wait for and validate one exact-SHA successful native ABI workflow run."""
 
@@ -166,29 +327,41 @@ def collect(
     if timeout_seconds <= 0:
         raise RunVerificationError("timeout_seconds must be positive")
 
-    run_gh = _run_gh_json if gh_json is None else gh_json
+    expected_workflow_path = _workflow_path(workflow)
     read_clock = time.monotonic if monotonic is None else monotonic
     wait = time.sleep if sleep is None else sleep
     deadline = read_clock() + timeout_seconds
 
     while True:
-        raw_runs = run_gh(
+        raw_runs = _call_gh_json(
             [
                 "run",
                 "list",
                 "--commit",
                 revision,
-                "--workflow",
-                workflow,
+                "--event",
+                "push",
                 "--limit",
                 "100",
                 "--json",
-                "databaseId,headSha,status,conclusion,url",
-            ]
+                "databaseId,headSha,event,status,conclusion,url",
+            ],
+            gh_json=gh_json,
+            run_process=run_process,
+            monotonic=read_clock,
+            deadline=deadline,
+            detail=f"{workflow} run listing at {revision}",
         )
-        runs = [_as_mapping(run, "workflow run") for run in _as_sequence(raw_runs, "workflow runs")]
-        exact_runs = [run for run in runs if run.get("headSha") == revision]
-        if not exact_runs:
+        matching_runs = _discover_matching_runs(
+            raw_runs,
+            revision=revision,
+            workflow_path=expected_workflow_path,
+            gh_json=gh_json,
+            run_process=run_process,
+            monotonic=read_clock,
+            deadline=deadline,
+        )
+        if not matching_runs:
             _wait_or_timeout(
                 monotonic=read_clock,
                 sleep=wait,
@@ -197,7 +370,10 @@ def collect(
             )
             continue
 
-        selected = max(exact_runs, key=_run_database_id)
+        selected, workflow_id, actual_workflow_path = max(
+            matching_runs,
+            key=lambda item: _run_database_id(item[0]),
+        )
         status = selected.get("status")
         conclusion = selected.get("conclusion")
         if status != "completed":
@@ -214,30 +390,25 @@ def collect(
             )
 
         run_id = _run_database_id(selected)
-        viewed = _as_mapping(
-            run_gh(
+        viewed = _validate_run_view(
+            _call_gh_json(
                 [
                     "run",
                     "view",
                     str(run_id),
                     "--json",
-                    "databaseId,headSha,status,conclusion,url,jobs",
-                ]
+                    "databaseId,headSha,event,status,conclusion,url,workflowDatabaseId,jobs",
+                ],
+                gh_json=gh_json,
+                run_process=run_process,
+                monotonic=read_clock,
+                deadline=deadline,
+                detail=f"run {run_id} details",
             ),
-            "workflow run view",
+            run_id=run_id,
+            revision=revision,
+            workflow_id=workflow_id,
         )
-        if viewed.get("headSha") != revision:
-            raise RunVerificationError(
-                f"run view SHA {viewed.get('headSha')!r} does not match {revision}"
-            )
-        if viewed.get("status") != "completed" or viewed.get("conclusion") != "success":
-            raise RunVerificationError(
-                "run view is not completed successfully: "
-                f"status={viewed.get('status')!r}, "
-                f"conclusion={viewed.get('conclusion')!r}"
-            )
-        if _run_database_id(viewed) != run_id:
-            raise RunVerificationError("run view database ID changed")
 
         ledger = {
             "schema_version": LEDGER_SCHEMA_VERSION,
@@ -246,6 +417,9 @@ def collect(
             "run": {
                 "database_id": run_id,
                 "head_sha": revision,
+                "event": "push",
+                "workflow_id": workflow_id,
+                "workflow_path": actual_workflow_path,
                 "status": "completed",
                 "conclusion": "success",
                 "url": viewed.get("url"),
@@ -254,6 +428,29 @@ def collect(
         }
         _atomic_write_json(output, ledger)
         return ledger
+
+
+def _validate_ledger_run(
+    raw_run: object,
+    *,
+    revision: str,
+    expected_workflow: str,
+) -> None:
+    run = _as_mapping(raw_run, "ledger run")
+    if run.get("head_sha") != revision:
+        raise RunVerificationError("ledger run SHA does not match ledger revision")
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        raise RunVerificationError("ledger run is not completed successfully")
+    database_id = run.get("database_id")
+    if not isinstance(database_id, int) or isinstance(database_id, bool):
+        raise RunVerificationError("ledger run ID is invalid")
+    if run.get("event") != "push":
+        raise RunVerificationError("ledger run event is not push")
+    workflow_id = run.get("workflow_id")
+    if not isinstance(workflow_id, int) or isinstance(workflow_id, bool):
+        raise RunVerificationError("ledger workflow ID is invalid")
+    if run.get("workflow_path") != _workflow_path(expected_workflow):
+        raise RunVerificationError("ledger workflow path is invalid")
 
 
 def _load_validated_ledger(path: Path, expected_workflow: str) -> dict[str, Any]:
@@ -274,14 +471,11 @@ def _load_validated_ledger(path: Path, expected_workflow: str) -> dict[str, Any]
             f"ledger workflow {ledger.get('workflow')!r} does not match {expected_workflow!r}"
         )
 
-    run = _as_mapping(ledger.get("run"), "ledger run")
-    if run.get("head_sha") != revision:
-        raise RunVerificationError("ledger run SHA does not match ledger revision")
-    if run.get("status") != "completed" or run.get("conclusion") != "success":
-        raise RunVerificationError("ledger run is not completed successfully")
-    database_id = run.get("database_id")
-    if not isinstance(database_id, int) or isinstance(database_id, bool):
-        raise RunVerificationError("ledger run ID is invalid")
+    _validate_ledger_run(
+        ledger.get("run"),
+        revision=revision,
+        expected_workflow=expected_workflow,
+    )
 
     ledger_jobs = _as_sequence(ledger.get("jobs"), "ledger jobs")
     reconstructed_jobs = [

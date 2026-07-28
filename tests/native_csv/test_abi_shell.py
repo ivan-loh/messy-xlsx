@@ -62,6 +62,59 @@ def test_shell_read_exercises_memoryview_source_callback_and_terminal_state() ->
     assert tokenizer.debug_state.state == "closed"
 
 
+def test_close_is_rejected_reentrantly_from_source_read() -> None:
+    native = importlib.import_module("messy_xlsx._csv_tokenizer")
+    observed_states: list[str] = []
+    callbacks: list[Any] = []
+    tokenizer = native.NativeCSVTokenizer(object())
+
+    class Source:
+        def read(self, size: int) -> bytes:
+            assert size > 0
+            with pytest.raises(RuntimeError, match="while reading"):
+                tokenizer.close()
+            observed_states.append(tokenizer.debug_state.state)
+            return b"still-owned"
+
+    tokenizer.bind(Source())
+    with pytest.raises(NotImplementedError, match="ABI shell"):
+        tokenizer.read_batch(1, callbacks.append)
+
+    assert observed_states == ["reading"]
+    assert callbacks == [{"kind": "abi_shell", "bytes_seen": 11}]
+    assert tokenizer.debug_state.state == "terminal"
+    tokenizer.close()
+    assert tokenizer.debug_state.state == "closed"
+
+
+def test_close_is_rejected_reentrantly_from_warning_callback() -> None:
+    native = importlib.import_module("messy_xlsx._csv_tokenizer")
+    callback_payloads: list[Any] = []
+    observed_states: list[str] = []
+    tokenizer = native.NativeCSVTokenizer(object())
+
+    class Source:
+        def read(self, size: int) -> bytes:
+            assert size > 0
+            return b"still-owned"
+
+    def on_warning(payload: Any) -> None:
+        callback_payloads.append(payload)
+        with pytest.raises(RuntimeError, match="while reading"):
+            tokenizer.close()
+        observed_states.append(tokenizer.debug_state.state)
+
+    tokenizer.bind(Source())
+    with pytest.raises(NotImplementedError, match="ABI shell"):
+        tokenizer.read_batch(1, on_warning)
+
+    assert callback_payloads == [{"kind": "abi_shell", "bytes_seen": 11}]
+    assert observed_states == ["reading"]
+    assert tokenizer.debug_state.state == "terminal"
+    tokenizer.close()
+    assert tokenizer.debug_state.state == "closed"
+
+
 def test_allocation_reallocation_success_and_fault_paths() -> None:
     native = importlib.import_module("messy_xlsx._csv_tokenizer")
 
