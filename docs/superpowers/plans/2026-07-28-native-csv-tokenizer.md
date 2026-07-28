@@ -1364,7 +1364,9 @@ git commit -m "feat: match pandas Python CSV parsing order"
 def test_quote_error_is_discarded_before_footer_removal() -> None:
     data = b"a,b\n1,2\n3,4\n\"bad\n5,6\n"
     options = ParseOptions(skip_footer=1)
-    assert native_outcome(data, options, batch_size=1) == materialized_oracle(data, options)
+    actual = native_outcome(data, options, batch_size=1)
+    expected = materialized_oracle(data, options)
+    assert_oracle_equivalent(actual, expected)
 
 
 def test_wide_trailing_row_can_disappear_as_footer_without_warning() -> None:
