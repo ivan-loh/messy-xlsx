@@ -12,6 +12,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.pyd
+src/messy_xlsx/_csv_tokenizer.c
 .Python
 build/
 develop-eggs/

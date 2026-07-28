@@ -1,0 +1,4 @@
+abi3audit==0.0.26
+cibuildwheel==4.1.1
+Cython==3.2.9
+setuptools==83.0.0

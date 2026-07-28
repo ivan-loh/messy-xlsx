@@ -1,0 +1,6 @@
+include build_support.py
+include setup.py
+include setup.cfg
+include requirements/native-release.txt
+include src/messy_xlsx/_csv_tokenizer.pyx
+recursive-include tests *.py

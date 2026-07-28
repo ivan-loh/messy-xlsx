@@ -1,0 +1,234 @@
+name: Native ABI Proof
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-native:
+    name: native-wheel / ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: manylinux-x86_64
+            runner: ubuntu-24.04
+            cibw_build: cp311-manylinux_x86_64
+            architecture: x86_64
+          - platform: manylinux-aarch64
+            runner: ubuntu-24.04-arm
+            cibw_build: cp311-manylinux_aarch64
+            architecture: aarch64
+          - platform: musllinux-x86_64
+            runner: ubuntu-24.04
+            cibw_build: cp311-musllinux_x86_64
+            architecture: x86_64
+          - platform: musllinux-aarch64
+            runner: ubuntu-24.04-arm
+            cibw_build: cp311-musllinux_aarch64
+            architecture: aarch64
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            cibw_build: cp311-macosx_x86_64
+            architecture: x86_64
+            deployment_target: "10.13"
+          - platform: macos-arm64
+            runner: macos-15
+            cibw_build: cp311-macosx_arm64
+            architecture: arm64
+            deployment_target: "11.0"
+          - platform: windows-amd64
+            runner: windows-2025
+            cibw_build: cp311-win_amd64
+            architecture: AMD64
+    env:
+      CIBW_BUILD: ${{ matrix.cibw_build }}
+      CIBW_BUILD_VERBOSITY: "1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - name: Install pinned native release tooling
+        run: python -m pip install -r requirements/native-release.txt
+      - name: Build Linux ABI3 wheel
+        if: runner.os == 'Linux'
+        env:
+          CIBW_ARCHS_LINUX: ${{ matrix.architecture }}
+          CIBW_ENVIRONMENT: MESSY_XLSX_BUILD_MODE=native
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux2014
+          CIBW_MUSLLINUX_X86_64_IMAGE: musllinux_1_2
+          CIBW_MUSLLINUX_AARCH64_IMAGE: musllinux_1_2
+        run: python -m cibuildwheel --output-dir wheelhouse
+      - name: Build macOS ABI3 wheel
+        if: runner.os == 'macOS'
+        env:
+          MESSY_XLSX_BUILD_MODE: native
+          CIBW_ARCHS_MACOS: ${{ matrix.architecture }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: python -m cibuildwheel --output-dir wheelhouse
+      - name: Build Windows ABI3 wheel
+        if: runner.os == 'Windows'
+        env:
+          MESSY_XLSX_BUILD_MODE: native
+          CIBW_ARCHS_WINDOWS: AMD64
+        run: python -m cibuildwheel --output-dir wheelhouse
+      - name: Verify one ABI3 artifact
+        shell: python
+        run: |
+          import pathlib
+          import subprocess
+
+          wheels = list(pathlib.Path("wheelhouse").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          assert "-cp311-abi3-" in wheels[0].name, wheels[0]
+          subprocess.run(["abi3audit", "--strict", str(wheels[0])], check=True)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-${{ matrix.platform }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  abi3-smoke:
+    name: abi3-smoke / ${{ matrix.platform }} / ${{ matrix.python }}
+    needs: build-native
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {platform: manylinux-x86_64, runner: ubuntu-24.04, python: cp311, version: "3.11"}
+          - {platform: manylinux-x86_64, runner: ubuntu-24.04, python: cp312, version: "3.12"}
+          - {platform: manylinux-x86_64, runner: ubuntu-24.04, python: cp313, version: "3.13"}
+          - {platform: manylinux-x86_64, runner: ubuntu-24.04, python: cp314, version: "3.14"}
+          - {platform: manylinux-aarch64, runner: ubuntu-24.04-arm, python: cp311, version: "3.11"}
+          - {platform: manylinux-aarch64, runner: ubuntu-24.04-arm, python: cp312, version: "3.12"}
+          - {platform: manylinux-aarch64, runner: ubuntu-24.04-arm, python: cp313, version: "3.13"}
+          - {platform: manylinux-aarch64, runner: ubuntu-24.04-arm, python: cp314, version: "3.14"}
+          - {platform: musllinux-x86_64, runner: ubuntu-24.04, python: cp311, version: "3.11"}
+          - {platform: musllinux-x86_64, runner: ubuntu-24.04, python: cp312, version: "3.12"}
+          - {platform: musllinux-x86_64, runner: ubuntu-24.04, python: cp313, version: "3.13"}
+          - {platform: musllinux-x86_64, runner: ubuntu-24.04, python: cp314, version: "3.14"}
+          - {platform: musllinux-aarch64, runner: ubuntu-24.04-arm, python: cp311, version: "3.11"}
+          - {platform: musllinux-aarch64, runner: ubuntu-24.04-arm, python: cp312, version: "3.12"}
+          - {platform: musllinux-aarch64, runner: ubuntu-24.04-arm, python: cp313, version: "3.13"}
+          - {platform: musllinux-aarch64, runner: ubuntu-24.04-arm, python: cp314, version: "3.14"}
+          - {platform: macos-x86_64, runner: macos-15-intel, python: cp311, version: "3.11"}
+          - {platform: macos-x86_64, runner: macos-15-intel, python: cp312, version: "3.12"}
+          - {platform: macos-x86_64, runner: macos-15-intel, python: cp313, version: "3.13"}
+          - {platform: macos-x86_64, runner: macos-15-intel, python: cp314, version: "3.14"}
+          - {platform: macos-arm64, runner: macos-15, python: cp311, version: "3.11"}
+          - {platform: macos-arm64, runner: macos-15, python: cp312, version: "3.12"}
+          - {platform: macos-arm64, runner: macos-15, python: cp313, version: "3.13"}
+          - {platform: macos-arm64, runner: macos-15, python: cp314, version: "3.14"}
+          - {platform: windows-amd64, runner: windows-2025, python: cp311, version: "3.11"}
+          - {platform: windows-amd64, runner: windows-2025, python: cp312, version: "3.12"}
+          - {platform: windows-amd64, runner: windows-2025, python: cp313, version: "3.13"}
+          - {platform: windows-amd64, runner: windows-2025, python: cp314, version: "3.14"}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: native-${{ matrix.platform }}
+          path: ${{ runner.temp }}/wheelhouse
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        if: ${{ !startsWith(matrix.platform, 'musllinux-') }}
+        with:
+          python-version: ${{ matrix.version }}
+      - name: Smoke manylinux or macOS artifact
+        if: runner.os != 'Windows' && !startsWith(matrix.platform, 'musllinux-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheels=("$RUNNER_TEMP"/wheelhouse/*.whl)
+          test "${#wheels[@]}" -eq 1
+          python -m venv "$RUNNER_TEMP/abi-smoke"
+          "$RUNNER_TEMP/abi-smoke/bin/python" -m pip install --no-deps "${wheels[0]}"
+          "$RUNNER_TEMP/abi-smoke/bin/python" - <<'PY'
+          import pathlib
+          import site
+          import sys
+          import types
+
+          package_path = next(
+              pathlib.Path(root) / "messy_xlsx"
+              for root in site.getsitepackages()
+              if (pathlib.Path(root) / "messy_xlsx").is_dir()
+          )
+          package = types.ModuleType("messy_xlsx")
+          package.__path__ = [str(package_path)]
+          sys.modules["messy_xlsx"] = package
+          import messy_xlsx._csv_tokenizer as native
+
+          assert native.NATIVE_API_VERSION == 1
+          assert native.PANDAS_SEMANTIC_VERSION == "3.0.5"
+          PY
+      - name: Smoke musllinux artifact
+        if: startsWith(matrix.platform, 'musllinux-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$RUNNER_TEMP/wheelhouse:/wheelhouse:ro" \
+            "python:${{ matrix.version }}-alpine" \
+            sh -euxc '
+              wheel="$(find /wheelhouse -maxdepth 1 -name "*.whl" -print -quit)"
+              test -n "$wheel"
+              python -m pip install --no-deps "$wheel"
+              python - <<'"'"'PY'"'"'
+          import pathlib
+          import site
+          import sys
+          import types
+
+          package_path = next(
+              pathlib.Path(root) / "messy_xlsx"
+              for root in site.getsitepackages()
+              if (pathlib.Path(root) / "messy_xlsx").is_dir()
+          )
+          package = types.ModuleType("messy_xlsx")
+          package.__path__ = [str(package_path)]
+          sys.modules["messy_xlsx"] = package
+          import messy_xlsx._csv_tokenizer as native
+
+          assert native.NATIVE_API_VERSION == 1
+          assert native.PANDAS_SEMANTIC_VERSION == "3.0.5"
+          PY
+            '
+      - name: Smoke Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $wheels = @(Get-ChildItem "$env:RUNNER_TEMP/wheelhouse/*.whl")
+          if ($wheels.Count -ne 1) { throw "expected exactly one wheel" }
+          python -m venv "$env:RUNNER_TEMP/abi-smoke"
+          & "$env:RUNNER_TEMP/abi-smoke/Scripts/python.exe" -m pip install --no-deps $wheels[0].FullName
+          @'
+          import pathlib
+          import site
+          import sys
+          import types
+
+          package_path = next(
+              pathlib.Path(root) / "messy_xlsx"
+              for root in site.getsitepackages()
+              if (pathlib.Path(root) / "messy_xlsx").is_dir()
+          )
+          package = types.ModuleType("messy_xlsx")
+          package.__path__ = [str(package_path)]
+          sys.modules["messy_xlsx"] = package
+          import messy_xlsx._csv_tokenizer as native
+
+          assert native.NATIVE_API_VERSION == 1
+          assert native.PANDAS_SEMANTIC_VERSION == "3.0.5"
+          '@ | & "$env:RUNNER_TEMP/abi-smoke/Scripts/python.exe" -
