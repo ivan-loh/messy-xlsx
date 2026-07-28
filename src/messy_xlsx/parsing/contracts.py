@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
 import pyarrow as pa
+
+from messy_xlsx.parsing.csv_contracts import (
+    CSVExecutionDecision,
+    CSVExecutionKind,
+    CSVExecutionReason,
+)
 
 
 class OutputMode(StrEnum):
@@ -44,6 +50,25 @@ class ParseMetrics:
     full_materializations: int = 0
     streaming_passes: int = 0
     failed_attempts: int = 0
+    csv_operation_sequence: int = 0
+    last_csv_execution: CSVExecutionDecision | None = None
+    csv_execution_counts: dict[
+        tuple[CSVExecutionKind, CSVExecutionReason],
+        int,
+    ] = field(default_factory=dict)
+
+    def record_csv_execution(
+        self,
+        kind: CSVExecutionKind,
+        reason: CSVExecutionReason,
+    ) -> CSVExecutionDecision:
+        """Record and return one CSV execution decision."""
+        self.csv_operation_sequence += 1
+        decision = CSVExecutionDecision(self.csv_operation_sequence, kind, reason)
+        self.last_csv_execution = decision
+        key = (kind, reason)
+        self.csv_execution_counts[key] = self.csv_execution_counts.get(key, 0) + 1
+        return decision
 
 
 class MaterializedArrowReader(Protocol):

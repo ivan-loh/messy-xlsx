@@ -10,10 +10,12 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, BinaryIO
 
 import numpy as np
 import pandas as pd
 
+from messy_xlsx._fallback_signals import _contains_process_failure, _exception_traceback
 from messy_xlsx._source import SourceHandle
 from messy_xlsx.exceptions import FormatError
 from messy_xlsx.parsing.base_handler import (
@@ -21,6 +23,11 @@ from messy_xlsx.parsing.base_handler import (
     FormatHandler,
     ParseOptions,
 )
+from messy_xlsx.parsing.csv_io import (
+    LogicalRecordBudgetReader,
+    RecordLimitingReader,
+)
+from messy_xlsx.parsing.streams import _run_cleanups
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 DEFAULT_NA_VALUES = ["", "NA", "N/A", "n/a", "null", "NULL", "None", "#N/A"]
+CSV_PREFIX_LIMIT = 64 * 1024
 
 ENCODING_FALLBACKS = ["latin-1", "windows-1252", "iso-8859-1"]
 
@@ -212,6 +220,43 @@ class MetadataRowDetector:
             logger.debug("Metadata detection failed for text data: %s", e)
             return 0
 
+        return self._detect_skip_rows_from_frame(df)
+
+    def detect_skip_rows_from_binary(
+        self,
+        source: Any,
+        encoding: str,
+        encoding_errors: str,
+        delimiter: str,
+        max_check: int = 15,
+    ) -> int:
+        """Detect metadata from complete bounded logical rows of a binary source."""
+        try:
+            df = pd.read_csv(
+                source,
+                header=None,
+                nrows=max_check,
+                encoding=encoding,
+                encoding_errors=encoding_errors,
+                delimiter=delimiter,
+                on_bad_lines="warn",
+                skip_blank_lines=False,
+            )
+        except FormatError:
+            raise
+        except (
+            pd.errors.ParserError,
+            pd.errors.EmptyDataError,
+            UnicodeDecodeError,
+            ValueError,
+            OSError,
+        ) as e:
+            logger.debug("Metadata detection failed for binary source: %s", e)
+            return 0
+        return self._detect_skip_rows_from_frame(df)
+
+    def _detect_skip_rows_from_frame(self, df: pd.DataFrame) -> int:
+        """Score one bounded metadata probe frame."""
         if len(df) < 3:
             return 0
 
@@ -279,51 +324,60 @@ class CSVHandler(FormatHandler):
         options: ParseOptions,
     ) -> pd.DataFrame:
         """Parse from one repeatable source handle."""
-        is_stream = source.is_stream
-        file_desc = source.description
-        text_data = ""
         file_path = source.path
+        if file_path is not None:
+            prefix = self._read_path_prefix(file_path)
+            return self._parse_target(
+                file_path,
+                prefix,
+                source.description,
+                options,
+                is_stream=False,
+            )
 
-        if is_stream:
-            # Buffer-backed CSV work shares the handle's single immutable byte
-            # view across validation, detection, and parsing passes.
-            raw_data = source.read_bytes()
+        with source.open_backend() as borrowed:
+            if isinstance(borrowed, Path):
+                raise ValueError("Stream-backed CSV source unexpectedly produced a path")
+            prefix = self._read_stream_prefix(borrowed)
+            borrowed.seek(0)
+            return self._parse_target(
+                borrowed,
+                prefix,
+                source.description,
+                options,
+                is_stream=True,
+            )
 
-            encoding = self._detect_encoding_from_bytes(raw_data, options.encoding)
-            delimiter = self._detect_delimiter_from_bytes(raw_data, encoding)
-
-            text_data = raw_data.decode(encoding, errors="ignore")
-        else:
-            if file_path is None:
-                raise ValueError("Path-backed CSV source is missing its path")
-            encoding = self._detect_encoding(file_path, options.encoding)
-            delimiter = self._detect_delimiter(file_path, encoding)
-
-        # Auto-detect metadata rows to skip
-        skip_rows = options.skip_rows
-        if options.auto_detect_header and skip_rows == 0:
-            if is_stream:
-                skip_rows = self._detector.detect_skip_rows_from_text(text_data, delimiter)
-            else:
-                assert file_path is not None
-                skip_rows = self._detector.detect_skip_rows(
-                    file_path,
-                    encoding,
-                    delimiter,
-                )
-
+    def _parse_target(
+        self,
+        target: Path | BinaryIO,
+        prefix: bytes,
+        file_desc: str,
+        options: ParseOptions,
+        *,
+        is_stream: bool,
+    ) -> pd.DataFrame:
+        """Parse one path or active binary borrow using bounded inspection."""
+        encoding = self._detect_encoding_from_bytes(prefix, options.encoding)
+        delimiter = self._detect_delimiter_from_bytes(prefix, encoding)
+        skip_rows = self._resolved_skip_rows(
+            prefix,
+            encoding,
+            delimiter,
+            options,
+            target=target,
+            file_desc=file_desc,
+            is_stream=is_stream,
+        )
         na_values = options.na_values or DEFAULT_NA_VALUES
-
         header = 0 if options.header_rows > 0 else None
-
         engine = "python" if options.skip_footer > 0 else "c"
-        text_stream = io.StringIO(text_data) if is_stream else None
-        source_for_pandas = text_stream if text_stream is not None else file_path
 
         try:
             df = pd.read_csv(
-                source_for_pandas,
-                encoding=None if is_stream else encoding,  # Already decoded for StringIO
+                target,
+                encoding=encoding,
+                encoding_errors="ignore" if is_stream else "strict",
                 delimiter=delimiter,
                 skiprows=skip_rows if options.header_rows <= 1 else 0,
                 skipfooter=options.skip_footer,
@@ -331,7 +385,7 @@ class CSVHandler(FormatHandler):
                 na_values=na_values,
                 header=header,
                 engine=engine,
-                on_bad_lines="warn",  # Handle malformed rows gracefully
+                on_bad_lines="warn",
             )
         except UnicodeDecodeError as err:
             if is_stream:
@@ -340,34 +394,135 @@ class CSVHandler(FormatHandler):
                     file_path=file_desc,
                     detected_format="csv",
                 ) from err
-            assert file_path is not None
+            assert isinstance(target, Path)
             df = self._read_with_encoding_fallback(
-                file_path,
+                target,
                 delimiter,
                 options,
                 na_values,
             )
         except Exception as e:
+            if _contains_process_failure(e):
+                raise
             raise FormatError(
                 f"Cannot parse CSV file: {e}",
                 file_path=file_desc,
                 detected_format="csv",
             ) from e
-        finally:
-            if text_stream is not None:
-                text_stream.close()
 
+        return self._finish_frame(df, options)
+
+    def _resolved_skip_rows(
+        self,
+        prefix: bytes,
+        encoding: str,
+        delimiter: str,
+        options: ParseOptions,
+        *,
+        target: Path | BinaryIO | None = None,
+        file_desc: str = "<source>",
+        is_stream: bool = False,
+    ) -> int:
+        """Resolve metadata skipping from the same bounded prefix used for dialects."""
+        skip_rows = options.skip_rows
+        if options.auto_detect_header and skip_rows == 0:
+            if target is None:
+                text = prefix.decode(encoding, errors="ignore")
+                skip_rows = self._detector.detect_skip_rows_from_text(text, delimiter)
+            else:
+                skip_rows = self._detect_skip_rows_from_target(
+                    target,
+                    encoding,
+                    delimiter,
+                    file_desc,
+                    is_stream=is_stream,
+                )
+        return int(skip_rows)
+
+    def _detect_skip_rows_from_target(
+        self,
+        target: Path | BinaryIO,
+        encoding: str,
+        delimiter: str,
+        file_desc: str,
+        *,
+        is_stream: bool,
+    ) -> int:
+        """Run one bounded-row metadata probe and restore an active borrow."""
+
+        def detect(stream: BinaryIO) -> int:
+            limited = RecordLimitingReader(
+                stream,
+                encoding,
+                delimiter,
+                file_desc,
+                max_records=15,
+            )
+            proxy = LogicalRecordBudgetReader(
+                limited,
+                encoding,
+                delimiter,
+                file_desc,
+                enforce_total=True,
+            )
+            return self._detector.detect_skip_rows_from_binary(
+                proxy,
+                encoding,
+                "ignore" if is_stream else "strict",
+                delimiter,
+            )
+
+        if isinstance(target, Path):
+            with target.open("rb") as stream:
+                return detect(stream)
+        target.seek(0)
+        try:
+            result = detect(target)
+        except BaseException as error:
+            _run_cleanups(
+                [("CSV metadata cursor restore", lambda: target.seek(0))],
+                primary_error=error,
+                primary_traceback=_exception_traceback(error),
+            )
+            raise
+        else:
+            target.seek(0)
+            return result
+
+    def _finish_frame(self, df: pd.DataFrame, options: ParseOptions) -> pd.DataFrame:
+        """Apply the established multi-row/no-header column contract."""
         if options.header_rows > 1:
             if options.skip_rows > 0:
                 df = df.iloc[options.skip_rows :]
-
             df, columns = self._generate_column_names(df, options.header_rows)
             df.columns = columns
-            df = df.reset_index(drop=True)
-        elif options.header_rows == 0:
+            return df.reset_index(drop=True)
+        if options.header_rows == 0:
             df.columns = [f"col_{i}" for i in range(len(df.columns))]
-
         return df
+
+    @staticmethod
+    def _read_stream_prefix(stream: BinaryIO) -> bytes:
+        """Read at most one bounded inspection prefix from an active borrow."""
+        raw = stream.read(CSV_PREFIX_LIMIT)
+        if isinstance(raw, bytes):
+            return raw
+        if isinstance(raw, bytearray):
+            return bytes(raw)
+        if isinstance(raw, memoryview):
+            return raw.tobytes()
+        raise TypeError(
+            "Binary source read() must return bytes, bytearray, or memoryview; "
+            f"got {type(raw).__name__}"
+        )
+
+    def _read_path_prefix(self, file_path: Path) -> bytes:
+        """Read one bounded path prefix for encoding and delimiter inspection."""
+        try:
+            with file_path.open("rb") as stream:
+                return self._read_stream_prefix(stream)
+        except OSError:
+            return b""
 
     def _detect_encoding(self, file_path: Path, default: str) -> str:
         """Detect file encoding."""
@@ -421,9 +576,17 @@ class CSVHandler(FormatHandler):
     def _detect_delimiter_from_text(self, sample: str) -> str:
         """Detect delimiter from text sample."""
         try:
+            if (
+                "\n" not in sample
+                and "\r" not in sample
+                and sample.startswith('"')
+                and sample.count('"') % 2
+            ):
+                raise csv.Error("bounded sample ends inside a quoted record")
             sniffer = csv.Sniffer()
             dialect = sniffer.sniff(sample)
-            return dialect.delimiter
+            if len(dialect.delimiter) == 1 and dialect.delimiter not in {"\x00", "\r", "\n"}:
+                return dialect.delimiter
         except csv.Error:
             pass
 
@@ -487,6 +650,8 @@ class CSVHandler(FormatHandler):
                 errors.append(f"{encoding}: {e}")
                 continue
             except Exception as e:
+                if _contains_process_failure(e):
+                    raise
                 errors.append(f"{encoding}: {e}")
                 continue
 

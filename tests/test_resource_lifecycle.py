@@ -560,7 +560,7 @@ def _track_csv_string_streams(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_csv_parse_closes_library_created_text_stream_on_success(
+def test_csv_parse_creates_no_complete_text_stream_on_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _track_csv_string_streams(monkeypatch)
@@ -572,8 +572,7 @@ def test_csv_parse_closes_library_created_text_stream_on_success(
     )
 
     assert not result.empty
-    assert _TrackedStringIO.instances
-    assert all(stream.closed for stream in _TrackedStringIO.instances)
+    assert _TrackedStringIO.instances == []
 
 
 def _count_descriptors_resolving_to(path: Path) -> int:
@@ -607,7 +606,7 @@ def test_repeated_read_excel_does_not_grow_descriptors_for_target(
     assert after == before
 
 
-def test_csv_parse_closes_library_created_text_stream_on_failure(
+def test_csv_parse_creates_no_complete_text_stream_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _track_csv_string_streams(monkeypatch)
@@ -624,8 +623,7 @@ def test_csv_parse_closes_library_created_text_stream_on_failure(
             ParseOptions(auto_detect_header=False),
         )
 
-    assert _TrackedStringIO.instances
-    assert all(stream.closed for stream in _TrackedStringIO.instances)
+    assert _TrackedStringIO.instances == []
 
 
 def test_csv_metadata_detection_closes_library_created_text_stream(

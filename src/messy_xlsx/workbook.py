@@ -23,6 +23,7 @@ import openpyxl
 import pandas as pd
 import pyarrow as pa
 
+import messy_xlsx.parsing.csv_native as csv_native
 from messy_xlsx._fallback_signals import (
     _blocks_backend_retry,
     _bounded_exception_graph,
@@ -71,6 +72,9 @@ from messy_xlsx.parsing.coordinates import (
     CoordinateOperation,
     CoordinateTransform,
 )
+from messy_xlsx.parsing.csv_contracts import CSVExecutionKind, CSVExecutionReason
+from messy_xlsx.parsing.csv_handler import CSVHandler
+from messy_xlsx.parsing.csv_streaming import prepare_csv_streaming_reader
 from messy_xlsx.parsing.fastexcel_session import FastexcelSession
 from messy_xlsx.parsing.handler_registry import HandlerRegistry
 from messy_xlsx.parsing.materialized_streaming import (
@@ -2028,6 +2032,16 @@ class MessyWorkbook:
             return False
         return type(self._registry.get_handler(self.format_type)) is XLSHandler
 
+    def _uses_builtin_csv_planner(self) -> bool:
+        """Return whether native text streaming may bypass no extensions."""
+        if self.format_type not in {"csv", "tsv", "txt"}:
+            return False
+        if type(self._registry) is not HandlerRegistry:
+            return False
+        if not self._registry._uses_builtin_components():
+            return False
+        return type(self._registry.get_handler(self.format_type)) is CSVHandler
+
     @staticmethod
     def _should_propagate_sheet_error(error: BaseException) -> bool:
         """Return whether an adapter must not convert a per-sheet failure."""
@@ -2175,10 +2189,36 @@ class MessyWorkbook:
                 plan,
                 construction_owner=construction_owner,
             )
+        if decision.backend is BackendKind.CSV_STREAMING and self._uses_builtin_csv_planner():
+            reason = csv_native.capability_reason()
+            if reason is None:
+                self.parse_metrics.record_csv_execution(
+                    CSVExecutionKind.NATIVE,
+                    CSVExecutionReason.NATIVE_SELECTED,
+                )
+                return prepare_csv_streaming_reader(
+                    self._source_handle,
+                    plan,
+                    self.parse_metrics,
+                    construction_owner=construction_owner,
+                )
+            self.parse_metrics.record_csv_execution(
+                CSVExecutionKind.MATERIALIZED_FALLBACK,
+                reason,
+            )
 
-        # Tasks 14 and 15 replace these characterized compatibility adapters
-        # with native CSV/XLS readers. Custom registries intentionally remain
-        # materialized because their SPI returns a complete DataFrame.
+        if (
+            decision.backend is BackendKind.CUSTOM_DATAFRAME
+            and format_type in {"csv", "tsv", "txt"}
+        ):
+            self.parse_metrics.record_csv_execution(
+                CSVExecutionKind.CUSTOM_SPI,
+                CSVExecutionReason.CUSTOM_SPI,
+            )
+
+        # Task 15 replaces the remaining XLS compatibility adapter. Custom
+        # registries intentionally remain materialized because their SPI
+        # returns a complete DataFrame.
         frame = self._materialize_raw_frame(sheet_name, format_type, plan)
         date_system = (
             self._get_manifest_reader().workbook.date_system
